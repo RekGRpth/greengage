@@ -73,19 +73,20 @@ VectorBatchDestroy(VectorBatch *batch)
 void
 VectorBatchReset(VectorBatch *batch)
 {
+	int			col;
+
 	batch->nrows = 0;
 	batch->nselected = 0;
 	MemoryContextReset(batch->varlena_context);
+	for (col = 0; col < batch->ncols; col++)
+		memset(batch->columns[col].nulls, 0,
+			   sizeof(uint64) * VECTOR_BATCH_NULLWORDS(batch->capacity));
 }
 
-/*
- * Publish nrows values in each column and select all of them.  Producers must
- * call VectorBatchReset() before starting to fill a reused batch.
- */
+/* Publish nrows values in each column and select all of them. */
 void
 VectorBatchSetRowCount(VectorBatch *batch, int nrows)
 {
-	int			col;
 	int			row;
 
 	Assert(nrows >= 0 && nrows <= batch->capacity);
@@ -94,10 +95,6 @@ VectorBatchSetRowCount(VectorBatch *batch, int nrows)
 	batch->nselected = nrows;
 	for (row = 0; row < nrows; row++)
 		batch->selection[row] = row;
-
-	for (col = 0; col < batch->ncols; col++)
-		memset(batch->columns[col].nulls, 0,
-			   sizeof(uint64) * VECTOR_BATCH_NULLWORDS(batch->capacity));
 }
 
 void

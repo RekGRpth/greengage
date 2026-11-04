@@ -38,6 +38,7 @@
 #include "cdb/cdbappendonlystoragewrite.h"
 #include "cdb/cdbvars.h"
 #include "executor/executor.h"
+#include "executor/vectorBatch.h"
 #include "commands/defrem.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -758,6 +759,7 @@ void
 aocs_rescan(AOCSScanDesc scan)
 {
 	close_cur_scan_seg(scan);
+	scan->batch_eof = false;
 	if (scan->columnScanInfo.ds)
 		close_ds_read(scan->columnScanInfo.ds, scan->columnScanInfo.relationTupleDesc->natts);
 	initscan_with_colinfo(scan);
@@ -1524,6 +1526,156 @@ ReadNext:
 
 	Assert(!"Never here");
 	return false;
+}
+
+/*
+ * Fill a column batch directly from the projected datum streams.  The row
+ * loop follows aocs_getnext(), including missing attributes and visimap
+ * checks.  By-reference values are copied only for visible rows, since the
+ * stream's block buffers are reused while the batch is being filled.
+ */
+bool
+aocs_getnext_batch(AOCSScanDesc scan, VectorBatch *batch)
+{
+	int			err = 0;
+	int			nrows = 0;
+	bool		isSnapshotAny = (scan->rs_base.rs_snapshot == SnapshotAny);
+
+	Assert(scan != NULL && batch != NULL);
+	Assert((scan->rs_base.rs_flags & SO_TYPE_ANALYZE) == 0);
+	Assert((scan->rs_base.rs_flags & SO_TYPE_SAMPLESCAN) == 0);
+
+	if (scan->batch_eof)
+	{
+		VectorBatchReset(batch);
+		return false;
+	}
+
+	if (scan->columnScanInfo.relationTupleDesc == NULL)
+	{
+		scan->columnScanInfo.relationTupleDesc =
+			RelationGetDescr(scan->rs_base.rs_rd);
+		PinTupleDesc(scan->columnScanInfo.relationTupleDesc);
+		initscan_with_colinfo(scan);
+	}
+
+	Assert(batch->ncols == scan->columnScanInfo.relationTupleDesc->natts);
+	VectorBatchReset(batch);
+
+	while (nrows < batch->capacity)
+	{
+		AOCSFileSegInfo *curseginfo;
+		AOTupleId	aoTupleId;
+		int64		rowNum = InvalidAORowNum;
+
+ReadNext:
+		rowNum = InvalidAORowNum;
+		if (scan->cur_seg < 0 || err < 0)
+		{
+			if (scan->columnScanInfo.num_proj_atts == 0)
+				break;
+
+			err = open_next_scan_seg(scan);
+			if (err < 0)
+			{
+				scan->batch_eof = true;
+				scan->cur_seg = -1;
+				break;
+			}
+			scan->segrowsprocessed = 0;
+		}
+
+		Assert(scan->columnScanInfo.num_proj_atts > 0);
+		Assert(scan->cur_seg >= 0);
+		curseginfo = scan->seginfo[scan->cur_seg];
+
+		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+		{
+			AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+			Datum		value;
+			bool		isnull;
+			int64		nthInBlock;
+
+			if (attno != scan->columnScanInfo.proj_atts[ANCHOR_COL_IN_PROJ])
+			{
+				Assert(rowNum > 0);
+				if (AO_ATTR_VAL_IS_MISSING(rowNum,
+											attno,
+											curseginfo->segno,
+											scan->columnScanInfo.attnum_to_rownum))
+				{
+					value = getmissingattr(scan->columnScanInfo.relationTupleDesc,
+										   attno + 1, &isnull);
+					VectorBatchSetValue(batch, attno, nrows, value, isnull);
+					continue;
+				}
+			}
+
+			err = datumstreamread_advance(scan->columnScanInfo.ds[attno]);
+			Assert(err >= 0);
+			if (err == 0)
+			{
+				err = datumstreamread_block(scan->columnScanInfo.ds[attno],
+											scan->blockDirectory, attno);
+				if (err < 0)
+				{
+					close_cur_scan_seg(scan);
+					goto ReadNext;
+				}
+
+				AOCSScanDesc_UpdateTotalBytesRead(scan, attno);
+				pgstat_count_buffer_read_ao(scan->rs_base.rs_rd,
+											RelationGuessNumberOfBlocksFromSize(scan->totalBytesRead));
+
+				err = datumstreamread_advance(scan->columnScanInfo.ds[attno]);
+				Assert(err > 0);
+			}
+
+			datumstreamread_get(scan->columnScanInfo.ds[attno], &value, &isnull);
+			VectorBatchSetValue(batch, attno, nrows, value, isnull);
+
+			nthInBlock = datumstreamread_nth(scan->columnScanInfo.ds[attno]);
+			if (rowNum == InvalidAORowNum &&
+				scan->columnScanInfo.ds[attno]->blockFirstRowNum != InvalidAORowNum)
+			{
+				Assert(scan->columnScanInfo.ds[attno]->blockFirstRowNum > 0 && nthInBlock >= 0);
+				rowNum = scan->columnScanInfo.ds[attno]->blockFirstRowNum + nthInBlock;
+			}
+#ifdef USE_ASSERT_CHECKING
+			else if (scan->columnScanInfo.ds[attno]->blockFirstRowNum != InvalidAORowNum)
+			{
+				Assert(scan->columnScanInfo.ds[attno]->blockFirstRowNum > 0 && nthInBlock >= 0);
+				Assert(rowNum == scan->columnScanInfo.ds[attno]->blockFirstRowNum + nthInBlock);
+			}
+#endif
+		}
+
+		scan->segrowsprocessed++;
+		if (rowNum == InvalidAORowNum)
+			AOTupleIdInit(&aoTupleId, curseginfo->segno, scan->segrowsprocessed);
+		else
+			AOTupleIdInit(&aoTupleId, curseginfo->segno, rowNum);
+
+		if (!isSnapshotAny && !AppendOnlyVisimap_IsVisible(&scan->visibilityMap, &aoTupleId))
+			goto ReadNext;
+
+		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+		{
+			AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+			VectorColumn *column = &batch->columns[attno];
+
+			if (!column->typbyval && !VectorBatchIsNull(batch, attno, nrows))
+				column->values[nrows] = VectorBatchCopyDatum(batch, attno,
+														 column->values[nrows], false);
+		}
+
+		scan->cdb_fake_ctid = *((ItemPointer) &aoTupleId);
+		pgstat_count_heap_getnext(scan->rs_base.rs_rd);
+		nrows++;
+	}
+
+	VectorBatchSetRowCount(batch, nrows);
+	return nrows > 0;
 }
 
 

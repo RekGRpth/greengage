@@ -1,0 +1,78 @@
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS vector_aoco_test;
+DROP TABLE IF EXISTS vector_aoco_small;
+CREATE TABLE vector_aoco_test
+(id int4, big int8, val text, num numeric(12,2))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_test
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(1, 5000) AS g;
+ALTER TABLE vector_aoco_test ADD COLUMN later int4 DEFAULT 42;
+INSERT INTO vector_aoco_test
+SELECT 5000 + g, (5000 + g)::int8 * 10, 'new' || g, 1.25, g
+FROM generate_series(1, 10) AS g;
+DELETE FROM vector_aoco_test WHERE id % 11 = 0;
+ANALYZE vector_aoco_test;
+CREATE TABLE vector_aoco_small (id int4, val text)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_small
+SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
+ANALYZE vector_aoco_small;
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
+FROM vector_aoco_test ORDER BY id LIMIT 3;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: gg_vector_region.id
+         ->  Limit
+               ->  Sort
+                     Sort Key: gg_vector_region.id
+                     ->  Custom Scan (GGVectorRegion)
+                           ->  Seq Scan on vector_aoco_test
+(9 rows)
+
+SELECT sum(big), sum(id), min(num), max(num), min(later), max(later)
+FROM vector_aoco_test;
+    sum    |   sum    | min  |  max  | min | max 
+-----------+----------+------+-------+-----+-----
+ 114114150 | 11411415 | 0.00 | 33.00 |   1 |  42
+(1 row)
+
+SELECT id, big, val, num, later
+FROM vector_aoco_test
+ORDER BY id OFFSET 2490 LIMIT 3;
+  id  |  big  |  val  |  num  | later 
+------+-------+-------+-------+-------
+ 2740 | 27400 | v2740 | 13.33 |    42
+ 2741 | 27410 | v2741 | 13.67 |    42
+ 2742 | 27420 | v2742 | 14.00 |    42
+(3 rows)
+
+SELECT val, count(*), sum(big)
+FROM vector_aoco_test
+GROUP BY val ORDER BY val LIMIT 3;
+  val  | count |  sum  
+-------+-------+-------
+ new1  |     1 | 50010
+ new10 |     1 | 50100
+ new2  |     1 | 50020
+(3 rows)
+
+SELECT count(*), sum(a.id), sum(b.id),
+       sum(length(a.val)), sum(length(b.val))
+FROM vector_aoco_small a CROSS JOIN vector_aoco_small b;
+ count | sum | sum | sum | sum 
+-------+-----+-----+-----+-----
+   100 | 550 | 550 | 210 | 210
+(1 row)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_aoco_test;
+DROP TABLE vector_aoco_small;

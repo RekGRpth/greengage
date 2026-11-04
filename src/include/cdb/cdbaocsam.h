@@ -305,6 +305,10 @@ typedef struct AOCSScanDescData
 	 * CO table, starting at a certain logical heap block and ending in another.
 	 */
 	bool 		partialScan;
+
+	/* The batch reader reached EOF; unlike a row scan, it may discover EOF
+	 * while returning a final non-empty batch. */
+	bool		batch_eof;
 } AOCSScanDescData;
 
 typedef AOCSScanDescData *AOCSScanDesc;
@@ -427,6 +431,8 @@ extern void aocs_rescan(AOCSScanDesc scan);
 extern void aocs_endscan(AOCSScanDesc scan);
 
 extern bool aocs_getnext(AOCSScanDesc scan, ScanDirection direction, TupleTableSlot *slot);
+struct VectorBatch;
+extern bool aocs_getnext_batch(AOCSScanDesc scan, struct VectorBatch *batch);
 extern AOCSInsertDesc aocs_insert_init(Relation rel, int segno, int64 num_rows);
 extern void aocs_insert_values(AOCSInsertDesc idesc, Datum *d, bool *null, AOTupleId *aoTupleId);
 static inline void aocs_insert(AOCSInsertDesc idesc, TupleTableSlot *slot)

@@ -254,6 +254,7 @@
 		"gp_vmem_limit_per_query",
 		"gp_vmem_protect_limit",
 		"gp_vmem_protect_segworker_cache_limit",
+		"gp_vectorized_execution",
 		"gp_workfile_limit_per_segment",
 		"gp_workfile_max_entries",
 		"hba_file",
