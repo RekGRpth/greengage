@@ -37,6 +37,17 @@ GROUP BY val ORDER BY val LIMIT 3;
 SELECT count(*), sum(a.id), sum(b.id),
        sum(length(a.val)), sum(length(b.val))
 FROM vector_aoco_small a CROSS JOIN vector_aoco_small b;
+SELECT id, big, val, num, later
+FROM vector_aoco_test
+WHERE id % 3 = 0 AND big > 25000 AND (val IS NULL OR num < 20.0)
+ORDER BY id LIMIT 5;
+SELECT sum(id) FROM vector_aoco_small
+WHERE id < 0 AND 1 / (id - id) = 1;
+SELECT sum(id) FROM vector_aoco_small
+WHERE id >= 0 OR 1 / (id - id) = 1;
+SELECT sum(id) FROM vector_aoco_small WHERE NOT (id < 5);
+SELECT sum(id) FROM vector_aoco_small WHERE (val || '') = 'v' || id;
+SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;

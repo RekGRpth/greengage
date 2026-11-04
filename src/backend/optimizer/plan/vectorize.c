@@ -17,6 +17,7 @@
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
 #include "executor/nodeVectorRegion.h"
+#include "executor/vectorExpr.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
@@ -71,7 +72,7 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 	RangeTblEntry *rte;
 	ListCell   *lc;
 
-	if (scan->scanrelid <= 0 || scan->plan.qual != NIL ||
+	if (scan->scanrelid <= 0 ||
 		scan->plan.lefttree != NULL || scan->plan.righttree != NULL ||
 		scan->plan.initPlan != NIL || scan->plan.extParam != NULL ||
 		scan->plan.allParam != NULL || scan->plan.targetlist == NIL)
@@ -80,6 +81,8 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
 	if (rte->rtekind != RTE_RELATION ||
 		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID)
+		return false;
+	if (!VectorExprIsSupported((Expr *) scan->plan.qual, scan->scanrelid))
 		return false;
 
 	foreach(lc, scan->plan.targetlist)

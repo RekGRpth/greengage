@@ -19,6 +19,7 @@
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/vectorBatch.h"
+#include "executor/vectorExpr.h"
 #include "nodes/extensible.h"
 #include "utils/rel.h"
 
@@ -29,6 +30,7 @@ typedef struct VectorRegionState
 	CustomScanState css;
 	SeqScanState *scan;
 	VectorBatch *batch;
+	VectorExprState *qual;
 	int		   *output_attnos;
 	int			output_ncols;
 	int			position;
@@ -141,9 +143,19 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	}
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+	{
 		state->batch = VectorBatchCreate(estate->es_query_cxt,
 										 RelationGetDescr(relation),
 										 VECTOR_BATCH_DEFAULT_CAPACITY);
+		if (scan->plan.qual != NIL)
+		{
+			state->qual = VectorExprCompile(estate->es_query_cxt,
+											(Expr *) scan->plan.qual,
+											state->batch, scan->scanrelid);
+			if (state->qual == NULL)
+				elog(ERROR, "vector region could not compile its scan qual");
+		}
+	}
 }
 
 static TupleTableSlot *
@@ -158,7 +170,7 @@ VectorRegionExec(CustomScanState *node)
 	if (state->eof)
 		return slot;
 
-	if (state->position >= state->batch->nselected)
+	while (state->position >= state->batch->nselected)
 	{
 		TableScanDesc scandesc = state->scan->ss.ss_currentScanDesc;
 
@@ -181,6 +193,7 @@ VectorRegionExec(CustomScanState *node)
 			return slot;
 		}
 		state->position = 0;
+		VectorExprFilter(state->batch, state->qual);
 	}
 
 	row = VectorBatchSelectedRow(state->batch, state->position++);
@@ -203,6 +216,8 @@ VectorRegionEnd(CustomScanState *node)
 
 	if (state->batch != NULL)
 		VectorBatchDestroy(state->batch);
+	if (state->qual != NULL)
+		VectorExprDestroy(state->qual);
 	if (state->output_attnos != NULL)
 		pfree(state->output_attnos);
 

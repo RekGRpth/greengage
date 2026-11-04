@@ -73,6 +73,51 @@ FROM vector_aoco_small a CROSS JOIN vector_aoco_small b;
    100 | 550 | 550 | 210 | 210
 (1 row)
 
+SELECT id, big, val, num, later
+FROM vector_aoco_test
+WHERE id % 3 = 0 AND big > 25000 AND (val IS NULL OR num < 20.0)
+ORDER BY id LIMIT 5;
+  id  |  big  |  val  | num  | later 
+------+-------+-------+------+-------
+ 2502 | 25020 | v2502 | 0.67 |    42
+ 2505 | 25050 | v2505 | 1.67 |    42
+ 2511 | 25110 | v2511 | 3.67 |    42
+ 2514 | 25140 | v2514 | 4.67 |    42
+ 2517 | 25170 | v2517 | 5.67 |    42
+(5 rows)
+
+SELECT sum(id) FROM vector_aoco_small
+WHERE id < 0 AND 1 / (id - id) = 1;
+ sum 
+-----
+    
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small
+WHERE id >= 0 OR 1 / (id - id) = 1;
+ sum 
+-----
+  55
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small WHERE NOT (id < 5);
+ sum 
+-----
+  45
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small WHERE (val || '') = 'v' || id;
+ sum 
+-----
+  55
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
+   sum   
+---------
+ 9784790
+(1 row)
+
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
