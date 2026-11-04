@@ -255,6 +255,8 @@ bool		gp_recursive_cte = true;
 bool		gp_eager_two_phase_agg = false;
 bool		gp_force_random_redistribution = false;
 
+int			gp_vectorized_execution = GP_VECTORIZED_EXECUTION_OFF;
+
 /* Optimizer related gucs */
 bool		optimizer;
 bool		optimizer_log;
@@ -468,6 +470,13 @@ static const struct config_enum_entry optimizer_cost_model_options[] = {
 	{"legacy", OPTIMIZER_GPDB_LEGACY},
 	{"calibrated", OPTIMIZER_GPDB_CALIBRATED},
 	{"experimental", OPTIMIZER_GPDB_EXPERIMENTAL},
+	{NULL, 0}
+};
+
+static const struct config_enum_entry gp_vectorized_execution_options[] = {
+	{"off", GP_VECTORIZED_EXECUTION_OFF},
+	{"force", GP_VECTORIZED_EXECUTION_FORCE},
+	{"auto", GP_VECTORIZED_EXECUTION_AUTO},
 	{NULL, 0}
 };
 
@@ -4821,6 +4830,17 @@ struct config_enum ConfigureNamesEnum_gp[] =
 		},
 		&optimizer_cost_model,
 		OPTIMIZER_GPDB_CALIBRATED, optimizer_cost_model_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"gp_vectorized_execution", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enables vectorized execution of eligible plan regions."),
+			gettext_noop("Valid values are off, force and auto."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_vectorized_execution,
+		GP_VECTORIZED_EXECUTION_OFF, gp_vectorized_execution_options,
 		NULL, NULL, NULL
 	},
 
