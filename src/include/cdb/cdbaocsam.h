@@ -309,6 +309,14 @@ typedef struct AOCSScanDescData
 	/* The batch reader reached EOF; unlike a row scan, it may discover EOF
 	 * while returning a final non-empty batch. */
 	bool		batch_eof;
+
+	/*
+	 * The batch reader must copy by-ref values out of the datumstream
+	 * buffers: the relation has columns that are missing in some rows
+	 * (ALTER TABLE ADD COLUMN), whose streams do not advance in step with
+	 * the others, so batches cannot end at block boundaries.
+	 */
+	bool		batch_copies_byref;
 } AOCSScanDescData;
 
 typedef AOCSScanDescData *AOCSScanDesc;
