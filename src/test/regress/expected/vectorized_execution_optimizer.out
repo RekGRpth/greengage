@@ -3,6 +3,7 @@ DROP TABLE IF EXISTS vector_aoco_test;
 DROP TABLE IF EXISTS vector_aoco_small;
 DROP TABLE IF EXISTS vector_join_l;
 DROP TABLE IF EXISTS vector_join_r;
+DROP TABLE IF EXISTS vector_aoco_wide;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -32,6 +33,10 @@ INSERT INTO vector_join_l SELECT g, 'l' || g FROM generate_series(1, 5) AS g;
 INSERT INTO vector_join_r VALUES (3, 'r3a'), (3, 'r3b'), (4, 'r4'), (6, 'r6'), (8, 'r8');
 ANALYZE vector_join_l;
 ANALYZE vector_join_r;
+CREATE TABLE vector_aoco_wide (id int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
+ANALYZE vector_aoco_wide;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -226,6 +231,20 @@ ORDER BY l.id;
   5
 (3 rows)
 
+SET statement_mem = '1MB';
+SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
+ count 
+-------
+  5000
+(1 row)
+
+SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t1.id = t2.id AND t2.id < 1000;
+ count 
+-------
+  5000
+(1 row)
+
+RESET statement_mem;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -276,3 +295,4 @@ DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
 DROP TABLE vector_join_l;
 DROP TABLE vector_join_r;
+DROP TABLE vector_aoco_wide;

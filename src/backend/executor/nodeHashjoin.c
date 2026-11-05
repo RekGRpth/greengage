@@ -2158,10 +2158,6 @@ VectorHashJoinBuild(HashJoinState *node)
 	hashNode->hashtable = hashtable;
 	MultiExecHash(hashNode);
 	node->hj_HashTable = hashNode->hashtable;
-	if (node->hj_HashTable->nbatch != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vectorized hash join supports only one batch")));
 	node->hj_HashTable->nbatch_outstart = node->hj_HashTable->nbatch;
 	node->hj_InnerEmpty = node->hj_HashTable->totalTuples == 0;
 	node->hj_OuterNotEmpty = false;
@@ -2176,16 +2172,35 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 	ExprState  *otherqual = node->js.ps.qual;
 	ExprContext *econtext = node->js.ps.ps_ExprContext;
 	HashJoinTable hashtable = node->hj_HashTable;
+	uint32		hashvalue = 0;
+	bool		have_hash = false;
+
+	if (hashtable->curbatch == -1 && !hashtable->first_pass)
+	{
+		hashtable->curbatch = 0;
+		if (!ExecHashJoinReloadHashTable(node))
+			return NULL;
+	}
+
+	if (outer == NULL && outer_eof &&
+		node->hj_JoinState == HJ_NEED_NEW_OUTER && hashtable->curbatch > 0 &&
+		hashtable->outerBatchFile[hashtable->curbatch] != NULL)
+	{
+		outer = ExecHashJoinGetSavedTuple(node,
+										 hashtable->outerBatchFile[hashtable->curbatch],
+										 &hashvalue, node->hj_OuterTupleSlot);
+		have_hash = outer != NULL;
+	}
 
 	if (outer != NULL)
 	{
-		uint32		hashvalue;
 		int			batchno;
 		bool		hashkeys_null = false;
 		bool		keep_nulls = HJ_FILL_OUTER(node) || node->hj_nonequijoin;
 
 		econtext->ecxt_outertuple = outer;
-		if (!ExecHashGetHashValue(hashNode, hashtable, econtext,
+		if (!have_hash &&
+			!ExecHashGetHashValue(hashNode, hashtable, econtext,
 								  node->hj_OuterHashKeys, true, keep_nulls,
 								  &hashvalue, &hashkeys_null))
 			return NULL;
@@ -2199,9 +2214,18 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 		node->hj_CurTuple = NULL;
 		if (batchno != hashtable->curbatch &&
 			node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("vectorized hash join supports only one batch")));
+		{
+			bool		shouldFree;
+			MinimalTuple mintuple = ExecFetchSlotMinimalTuple(outer, &shouldFree);
+
+			ExecHashJoinSaveTuple(&node->js.ps, mintuple, hashvalue,
+								  hashtable, &hashtable->outerBatchFile[batchno],
+								  hashtable->bfCxt);
+			if (shouldFree)
+				pfree(mintuple);
+			node->hj_JoinState = HJ_NEED_NEW_OUTER;
+			return NULL;
+		}
 		node->hj_JoinState = HJ_SCAN_BUCKET;
 	}
 	else if (node->hj_JoinState == HJ_NEED_NEW_OUTER)
@@ -2211,6 +2235,8 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 			ExecPrepHashTableForUnmatched(node);
 			node->hj_JoinState = HJ_FILL_INNER_TUPLES;
 		}
+		else if (outer_eof)
+			node->hj_JoinState = HJ_NEED_NEW_BATCH;
 		else
 			return NULL;
 	}
@@ -2258,7 +2284,10 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 
 			case HJ_FILL_INNER_TUPLES:
 				if (!ExecScanHashTableForUnmatched(node, econtext))
-					return NULL;
+				{
+					node->hj_JoinState = HJ_NEED_NEW_BATCH;
+					continue;
+				}
 				econtext->ecxt_outertuple = node->hj_NullOuterTupleSlot;
 				if (otherqual == NULL || ExecQual(otherqual, econtext))
 					return ExecProject(node->js.ps.ps_ProjInfo);
@@ -2268,11 +2297,47 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 			case HJ_NEED_NEW_OUTER:
 				if (outer_eof && HJ_FILL_INNER(node))
 				{
-						ExecPrepHashTableForUnmatched(node);
+					ExecPrepHashTableForUnmatched(node);
 					node->hj_JoinState = HJ_FILL_INNER_TUPLES;
 					continue;
 				}
+				if (outer_eof)
+				{
+					node->hj_JoinState = HJ_NEED_NEW_BATCH;
+					continue;
+				}
 				return NULL;
+
+			case HJ_NEED_NEW_BATCH:
+				if (!ExecHashJoinNewBatch(node))
+					return NULL;
+				node->hj_JoinState = HJ_NEED_NEW_OUTER;
+				if (hashtable->curbatch > 0 &&
+					hashtable->outerBatchFile[hashtable->curbatch] != NULL)
+				{
+					outer = ExecHashJoinGetSavedTuple(node,
+											 hashtable->outerBatchFile[hashtable->curbatch],
+											 &hashvalue, node->hj_OuterTupleSlot);
+					if (outer != NULL)
+					{
+						int			batchno;
+
+						have_hash = true;
+						econtext->ecxt_outertuple = outer;
+						node->hj_OuterNotEmpty = true;
+						node->hj_MatchedOuter = false;
+						node->hj_CurHashValue = hashvalue;
+						ExecHashGetBucketAndBatch(hashtable, hashvalue,
+												  &node->hj_CurBucketNo, &batchno);
+						node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable, hashvalue);
+						node->hj_CurTuple = NULL;
+						if (batchno != hashtable->curbatch &&
+							node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
+							elog(ERROR, "vectorized hash join read an outer tuple from the wrong batch");
+						node->hj_JoinState = HJ_SCAN_BUCKET;
+					}
+				}
+				break;
 
 			default:
 				elog(ERROR, "vectorized hash join reached an invalid state");
