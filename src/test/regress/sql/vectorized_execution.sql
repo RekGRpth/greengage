@@ -97,6 +97,10 @@ SELECT id, CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END AS parity
 FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
 SELECT id, coalesce(val, 'NONE') FROM vector_aoco_test WHERE id % 500 = 0 ORDER BY id;
 SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
+SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
+FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
+SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
+FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
 SELECT count(*) FROM vector_aoco_test l
 JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
   ON l.id % 10 = r.g;

@@ -293,6 +293,24 @@ SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
  5008
 (3 rows)
 
+SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
+FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
+ERROR:  column "t.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s...
+               ^
+SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
+FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
+ id | has_s 
+----+-------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+  6 | t
+  7 | t
+(7 rows)
+
 SELECT count(*) FROM vector_aoco_test l
 JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
   ON l.id % 10 = r.g;

@@ -472,6 +472,31 @@ VectorizePlan(PlannedStmt *stmt)
 
 	stmt->planTree = (Plan *) vectorize_mutator((Node *) stmt->planTree, &ctx);
 
+	/*
+	 * InitPlans and correlated subqueries are plans of their own, rooted in
+	 * the slice subplan_sliceIds names (-1: never dispatched, nothing to
+	 * do).  A subplan is held to its output order: its query's ORDER BY is
+	 * not visible here.
+	 */
+	if (stmt->subplans != NIL)
+	{
+		ListCell   *lc;
+		int			i = 0;
+
+		foreach(lc, stmt->subplans)
+		{
+			Plan	   *sub = (Plan *) lfirst(lc);
+
+			if (sub != NULL)
+			{
+				ctx.slice = stmt->subplan_sliceIds ?
+					stmt->subplan_sliceIds[i] : -1;
+				lfirst(lc) = vectorize_mutator((Node *) sub, &ctx);
+			}
+			i++;
+		}
+	}
+
 	if (ctx.wrapped > 0)
 		elog(DEBUG1, "vectorized execution: %d region(s) planned",
 			 ctx.wrapped);
