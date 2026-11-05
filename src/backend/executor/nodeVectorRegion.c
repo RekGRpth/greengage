@@ -3,15 +3,17 @@
  * nodeVectorRegion.c
  *	  Executor node for a segment-local vectorized plan region.
  *
- * The initial region reads a simple AOCS SeqScan into column batches and
- * materializes one virtual tuple per selected row at the region boundary.
- * The SeqScan child retains relation initialization and EXPLAIN structure,
- * but its row-at-a-time access method is not executed.
+ * AOCS leaves fill column batches directly from datum streams.  Heap and AO
+ * row leaves use the table AM's raw scan slot and deform referenced attributes
+ * into the same batch representation.  The SeqScan child retains relation
+ * initialization and EXPLAIN structure, but its row-at-a-time projection and
+ * qual are not executed.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/sysattr.h"
 #include "access/tableam.h"
 #include "cdb/cdbaocsam.h"
 #include "executor/executor.h"
@@ -23,6 +25,7 @@
 #include "executor/vectorExpr.h"
 #include "executor/vectorHashJoin.h"
 #include "nodes/extensible.h"
+#include "optimizer/optimizer.h"
 #include "utils/rel.h"
 
 #define VECTOR_REGION_NAME "GGVectorRegion"
@@ -40,6 +43,7 @@ typedef struct VectorRegionState
 	VectorExprState **proj;		/* per output column; NULL for plain columns */
 	VectorExprState *qual;
 	int		   *output_attnos;
+	bool	   *read_attrs;
 	int			output_ncols;
 	int			position;
 	bool		eof;
@@ -146,16 +150,14 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects an AOCS scan or aggregate")));
+				 errmsg("vector region expects a scan, aggregate or hash join")));
 
 	if (state->scan != NULL)
 	{
 		if (!IsA(state->scan, SeqScanState))
-			elog(ERROR, "vector region aggregate child is not an AOCS SeqScan");
+			elog(ERROR, "vector region leaf is not a SeqScan");
 		scan = (SeqScan *) state->scan->ss.ps.plan;
 		relation = state->scan->ss.ss_currentRelation;
-		if (!RelationIsAoCols(relation))
-			elog(ERROR, "vector region leaf is not an AOCS relation");
 	}
 
 	if (state->agg == NULL && state->hj == NULL)
@@ -191,6 +193,21 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 										 RelationGetDescr(relation) :
 										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
 										 VECTOR_BATCH_DEFAULT_CAPACITY);
+		if (state->scan != NULL && !RelationIsAoCols(relation))
+		{
+			Bitmapset  *attrs = NULL;
+			int			natts = RelationGetNumberOfAttributes(relation);
+
+			/* A row slot is reused on every fetch: deform only referenced attrs. */
+			state->read_attrs = MemoryContextAllocZero(estate->es_query_cxt,
+											 sizeof(bool) * natts);
+			pull_varattnos((Node *) scan->plan.targetlist, scan->scanrelid, &attrs);
+			pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &attrs);
+			for (col = 0; col < natts; col++)
+				state->read_attrs[col] =
+					bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
+			bms_free(attrs);
+		}
 		if (state->scan != NULL && scan->plan.qual != NIL)
 		{
 			VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
@@ -286,6 +303,48 @@ VectorRegionReadAdapter(VectorRegionState *state)
 	return true;
 }
 
+/*
+ * Read a heap or AO row scan without executing its row-at-a-time projection
+ * and qual.  The table AM fills the raw scan slot; referenced attributes are
+ * deformed into columns and by-ref datums are copied before the slot is reused.
+ */
+static bool
+VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc)
+{
+	VectorBatch *batch = state->batch;
+	TupleTableSlot *slot = state->scan->ss.ss_ScanTupleSlot;
+	int			nrows = 0;
+
+	VectorBatchReset(batch);
+	while (nrows < batch->capacity)
+	{
+		int			col;
+
+		if (!table_scan_getnextslot(scandesc,
+								   state->scan->ss.ps.state->es_direction, slot))
+		{
+			state->eof = true;
+			break;
+		}
+
+		for (col = 0; col < batch->ncols; col++)
+		{
+			Datum		value;
+			bool		isnull;
+
+			if (!state->read_attrs[col])
+				continue;
+			value = slot_getattr(slot, col + 1, &isnull);
+			value = VectorBatchCopyDatum(batch, col, value, isnull);
+			VectorBatchSetValue(batch, col, nrows, value, isnull);
+		}
+		nrows++;
+	}
+
+	VectorBatchSetRowCount(batch, nrows);
+	return nrows > 0;
+}
+
 static bool
 VectorRegionNextBatch(VectorRegionState *state)
 {
@@ -294,12 +353,13 @@ VectorRegionNextBatch(VectorRegionState *state)
 	if (state->input != NULL)
 		return VectorRegionReadAdapter(state);
 
+	/* EOF may be known while the final partial batch still has unread rows. */
+	if (state->position < state->batch->nselected)
+		return true;
+
 	while (!state->eof)
 	{
 		TableScanDesc scandesc;
-
-		if (state->position < state->batch->nselected)
-			return true;
 
 		scandesc = state->scan->ss.ss_currentScanDesc;
 		if (scandesc == NULL)
@@ -315,13 +375,21 @@ VectorRegionNextBatch(VectorRegionState *state)
 			MemoryContextSwitchTo(oldcontext);
 		}
 
-		if (!aocs_getnext_batch((AOCSScanDesc) scandesc, state->batch))
+		if (RelationIsAoCols(state->scan->ss.ss_currentRelation))
 		{
-			state->eof = true;
-			break;
+			if (!aocs_getnext_batch((AOCSScanDesc) scandesc, state->batch))
+			{
+				state->eof = true;
+				break;
+			}
 		}
+		else if (!VectorRegionReadRowScan(state, scandesc))
+			break;
 		state->position = 0;
 		VectorExprFilter(state->batch, state->qual);
+		/* A row scan can discover EOF while filling its final partial batch. */
+		if (state->batch->nselected > 0)
+			return true;
 	}
 	return false;
 }
@@ -420,6 +488,8 @@ VectorRegionEnd(CustomScanState *node)
 		VectorExprDestroy(state->qual);
 	if (state->output_attnos != NULL)
 		pfree(state->output_attnos);
+	if (state->read_attrs != NULL)
+		pfree(state->read_attrs);
 
 	foreach(lc, node->custom_ps)
 		ExecEndNode((PlanState *) lfirst(lc));

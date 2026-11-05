@@ -6,6 +6,8 @@ DROP TABLE IF EXISTS vector_join_r;
 DROP TABLE IF EXISTS vector_aoco_wide;
 DROP TABLE IF EXISTS vector_aoco_spill;
 DROP TABLE IF EXISTS vector_aoco_spill_wide;
+DROP TABLE IF EXISTS vector_heap_test;
+DROP TABLE IF EXISTS vector_aoro_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -27,6 +29,18 @@ DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_small
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_aoco_small;
+CREATE TABLE vector_heap_test (id int4, big int8, val text, num numeric(12,2))
+DISTRIBUTED BY (id);
+CREATE TABLE vector_aoro_test (id int4, big int8, val text, num numeric(12,2))
+WITH (appendonly = true, orientation = row) DISTRIBUTED BY (id);
+INSERT INTO vector_heap_test
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(1, 10000) AS g;
+INSERT INTO vector_aoro_test SELECT * FROM vector_heap_test;
+ANALYZE vector_heap_test;
+ANALYZE vector_aoro_test;
 CREATE TABLE vector_join_l (id int4, l text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
 CREATE TABLE vector_join_r (id int4, r text)
@@ -137,6 +151,19 @@ SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t
 SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
 SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
 ALTER DATABASE regression RESET statement_mem;
+EXPLAIN (COSTS OFF)
+SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test
+WHERE id % 2000 = 0 ORDER BY id;
+SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test
+WHERE id % 2000 = 0 ORDER BY id;
+SELECT count(*), sum(big), min(num), max(num), count(val) FROM vector_heap_test;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vector_aoro_test
+WHERE val IS NULL OR num < 10;
+SELECT count(*) FROM vector_aoro_test WHERE val IS NULL OR num < 10;
+SELECT count(*), sum(h.id), sum(r.big)
+FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id;
+SELECT count(*) FROM vector_heap_test h
+LEFT JOIN vector_aoro_test r ON h.id = r.id AND r.id < 100;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -158,3 +185,5 @@ DROP TABLE vector_join_r;
 DROP TABLE vector_aoco_wide;
 DROP TABLE vector_aoco_spill;
 DROP TABLE vector_aoco_spill_wide;
+DROP TABLE vector_heap_test;
+DROP TABLE vector_aoro_test;

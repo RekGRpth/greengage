@@ -4,7 +4,8 @@
  *	  Replace eligible segment-local plan regions with vectorized regions.
  *
  * The pass runs after either optimizer has produced a complete PlannedStmt.
- * The initial implementation covers simple AOCS scans in force mode.  The
+ * The initial implementation covers simple AOCS scans in force mode.  Heap
+ * and AO row scans use the same regions through a raw-slot batch reader.  The
  * cost-gated auto mode is enabled together with vectorized operators that
  * provide a benefit over row-at-a-time execution.
  *
@@ -12,7 +13,6 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_am.h"
 #include "cdb/cdbllize.h"
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
@@ -70,7 +70,7 @@ slice_runs_on_segments(VectorizeContext *ctx)
 }
 
 static bool
-is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
+is_simple_scan(VectorizeContext *ctx, SeqScan *scan)
 {
 	RangeTblEntry *rte;
 	ListCell   *lc;
@@ -83,8 +83,7 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 		return false;
 
 	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
-	if (rte->rtekind != RTE_RELATION ||
-		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID)
+	if (rte->rtekind != RTE_RELATION)
 		return false;
 	if (!VectorExprIsSupported((Expr *) scan->plan.qual, &vars))
 		return false;
@@ -105,13 +104,13 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 }
 
 /*
- * A scan that a region may wrap as its own root: like is_simple_aoco_scan,
+ * A scan that a region may wrap as its own root: like is_simple_scan,
  * but the targetlist may also carry projection expressions (ORCA keeps them
  * in the scan's targetlist) and junk entries (sort keys of an ORDER BY
  * above the region).
  */
 static bool
-is_projection_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
+is_projection_scan(VectorizeContext *ctx, SeqScan *scan)
 {
 	RangeTblEntry *rte;
 	ListCell   *lc;
@@ -124,8 +123,7 @@ is_projection_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 		return false;
 
 	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
-	if (rte->rtekind != RTE_RELATION ||
-		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID)
+	if (rte->rtekind != RTE_RELATION)
 		return false;
 	if (!VectorExprIsSupported((Expr *) scan->plan.qual, &vars))
 		return false;
@@ -420,7 +418,7 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 
 	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
-		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node)) &&
+		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash) &&
 		auto_allowed(ctx, (Plan *) node))
@@ -429,13 +427,13 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 	if (IsA(node, Agg) && slice_runs_on_segments(ctx) &&
 		VectorAggPlanIsSupported((Agg *) node) &&
 		(!IsA(outerPlan(node), SeqScan) ||
-		 is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node))) &&
+		 is_simple_scan(ctx, (SeqScan *) outerPlan(node))) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
 		((SeqScan *) node)->plan.targetlist != NIL &&
-		is_projection_aoco_scan(ctx, (SeqScan *) node) &&
+		is_projection_scan(ctx, (SeqScan *) node) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
