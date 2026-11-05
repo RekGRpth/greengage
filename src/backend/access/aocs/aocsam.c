@@ -1644,8 +1644,10 @@ ReadNext:
 		curseginfo = scan->seginfo[scan->cur_seg];
 
 		/*
-		 * End the batch before any column's block runs out, keeping all
-		 * block buffers of this batch live (see aocs_column_block_exhausted).
+		 * End the batch before any pass-by-reference column's block runs
+		 * out, keeping the block buffers those values point into live (see
+		 * aocs_column_block_exhausted).  By-value columns copy their datums
+		 * into the batch arrays, so their blocks may be reused freely.
 		 */
 		if (nrows > 0 && !scan->batch_copies_byref)
 		{
@@ -1653,8 +1655,10 @@ ReadNext:
 
 			for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
 			{
-				if (aocs_column_block_exhausted(
-						scan->columnScanInfo.ds[scan->columnScanInfo.proj_atts[i]]))
+				AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+
+				if (!batch->columns[attno].typbyval &&
+					aocs_column_block_exhausted(scan->columnScanInfo.ds[attno]))
 				{
 					block_end = true;
 					break;

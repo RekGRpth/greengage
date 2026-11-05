@@ -330,10 +330,7 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 		{
 			pergroup = lookup_group(state, batch, row);
 			if (pergroup == NULL)
-			{
-				ResetExprContext(agg->tmpcontext);
 				continue;
-			}
 		}
 		else
 			pergroup = agg->pergroups[0];
@@ -350,8 +347,9 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 			VectorAggAdvanceTransition(agg, pergroup, transno,
 									   state->values[transno], state->nulls[transno]);
 		}
-		ResetExprContext(agg->tmpcontext);
 	}
+	/* Transition garbage is bounded by the batch size; reset once. */
+	ResetExprContext(agg->tmpcontext);
 }
 
 void
