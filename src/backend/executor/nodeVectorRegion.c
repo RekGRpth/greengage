@@ -18,6 +18,7 @@
 #include "executor/nodeCustom.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeVectorRegion.h"
+#include "executor/vectorAgg.h"
 #include "executor/vectorBatch.h"
 #include "executor/vectorExpr.h"
 #include "nodes/extensible.h"
@@ -29,6 +30,9 @@ typedef struct VectorRegionState
 {
 	CustomScanState css;
 	SeqScanState *scan;
+	PlanState  *input;
+	AggState   *agg;
+	VectorAggState *vagg;
 	VectorBatch *batch;
 	VectorExprState *qual;
 	int		   *output_attnos;
@@ -97,6 +101,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 {
 	VectorRegionState *state = (VectorRegionState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	PlanState  *child;
 	SeqScan	   *scan;
 	Relation	relation;
 	ListCell   *lc;
@@ -105,75 +110,151 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	foreach(lc, cscan->custom_plans)
 	{
 		Plan	   *plan = (Plan *) lfirst(lc);
-		PlanState  *child = ExecInitNode(plan, estate,
-									 eflags & ~(EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK));
+		PlanState  *childstate = ExecInitNode(plan, estate,
+										 eflags & ~(EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK));
 
-		node->custom_ps = lappend(node->custom_ps, child);
+		node->custom_ps = lappend(node->custom_ps, childstate);
 	}
 
-	if (list_length(node->custom_ps) != 1 ||
-		!IsA(linitial(node->custom_ps), SeqScanState))
+	if (list_length(node->custom_ps) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects one AOCS SeqScan leaf")));
-
-	state->scan = (SeqScanState *) linitial(node->custom_ps);
-	scan = (SeqScan *) state->scan->ss.ps.plan;
-	relation = state->scan->ss.ss_currentRelation;
-	if (!RelationIsAoCols(relation))
-		elog(ERROR, "vector region leaf is not an AOCS relation");
-
-	state->output_ncols = list_length(scan->plan.targetlist);
-	if (state->output_ncols != node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts)
-		elog(ERROR, "vector region output shape does not match its scan");
-
-	state->output_attnos = MemoryContextAlloc(estate->es_query_cxt,
-										 sizeof(int) * state->output_ncols);
-	foreach(lc, scan->plan.targetlist)
+				 errmsg("vector region expects one plan child")));
+	child = (PlanState *) linitial(node->custom_ps);
+	if (IsA(child, AggState))
 	{
-		TargetEntry *te = (TargetEntry *) lfirst(lc);
-		Var		   *var;
+		PlanState  *outer;
 
-		if (!IsA(te->expr, Var))
-			elog(ERROR, "vector region supports only plain column projections");
-		var = (Var *) te->expr;
-		if (var->varattno <= 0 || var->varattno > RelationGetNumberOfAttributes(relation))
-			elog(ERROR, "vector region encountered an invalid output attribute");
-		state->output_attnos[col++] = var->varattno - 1;
+		state->agg = (AggState *) child;
+		outer = outerPlanState(state->agg);
+		if (IsA(outer, SeqScanState))
+			state->scan = (SeqScanState *) outer;
+		else
+			state->input = outer;
+	}
+	else if (IsA(child, SeqScanState))
+		state->scan = (SeqScanState *) child;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("vector region expects an AOCS scan or aggregate")));
+
+	if (state->scan != NULL)
+	{
+		if (!IsA(state->scan, SeqScanState))
+			elog(ERROR, "vector region aggregate child is not an AOCS SeqScan");
+		scan = (SeqScan *) state->scan->ss.ps.plan;
+		relation = state->scan->ss.ss_currentRelation;
+		if (!RelationIsAoCols(relation))
+			elog(ERROR, "vector region leaf is not an AOCS relation");
+	}
+
+	if (state->agg == NULL)
+	{
+		state->output_ncols = list_length(scan->plan.targetlist);
+		if (state->output_ncols != node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts)
+			elog(ERROR, "vector region output shape does not match its scan");
+
+		state->output_attnos = MemoryContextAlloc(estate->es_query_cxt,
+										 sizeof(int) * state->output_ncols);
+		foreach(lc, scan->plan.targetlist)
+		{
+			TargetEntry *te = (TargetEntry *) lfirst(lc);
+			Var		   *var;
+
+			if (!IsA(te->expr, Var))
+				elog(ERROR, "vector region supports only plain column projections");
+			var = (Var *) te->expr;
+			if (var->varattno <= 0 || var->varattno > RelationGetNumberOfAttributes(relation))
+				elog(ERROR, "vector region encountered an invalid output attribute");
+			state->output_attnos[col++] = var->varattno - 1;
+		}
 	}
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
 	{
 		state->batch = VectorBatchCreate(estate->es_query_cxt,
-										 RelationGetDescr(relation),
+										 state->scan != NULL ?
+										 RelationGetDescr(relation) :
+										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
 										 VECTOR_BATCH_DEFAULT_CAPACITY);
-		if (scan->plan.qual != NIL)
+		if (state->scan != NULL && scan->plan.qual != NIL)
 		{
+			VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+
 			state->qual = VectorExprCompile(estate->es_query_cxt,
 											(Expr *) scan->plan.qual,
-											state->batch, scan->scanrelid);
+											state->batch, &vars);
 			if (state->qual == NULL)
 				elog(ERROR, "vector region could not compile its scan qual");
+		}
+		if (state->agg != NULL)
+		{
+			state->vagg = VectorAggCreate(estate->es_query_cxt, state->agg,
+										  state->batch);
+			if (state->vagg == NULL)
+				elog(ERROR, "vector region could not initialize its aggregate");
 		}
 	}
 }
 
-static TupleTableSlot *
-VectorRegionExec(CustomScanState *node)
+static bool
+VectorRegionReadAdapter(VectorRegionState *state)
 {
-	VectorRegionState *state = (VectorRegionState *) node;
-	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	int			row;
-	int			col;
+	VectorBatch *batch = state->batch;
+	int			nrows = 0;
+	bool		exhausted = false;
 
-	ExecClearTuple(slot);
 	if (state->eof)
-		return slot;
-
-	while (state->position >= state->batch->nselected)
+		return false;
+	VectorBatchReset(batch);
+	while (nrows < batch->capacity)
 	{
-		TableScanDesc scandesc = state->scan->ss.ss_currentScanDesc;
+		TupleTableSlot *slot = ExecProcNode(state->input);
+		int			col;
 
+		if (TupIsNull(slot))
+		{
+			exhausted = true;
+			break;
+		}
+		slot_getallattrs(slot);
+		if (slot->tts_nvalid != batch->ncols)
+			elog(ERROR, "vector region input shape changed during execution");
+		for (col = 0; col < batch->ncols; col++)
+		{
+			Datum		value = slot->tts_values[col];
+			bool		isnull = slot->tts_isnull[col];
+
+			value = VectorBatchCopyDatum(batch, col, value, isnull);
+			VectorBatchSetValue(batch, col, nrows, value, isnull);
+		}
+		nrows++;
+	}
+	VectorBatchSetRowCount(batch, nrows);
+	state->position = 0;
+	state->eof = exhausted;
+	if (nrows == 0)
+		return false;
+	return true;
+}
+
+static bool
+VectorRegionNextBatch(VectorRegionState *state)
+{
+	CustomScanState *node = &state->css;
+
+	if (state->input != NULL)
+		return VectorRegionReadAdapter(state);
+
+	while (!state->eof)
+	{
+		TableScanDesc scandesc;
+
+		if (state->position < state->batch->nselected)
+			return true;
+
+		scandesc = state->scan->ss.ss_currentScanDesc;
 		if (scandesc == NULL)
 		{
 			MemoryContext oldcontext = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
@@ -190,11 +271,36 @@ VectorRegionExec(CustomScanState *node)
 		if (!aocs_getnext_batch((AOCSScanDesc) scandesc, state->batch))
 		{
 			state->eof = true;
-			return slot;
+			break;
 		}
 		state->position = 0;
 		VectorExprFilter(state->batch, state->qual);
 	}
+	return false;
+}
+
+static TupleTableSlot *
+VectorRegionExec(CustomScanState *node)
+{
+	VectorRegionState *state = (VectorRegionState *) node;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	int			row;
+	int			col;
+
+	if (state->agg != NULL)
+	{
+		while (VectorRegionNextBatch(state))
+		{
+			VectorAggProcessBatch(state->vagg, state->batch);
+			state->position = state->batch->nselected;
+		}
+		VectorAggFinish(state->vagg);
+		return VectorAggNext(state->vagg);
+	}
+
+	ExecClearTuple(slot);
+	if (!VectorRegionNextBatch(state))
+		return slot;
 
 	row = VectorBatchSelectedRow(state->batch, state->position++);
 	for (col = 0; col < state->output_ncols; col++)
@@ -214,6 +320,8 @@ VectorRegionEnd(CustomScanState *node)
 	VectorRegionState *state = (VectorRegionState *) node;
 	ListCell   *lc;
 
+	if (state->vagg != NULL)
+		VectorAggDestroy(state->vagg);
 	if (state->batch != NULL)
 		VectorBatchDestroy(state->batch);
 	if (state->qual != NULL)
@@ -236,6 +344,11 @@ VectorRegionRescan(CustomScanState *node)
 	state->eof = false;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
-	foreach(lc, node->custom_ps)
-		ExecReScan((PlanState *) lfirst(lc));
+	if (state->vagg != NULL)
+		VectorAggReset(state->vagg);
+	else
+	{
+		foreach(lc, node->custom_ps)
+			ExecReScan((PlanState *) lfirst(lc));
+	}
 }

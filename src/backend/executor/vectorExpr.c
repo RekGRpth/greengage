@@ -69,7 +69,8 @@ struct VectorExprState
 	int			capacity;
 };
 
-static VectorExprStep *build_step(Expr *expr, VectorBatch *batch, Index scanrelid);
+static VectorExprStep *build_step(Expr *expr, VectorBatch *batch,
+								  const VectorExprVarMap *vars);
 static void eval_step(VectorExprStep *step, VectorBatch *batch,
 					  int32 *selection, int nselected);
 
@@ -105,8 +106,21 @@ init_value(VectorValue *value, Oid typid, int32 typmod, int capacity,
 	}
 }
 
+static AttrNumber
+map_var_attno(Var *var, const VectorExprVarMap *vars)
+{
+	if (var->varlevelsup != 0 || var->varattno <= 0)
+		return 0;
+	if (var->varno == vars->scanrelid)
+		return var->varattno;
+	if (var->varno == OUTER_VAR && vars->outer_attnos != NULL &&
+		var->varattno <= vars->outer_ncols)
+		return vars->outer_attnos[var->varattno - 1];
+	return 0;
+}
+
 bool
-VectorExprIsSupported(Expr *expr, Index scanrelid)
+VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 {
 	ListCell   *lc;
 
@@ -119,31 +133,30 @@ VectorExprIsSupported(Expr *expr, Index scanrelid)
 			{
 				Var		   *var = (Var *) expr;
 
-				return var->varno == scanrelid && var->varattno > 0 &&
-					var->varlevelsup == 0;
+				return map_var_attno(var, vars) > 0;
 			}
 		case T_Const:
 			return true;
 		case T_RelabelType:
-			return VectorExprIsSupported(((RelabelType *) expr)->arg, scanrelid);
+			return VectorExprIsSupported(((RelabelType *) expr)->arg, vars);
 		case T_NullTest:
 			{
 				NullTest   *test = (NullTest *) expr;
 
 				return !test->argisrow &&
-					VectorExprIsSupported(test->arg, scanrelid);
+					VectorExprIsSupported(test->arg, vars);
 			}
 		case T_BoolExpr:
 			foreach(lc, ((BoolExpr *) expr)->args)
 			{
-				if (!VectorExprIsSupported((Expr *) lfirst(lc), scanrelid))
+				if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
 					return false;
 			}
 			return true;
 		case T_List:
 			foreach(lc, (List *) expr)
 			{
-				if (!VectorExprIsSupported((Expr *) lfirst(lc), scanrelid))
+				if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
 					return false;
 			}
 			return true;
@@ -156,7 +169,7 @@ VectorExprIsSupported(Expr *expr, Index scanrelid)
 					return false;
 				foreach(lc, op->args)
 				{
-					if (!VectorExprIsSupported((Expr *) lfirst(lc), scanrelid))
+					if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
 						return false;
 				}
 				return true;
@@ -170,7 +183,7 @@ VectorExprIsSupported(Expr *expr, Index scanrelid)
 					return false;
 				foreach(lc, func->args)
 				{
-					if (!VectorExprIsSupported((Expr *) lfirst(lc), scanrelid))
+					if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
 						return false;
 				}
 				return true;
@@ -199,7 +212,7 @@ alloc_step(VectorExprKind kind, int nargs, int capacity)
 
 static VectorExprStep *
 build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
-				Oid collation, List *args, VectorBatch *batch, Index scanrelid)
+				Oid collation, List *args, VectorBatch *batch, const VectorExprVarMap *vars)
 {
 	VectorExprStep *step;
 	ListCell   *lc;
@@ -215,7 +228,7 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 
 	foreach(lc, args)
 	{
-		step->args[argno] = build_step((Expr *) lfirst(lc), batch, scanrelid);
+		step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
 		if (step->args[argno] == NULL)
 			return NULL;
 		argno++;
@@ -224,7 +237,7 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 }
 
 static VectorExprStep *
-build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
+build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 {
 	VectorExprStep *step;
 	ListCell   *lc;
@@ -236,12 +249,12 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 			{
 				Var		   *var = (Var *) expr;
 				VectorColumn *column;
+				AttrNumber	attno = map_var_attno(var, vars);
 
-				if (var->varno != scanrelid || var->varattno <= 0 ||
-					var->varattno > batch->ncols || var->varlevelsup != 0)
+				if (attno <= 0 || attno > batch->ncols)
 					return NULL;
 				step = alloc_step(VEC_VAR, 0, batch->capacity);
-				column = &batch->columns[var->varattno - 1];
+				column = &batch->columns[attno - 1];
 				step->value.typid = column->typid;
 				step->value.typmod = column->typmod;
 				step->value.typlen = column->typlen;
@@ -267,7 +280,7 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 				RelabelType *relabel = (RelabelType *) expr;
 
 				step = alloc_step(VEC_RELABEL, 1, batch->capacity);
-				step->args[0] = build_step(relabel->arg, batch, scanrelid);
+				step->args[0] = build_step(relabel->arg, batch, vars);
 				if (step->args[0] == NULL)
 					return NULL;
 				step->value = step->args[0]->value;
@@ -280,7 +293,7 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 				OpExpr	   *op = (OpExpr *) expr;
 
 				return build_func_step(op->opfuncid, op->opresulttype, -1,
-									   op->inputcollid, op->args, batch, scanrelid);
+									   op->inputcollid, op->args, batch, vars);
 			}
 		case T_FuncExpr:
 			{
@@ -289,7 +302,7 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 				if (func->funcvariadic)
 					return NULL;
 				return build_func_step(func->funcid, func->funcresulttype, -1,
-									   func->inputcollid, func->args, batch, scanrelid);
+									   func->inputcollid, func->args, batch, vars);
 			}
 		case T_NullTest:
 			{
@@ -300,7 +313,7 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 				step = alloc_step(VEC_NULLTEST, 1, batch->capacity);
 				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
 				step->u.nulltesttype = test->nulltesttype;
-				step->args[0] = build_step(test->arg, batch, scanrelid);
+				step->args[0] = build_step(test->arg, batch, vars);
 				return step->args[0] ? step : NULL;
 			}
 		case T_List:
@@ -312,7 +325,7 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 				argno = 0;
 				foreach(lc, clauses)
 				{
-					step->args[argno] = build_step((Expr *) lfirst(lc), batch, scanrelid);
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
 					if (step->args[argno] == NULL)
 						return NULL;
 					argno++;
@@ -338,7 +351,7 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 				argno = 0;
 				foreach(lc, b->args)
 				{
-					step->args[argno] = build_step((Expr *) lfirst(lc), batch, scanrelid);
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
 					if (step->args[argno] == NULL)
 						return NULL;
 					argno++;
@@ -352,12 +365,12 @@ build_step(Expr *expr, VectorBatch *batch, Index scanrelid)
 
 VectorExprState *
 VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
-				  Index scanrelid)
+				  const VectorExprVarMap *vars)
 {
 	VectorExprState *state;
 	MemoryContext oldcontext;
 
-	if (!VectorExprIsSupported(expr, scanrelid))
+	if (!VectorExprIsSupported(expr, vars))
 		return NULL;
 
 	state = MemoryContextAllocZero(parent, sizeof(VectorExprState));
@@ -367,7 +380,7 @@ VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
 										 ALLOCSET_DEFAULT_MAXSIZE);
 	state->capacity = batch->capacity;
 	oldcontext = MemoryContextSwitchTo(state->context);
-	state->root = build_step(expr, batch, scanrelid);
+	state->root = build_step(expr, batch, vars);
 	MemoryContextSwitchTo(oldcontext);
 	if (state->root == NULL)
 	{
@@ -517,11 +530,9 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 }
 
 void
-VectorExprFilter(VectorBatch *batch, VectorExprState *state)
+VectorExprEval(VectorBatch *batch, VectorExprState *state)
 {
 	MemoryContext oldcontext;
-	int			write = 0;
-	int			pos;
 
 	if (state == NULL)
 		return;
@@ -529,6 +540,26 @@ VectorExprFilter(VectorBatch *batch, VectorExprState *state)
 	CHECK_FOR_INTERRUPTS();
 	oldcontext = MemoryContextSwitchTo(batch->varlena_context);
 	eval_step(state->root, batch, batch->selection, batch->nselected);
+	MemoryContextSwitchTo(oldcontext);
+}
+
+Datum
+VectorExprGetValue(VectorExprState *state, int row, bool *isnull)
+{
+	*isnull = value_is_null(&state->root->value, row);
+	return state->root->value.values[row];
+}
+
+void
+VectorExprFilter(VectorBatch *batch, VectorExprState *state)
+{
+	int			write = 0;
+	int			pos;
+
+	if (state == NULL)
+		return;
+
+	VectorExprEval(batch, state);
 	for (pos = 0; pos < batch->nselected; pos++)
 	{
 		int			row = batch->selection[pos];
@@ -538,5 +569,4 @@ VectorExprFilter(VectorBatch *batch, VectorExprState *state)
 			batch->selection[write++] = row;
 	}
 	batch->nselected = write;
-	MemoryContextSwitchTo(oldcontext);
 }

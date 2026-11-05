@@ -118,6 +118,35 @@ SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
  9784790
 (1 row)
 
+SELECT count(*) FROM vector_aoco_test;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*), sum(id) FROM vector_aoco_small WHERE id < 0;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;
+ val | count 
+-----+-------
+(0 rows)
+
+SELECT later, val, count(*), sum(big), min(num), max(num), min(val), max(val)
+FROM vector_aoco_test
+GROUP BY later, val ORDER BY later, val LIMIT 5;
+ later | val  | count |  sum  | min  | max  | min  | max  
+-------+------+-------+-------+------+------+------+------
+     1 | new1 |     1 | 50010 | 1.25 | 1.25 | new1 | new1
+     2 | new2 |     1 | 50020 | 1.25 | 1.25 | new2 | new2
+     3 | new3 |     1 | 50030 | 1.25 | 1.25 | new3 | new3
+     4 | new4 |     1 | 50040 | 1.25 | 1.25 | new4 | new4
+     6 | new6 |     1 | 50060 | 1.25 | 1.25 | new6 | new6
+(5 rows)
+
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;

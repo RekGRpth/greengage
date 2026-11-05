@@ -48,6 +48,12 @@ WHERE id >= 0 OR 1 / (id - id) = 1;
 SELECT sum(id) FROM vector_aoco_small WHERE NOT (id < 5);
 SELECT sum(id) FROM vector_aoco_small WHERE (val || '') = 'v' || id;
 SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
+SELECT count(*) FROM vector_aoco_test;
+SELECT count(*), sum(id) FROM vector_aoco_small WHERE id < 0;
+SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;
+SELECT later, val, count(*), sum(big), min(num), max(num), min(val), max(val)
+FROM vector_aoco_test
+GROUP BY later, val ORDER BY later, val LIMIT 5;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;

@@ -31,7 +31,7 @@ OBJS = execAmi.o execCurrent.o execExpr.o execExprInterp.o \
        nodeCtescan.o nodeNamedtuplestorescan.o nodeWorktablescan.o \
        nodeSubplan.o nodeSubqueryscan.o nodeTidscan.o \
        nodeForeignscan.o nodeWindowAgg.o tstoreReceiver.o tqueue.o spi.o \
-       nodeTableFuncscan.o nodeVectorRegion.o vectorBatch.o vectorExpr.o
+       nodeTableFuncscan.o nodeVectorRegion.o vectorAgg.o vectorBatch.o vectorExpr.o
 
 OBJS += nodeMotion.o \
        nodeShareInputScan.o \

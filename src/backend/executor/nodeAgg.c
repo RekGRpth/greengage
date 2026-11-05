@@ -254,6 +254,7 @@
 #include "executor/execExpr.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
+#include "executor/vectorAgg.h"
 #include "lib/hyperloglog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -5356,4 +5357,72 @@ agg_hash_explain_extra_message(AggState *aggstate)
 				sum_bucket_total,
 				sum_num_expansions);
 	}
+}
+
+/* Batch-executor entry points into the existing aggregate implementation. */
+void
+VectorAggAdvanceTransition(AggState *aggstate, AggStatePerGroup pergroup,
+						   int transno, Datum *values, bool *isnull)
+{
+	AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+	AggStatePerGroup pergroupstate = &pergroup[transno];
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	int			argno;
+
+	for (argno = 0; argno < pertrans->numTransInputs; argno++)
+	{
+		fcinfo->args[argno + 1].value = values[argno];
+		fcinfo->args[argno + 1].isnull = isnull[argno];
+	}
+	advance_transition_function(aggstate, pertrans, pergroupstate);
+}
+
+void
+VectorAggInitializeEntry(AggState *aggstate, TupleHashEntry entry)
+{
+	initialize_hash_entry(aggstate, aggstate->perhash[0].hashtable, entry);
+	if (aggstate->hash_spill_mode)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("vectorized hash aggregate exceeded its memory limit")));
+}
+
+void
+VectorAggInitializePlain(AggState *aggstate)
+{
+	initialize_aggregates(aggstate, aggstate->pergroups, 0);
+}
+
+void
+VectorAggFinishInput(AggState *aggstate)
+{
+	aggstate->input_done = true;
+	if (aggstate->aggstrategy == AGG_HASHED)
+	{
+		aggstate->table_filled = true;
+		select_current_set(aggstate, 0, true);
+		ResetTupleHashIterator(aggstate->perhash[0].hashtable,
+							   &aggstate->perhash[0].hashiter);
+	}
+}
+
+TupleTableSlot *
+VectorAggRetrievePlain(AggState *aggstate)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+	TupleTableSlot *result;
+
+	ResetExprContext(econtext);
+	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, 0);
+	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[0]);
+	result = project_aggregates(aggstate);
+	aggstate->agg_done = true;
+	return result;
+}
+
+TupleTableSlot *
+VectorAggRetrieveHashed(AggState *aggstate)
+{
+	return agg_retrieve_hash_table_in_memory(aggstate);
 }

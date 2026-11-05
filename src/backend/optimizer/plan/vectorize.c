@@ -17,6 +17,7 @@
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
 #include "executor/nodeVectorRegion.h"
+#include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -71,18 +72,19 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 {
 	RangeTblEntry *rte;
 	ListCell   *lc;
+	VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
 
 	if (scan->scanrelid <= 0 ||
 		scan->plan.lefttree != NULL || scan->plan.righttree != NULL ||
 		scan->plan.initPlan != NIL || scan->plan.extParam != NULL ||
-		scan->plan.allParam != NULL || scan->plan.targetlist == NIL)
+		scan->plan.allParam != NULL)
 		return false;
 
 	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
 	if (rte->rtekind != RTE_RELATION ||
 		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID)
 		return false;
-	if (!VectorExprIsSupported((Expr *) scan->plan.qual, scan->scanrelid))
+	if (!VectorExprIsSupported((Expr *) scan->plan.qual, &vars))
 		return false;
 
 	foreach(lc, scan->plan.targetlist)
@@ -105,9 +107,8 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
  * executor initialization keeps its relation lock and EXPLAIN shows the leaf.
  */
 static Plan *
-make_scan_region(VectorizeContext *ctx, SeqScan *scan)
+make_region(VectorizeContext *ctx, Plan *root)
 {
-	Plan	   *root = &scan->plan;
 	List	   *tlist = root->targetlist;
 	List	   *colnames = NIL;
 	List	   *coltypes = NIL;
@@ -157,7 +158,7 @@ make_scan_region(VectorizeContext *ctx, SeqScan *scan)
 	ctx->stmt->rtable = lappend(ctx->stmt->rtable, rte);
 
 	cs = makeNode(CustomScan);
-	cs->custom_plans = list_make1(scan);
+	cs->custom_plans = list_make1(root);
 	cs->custom_scan_tlist = scan_tlist;
 	cs->custom_relids = bms_make_singleton(rteidx);
 	cs->methods = GetVectorRegionScanMethods();
@@ -194,9 +195,16 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		return result;
 	}
 
+	if (IsA(node, Agg) && slice_runs_on_segments(ctx) &&
+		VectorAggPlanIsSupported((Agg *) node) &&
+		(!IsA(outerPlan(node), SeqScan) ||
+		 is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node))))
+		return (Node *) make_region(ctx, (Plan *) node);
+
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
+		((SeqScan *) node)->plan.targetlist != NIL &&
 		is_simple_aoco_scan(ctx, (SeqScan *) node))
-		return (Node *) make_scan_region(ctx, (SeqScan *) node);
+		return (Node *) make_region(ctx, (Plan *) node);
 
 	return plan_tree_mutator(node, vectorize_mutator, ctx, false);
 }
