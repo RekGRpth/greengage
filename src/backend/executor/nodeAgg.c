@@ -5381,10 +5381,21 @@ void
 VectorAggInitializeEntry(AggState *aggstate, TupleHashEntry entry)
 {
 	initialize_hash_entry(aggstate, aggstate->perhash[0].hashtable, entry);
-	if (aggstate->hash_spill_mode)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("vectorized hash aggregate exceeded its memory limit")));
+}
+
+void
+VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot, uint32 hash)
+{
+	HashAggSpill *spill = &aggstate->hash_spills[0];
+
+	if (spill->partitions == NULL)
+	{
+		hashagg_spill_init(aggstate, spill, aggstate->hash_tapeinfo, 0,
+						   aggstate->perhash[0].aggnode->numGroups,
+						   aggstate->hashentrysize);
+		aggstate->perhash[0].num_spill_parts += spill->npartitions;
+	}
+	hashagg_spill_tuple(aggstate, spill, slot, hash);
 }
 
 void
@@ -5399,6 +5410,7 @@ VectorAggFinishInput(AggState *aggstate)
 	aggstate->input_done = true;
 	if (aggstate->aggstrategy == AGG_HASHED)
 	{
+		hashagg_finish_initial_spills(aggstate);
 		aggstate->table_filled = true;
 		select_current_set(aggstate, 0, true);
 		ResetTupleHashIterator(aggstate->perhash[0].hashtable,
@@ -5424,5 +5436,5 @@ VectorAggRetrievePlain(AggState *aggstate)
 TupleTableSlot *
 VectorAggRetrieveHashed(AggState *aggstate)
 {
-	return agg_retrieve_hash_table_in_memory(aggstate);
+	return agg_retrieve_hash_table(aggstate);
 }

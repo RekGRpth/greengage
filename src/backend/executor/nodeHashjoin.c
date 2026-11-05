@@ -2182,16 +2182,6 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 			return NULL;
 	}
 
-	if (outer == NULL && outer_eof &&
-		node->hj_JoinState == HJ_NEED_NEW_OUTER && hashtable->curbatch > 0 &&
-		hashtable->outerBatchFile[hashtable->curbatch] != NULL)
-	{
-		outer = ExecHashJoinGetSavedTuple(node,
-										 hashtable->outerBatchFile[hashtable->curbatch],
-										 &hashvalue, node->hj_OuterTupleSlot);
-		have_hash = outer != NULL;
-	}
-
 	if (outer != NULL)
 	{
 		int			batchno;
@@ -2227,18 +2217,6 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 			return NULL;
 		}
 		node->hj_JoinState = HJ_SCAN_BUCKET;
-	}
-	else if (node->hj_JoinState == HJ_NEED_NEW_OUTER)
-	{
-		if (outer_eof && HJ_FILL_INNER(node))
-		{
-			ExecPrepHashTableForUnmatched(node);
-			node->hj_JoinState = HJ_FILL_INNER_TUPLES;
-		}
-		else if (outer_eof)
-			node->hj_JoinState = HJ_NEED_NEW_BATCH;
-		else
-			return NULL;
 	}
 
 	for (;;)
@@ -2295,6 +2273,57 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 				break;
 
 			case HJ_NEED_NEW_OUTER:
+				/*
+				 * The outer plan is exhausted once outer_eof is set, but the
+				 * current batch's postponed outer tuples still need probing
+				 * before the batch file is closed by ExecHashJoinNewBatch.
+				 */
+				if (outer_eof && hashtable->curbatch > 0 &&
+					hashtable->outerBatchFile[hashtable->curbatch] != NULL)
+				{
+					outer = ExecHashJoinGetSavedTuple(node,
+											 hashtable->outerBatchFile[hashtable->curbatch],
+													  &hashvalue,
+													  node->hj_OuterTupleSlot);
+					if (outer != NULL)
+					{
+						int			batchno;
+
+						econtext->ecxt_outertuple = outer;
+						node->hj_OuterNotEmpty = true;
+						node->hj_MatchedOuter = false;
+						node->hj_CurHashValue = hashvalue;
+						ExecHashGetBucketAndBatch(hashtable, hashvalue,
+												  &node->hj_CurBucketNo, &batchno);
+						node->hj_CurSkewBucketNo =
+							ExecHashGetSkewBucket(hashtable, hashvalue);
+						node->hj_CurTuple = NULL;
+						if (batchno == hashtable->curbatch ||
+							node->hj_CurSkewBucketNo != INVALID_SKEW_BUCKET_NO)
+						{
+							node->hj_JoinState = HJ_SCAN_BUCKET;
+							continue;
+						}
+
+						/*
+						 * nbatch grew since this tuple was saved: postpone
+						 * it again and read the next one.
+						 */
+						{
+							bool	shouldFree;
+							MinimalTuple mintuple =
+								ExecFetchSlotMinimalTuple(outer, &shouldFree);
+
+							ExecHashJoinSaveTuple(&node->js.ps, mintuple, hashvalue,
+												  hashtable,
+												  &hashtable->outerBatchFile[batchno],
+												  hashtable->bfCxt);
+							if (shouldFree)
+								pfree(mintuple);
+						}
+						continue;
+					}
+				}
 				if (outer_eof && HJ_FILL_INNER(node))
 				{
 					ExecPrepHashTableForUnmatched(node);
@@ -2312,31 +2341,6 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 				if (!ExecHashJoinNewBatch(node))
 					return NULL;
 				node->hj_JoinState = HJ_NEED_NEW_OUTER;
-				if (hashtable->curbatch > 0 &&
-					hashtable->outerBatchFile[hashtable->curbatch] != NULL)
-				{
-					outer = ExecHashJoinGetSavedTuple(node,
-											 hashtable->outerBatchFile[hashtable->curbatch],
-											 &hashvalue, node->hj_OuterTupleSlot);
-					if (outer != NULL)
-					{
-						int			batchno;
-
-						have_hash = true;
-						econtext->ecxt_outertuple = outer;
-						node->hj_OuterNotEmpty = true;
-						node->hj_MatchedOuter = false;
-						node->hj_CurHashValue = hashvalue;
-						ExecHashGetBucketAndBatch(hashtable, hashvalue,
-												  &node->hj_CurBucketNo, &batchno);
-						node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable, hashvalue);
-						node->hj_CurTuple = NULL;
-						if (batchno != hashtable->curbatch &&
-							node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
-							elog(ERROR, "vectorized hash join read an outer tuple from the wrong batch");
-						node->hj_JoinState = HJ_SCAN_BUCKET;
-					}
-				}
 				break;
 
 			default:

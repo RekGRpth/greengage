@@ -4,6 +4,8 @@ DROP TABLE IF EXISTS vector_aoco_small;
 DROP TABLE IF EXISTS vector_join_l;
 DROP TABLE IF EXISTS vector_join_r;
 DROP TABLE IF EXISTS vector_aoco_wide;
+DROP TABLE IF EXISTS vector_aoco_spill;
+DROP TABLE IF EXISTS vector_aoco_spill_wide;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -37,6 +39,14 @@ CREATE TABLE vector_aoco_wide (id int4, pad text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
 ANALYZE vector_aoco_wide;
+CREATE TABLE vector_aoco_spill (grp int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (grp);
+INSERT INTO vector_aoco_spill SELECT g % 10, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
+ANALYZE vector_aoco_spill;
+CREATE TABLE vector_aoco_spill_wide (id int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_spill_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 50000) AS g;
+ANALYZE vector_aoco_spill_wide;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -87,10 +97,12 @@ ORDER BY l.id;
 SELECT l.id FROM vector_join_l l
 WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
 ORDER BY l.id;
-SET statement_mem = '1MB';
+ALTER DATABASE regression SET statement_mem = '400kB';
 SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
 SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t1.id = t2.id AND t2.id < 1000;
-RESET statement_mem;
+SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
+SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
+ALTER DATABASE regression RESET statement_mem;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -107,3 +119,5 @@ DROP TABLE vector_aoco_small;
 DROP TABLE vector_join_l;
 DROP TABLE vector_join_r;
 DROP TABLE vector_aoco_wide;
+DROP TABLE vector_aoco_spill;
+DROP TABLE vector_aoco_spill_wide;

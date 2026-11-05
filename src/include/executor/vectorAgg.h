@@ -29,6 +29,8 @@ extern void VectorAggAdvanceTransition(AggState *aggstate,
 extern void VectorAggInitializeEntry(AggState *aggstate,
 									 TupleHashEntry entry);
 extern void VectorAggInitializePlain(AggState *aggstate);
+extern void VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot,
+								uint32 hash);
 extern void VectorAggFinishInput(AggState *aggstate);
 extern TupleTableSlot *VectorAggRetrievePlain(AggState *aggstate);
 extern TupleTableSlot *VectorAggRetrieveHashed(AggState *aggstate);

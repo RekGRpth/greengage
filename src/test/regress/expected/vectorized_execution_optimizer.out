@@ -4,6 +4,8 @@ DROP TABLE IF EXISTS vector_aoco_small;
 DROP TABLE IF EXISTS vector_join_l;
 DROP TABLE IF EXISTS vector_join_r;
 DROP TABLE IF EXISTS vector_aoco_wide;
+DROP TABLE IF EXISTS vector_aoco_spill;
+DROP TABLE IF EXISTS vector_aoco_spill_wide;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -37,6 +39,14 @@ CREATE TABLE vector_aoco_wide (id int4, pad text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
 ANALYZE vector_aoco_wide;
+CREATE TABLE vector_aoco_spill (grp int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (grp);
+INSERT INTO vector_aoco_spill SELECT g % 10, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
+ANALYZE vector_aoco_spill;
+CREATE TABLE vector_aoco_spill_wide (id int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_spill_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 50000) AS g;
+ANALYZE vector_aoco_spill_wide;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -231,7 +241,7 @@ ORDER BY l.id;
   5
 (3 rows)
 
-SET statement_mem = '1MB';
+ALTER DATABASE regression SET statement_mem = '400kB';
 SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
  count 
 -------
@@ -244,7 +254,28 @@ SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t
   5000
 (1 row)
 
-RESET statement_mem;
+SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
+ grp | count |  sum   
+-----+-------+--------
+   0 |   500 | 500000
+   1 |   500 | 500000
+   2 |   500 | 500000
+   3 |   500 | 500000
+   4 |   500 | 500000
+   5 |   500 | 500000
+   6 |   500 | 500000
+   7 |   500 | 500000
+   8 |   500 | 500000
+   9 |   500 | 500000
+(10 rows)
+
+SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
+ count 
+-------
+ 50000
+(1 row)
+
+ALTER DATABASE regression RESET statement_mem;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -296,3 +327,5 @@ DROP TABLE vector_aoco_small;
 DROP TABLE vector_join_l;
 DROP TABLE vector_join_r;
 DROP TABLE vector_aoco_wide;
+DROP TABLE vector_aoco_spill;
+DROP TABLE vector_aoco_spill_wide;

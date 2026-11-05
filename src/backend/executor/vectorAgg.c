@@ -26,6 +26,7 @@ struct VectorAggState
 	VectorExprState ***args;
 	Datum	  **values;
 	bool	  **nulls;
+	TupleTableSlot *input_slot;	/* full input row, for spilling */
 	bool		input_done;
 	bool		output_done;
 };
@@ -37,6 +38,10 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	SeqScan	   *scan;
 	ListCell   *lc;
 	int			col = 0;
+
+	if (!IsA(outer, SeqScan) && !IsA(outer, Motion) &&
+		agg->aggstrategy != AGG_HASHED)
+		return false;
 
 	vars->outer_ncols = list_length(outer->targetlist);
 	vars->outer_attnos = MemoryContextAlloc(context,
@@ -81,7 +86,6 @@ VectorAggPlanIsSupported(Agg *agg)
 {
 	VectorExprVarMap vars;
 	ListCell   *lc;
-	bool		hasagg = false;
 	int			col;
 	bool		supported = false;
 
@@ -124,7 +128,6 @@ VectorAggPlanIsSupported(Agg *agg)
 			Aggref	   *aggref = (Aggref *) te->expr;
 			ListCell   *arglc;
 
-			hasagg = true;
 			if (aggref->aggkind != AGGKIND_NORMAL || aggref->agglevelsup != 0 ||
 				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
 				aggref->aggorder != NIL || aggref->aggdistinct != NIL ||
@@ -140,7 +143,7 @@ VectorAggPlanIsSupported(Agg *agg)
 			}
 		}
 	}
-	supported = hasagg;
+	supported = true;
 
 done:
 	pfree(vars.outer_attnos);
@@ -204,6 +207,15 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 	if (agg->aggstrategy == AGG_PLAIN)
 		VectorAggInitializePlain(agg);
 	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Spilled rows are read back by nodeAgg's refill machinery, which reads
+	 * group keys and aggregate arguments alike from the input tuple.  Spill
+	 * therefore needs the full input row, not just the grouping columns.
+	 */
+	state->input_slot = ExecInitExtraTupleSlot(agg->ss.ps.state,
+											   agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+											   &TTSOpsVirtual);
 	return state;
 }
 
@@ -232,6 +244,25 @@ eval_arguments(VectorAggState *state, VectorBatch *batch)
 	}
 }
 
+/* Build the full input row of a batch position in the input layout. */
+static TupleTableSlot *
+fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
+{
+	TupleTableSlot *slot = state->input_slot;
+	int			col;
+
+	ExecClearTuple(slot);
+	for (col = 0; col < state->vars.outer_ncols; col++)
+	{
+		AttrNumber	attno = state->vars.outer_attnos[col];
+
+		slot->tts_values[col] = batch->columns[attno - 1].values[row];
+		slot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
+	}
+	ExecStoreVirtualTuple(slot);
+	return slot;
+}
+
 static AggStatePerGroup
 lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 {
@@ -240,6 +271,7 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	TupleTableSlot *hashslot = perhash->hashslot;
 	TupleHashEntry entry;
 	bool		isnew = false;
+	uint32		hash = 0;
 	int			col;
 
 	ExecClearTuple(hashslot);
@@ -254,17 +286,26 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	ExecStoreVirtualTuple(hashslot);
 
 	if (agg->hash_spill_mode)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("vectorized hash aggregate exceeded its memory limit")));
-	entry = LookupTupleHashEntry(perhash->hashtable, hashslot, &isnew, NULL);
-	if (entry == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("vectorized hash aggregate could not create a group")));
-	if (isnew)
-		VectorAggInitializeEntry(agg, entry);
-	return (AggStatePerGroup) entry->additional;
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, NULL, &hash);
+	else
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, &isnew, &hash);
+	if (entry != NULL)
+	{
+		if (isnew)
+			VectorAggInitializeEntry(agg, entry);
+		return (AggStatePerGroup) entry->additional;
+	}
+
+	/* A new group that no longer fits is spilled and processed on refill. */
+	if (agg->hash_spill_mode)
+	{
+		VectorAggSpillTuple(agg, fill_input_slot(state, batch, row), hash);
+		return NULL;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("vectorized hash aggregate could not create a group")));
+	return NULL;
 }
 
 void
@@ -286,7 +327,14 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 		if ((pos & 0xff) == 0)
 			CHECK_FOR_INTERRUPTS();
 		if (agg->aggstrategy == AGG_HASHED)
+		{
 			pergroup = lookup_group(state, batch, row);
+			if (pergroup == NULL)
+			{
+				ResetExprContext(agg->tmpcontext);
+				continue;
+			}
+		}
 		else
 			pergroup = agg->pergroups[0];
 

@@ -313,6 +313,11 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		return result;
 	}
 
+	/* Prefer a hashed aggregate below a plain partial/final aggregate. */
+	if (IsA(node, Agg) && ((Agg *) node)->aggstrategy == AGG_PLAIN &&
+		IsA(outerPlan(node), Agg))
+		return plan_tree_mutator(node, vectorize_mutator, ctx, false);
+
 	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
 		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node)) &&
