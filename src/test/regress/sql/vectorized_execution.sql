@@ -73,6 +73,25 @@ WHERE id >= 0 OR 1 / (id - id) = 1;
 SELECT sum(id) FROM vector_aoco_small WHERE NOT (id < 5);
 SELECT sum(id) FROM vector_aoco_small WHERE (val || '') = 'v' || id;
 SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
+SELECT count(*) FROM vector_aoco_test WHERE id IN (1, 2, 3, 5000, 99999);
+SELECT count(*) FROM vector_aoco_test WHERE id NOT IN (4, 5, 6000);
+SELECT count(*) FROM vector_aoco_test WHERE val IN ('new1', 'new2', 'v10', 'nope');
+SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
+SELECT coalesce(val, 'MISSING'), count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1 LIMIT 4;
+SELECT sum(coalesce(later, 0)), count(coalesce(val, 'x')) FROM vector_aoco_test;
+SELECT sum(CASE WHEN id % 2 = 0 THEN big ELSE -big END) FROM vector_aoco_test;
+SELECT CASE WHEN num > 20 THEN 'high' WHEN num > 5 THEN 'mid' ELSE 'low' END AS bucket, count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+SELECT count(*) FROM vector_aoco_test
+WHERE CASE WHEN val IS NULL THEN false ELSE length(val) > 4 END;
+SELECT count(*), sum(CASE WHEN val IS NULL THEN 1 ELSE 0 END) FROM vector_aoco_test;
+SELECT count(*) FROM vector_aoco_test WHERE (id % 2 = 0) IS TRUE;
+SELECT count(*) FROM vector_aoco_test WHERE (id % 11 = 0) IS NOT TRUE;
+SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS UNKNOWN;
+SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS NOT UNKNOWN;
+SELECT sum(CASE WHEN id % 3 = 0 THEN num * 2 WHEN id % 3 = 1 THEN num ELSE NULL END)
+FROM vector_aoco_test;
 SELECT count(*) FROM vector_aoco_test;
 SELECT count(*), sum(id) FROM vector_aoco_small WHERE id < 0;
 SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;

@@ -143,6 +143,105 @@ SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
  9784790
 (1 row)
 
+SELECT count(*) FROM vector_aoco_test WHERE id IN (1, 2, 3, 5000, 99999);
+ count 
+-------
+     4
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE id NOT IN (4, 5, 6000);
+ count 
+-------
+  4553
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE val IN ('new1', 'new2', 'v10', 'nope');
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
+ count 
+-------
+    55
+(1 row)
+
+SELECT coalesce(val, 'MISSING'), count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1 LIMIT 4;
+ coalesce | count 
+----------+-------
+ MISSING  |   650
+ new1     |     1
+ new10    |     1
+ new2     |     1
+(4 rows)
+
+SELECT sum(coalesce(later, 0)), count(coalesce(val, 'x')) FROM vector_aoco_test;
+  sum   | count 
+--------+-------
+ 190982 |  4555
+(1 row)
+
+SELECT sum(CASE WHEN id % 2 = 0 THEN big ELSE -big END) FROM vector_aoco_test;
+  sum  
+-------
+ 50130
+(1 row)
+
+SELECT CASE WHEN num > 20 THEN 'high' WHEN num > 5 THEN 'mid' ELSE 'low' END AS bucket, count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ bucket | count 
+--------+-------
+ high   |  1770
+ low    |   739
+ mid    |  2046
+(3 rows)
+
+SELECT count(*) FROM vector_aoco_test
+WHERE CASE WHEN val IS NULL THEN false ELSE length(val) > 4 END;
+ count 
+-------
+  3118
+(1 row)
+
+SELECT count(*), sum(CASE WHEN val IS NULL THEN 1 ELSE 0 END) FROM vector_aoco_test;
+ count | sum 
+-------+-----
+  4555 | 650
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (id % 2 = 0) IS TRUE;
+ count 
+-------
+  2278
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (id % 11 = 0) IS NOT TRUE;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS UNKNOWN;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS NOT UNKNOWN;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT sum(CASE WHEN id % 3 = 0 THEN num * 2 WHEN id % 3 = 1 THEN num ELSE NULL END)
+FROM vector_aoco_test;
+   sum    
+----------
+ 74813.60
+(1 row)
+
 SELECT count(*) FROM vector_aoco_test;
  count 
 -------

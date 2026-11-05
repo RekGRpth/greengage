@@ -19,6 +19,8 @@
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 
 typedef enum VectorExprKind
@@ -30,7 +32,11 @@ typedef enum VectorExprKind
 	VEC_AND,
 	VEC_OR,
 	VEC_NOT,
-	VEC_NULLTEST
+	VEC_NULLTEST,
+	VEC_COALESCE,
+	VEC_CASE,
+	VEC_SAOP,
+	VEC_BOOLTEST
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -59,6 +65,19 @@ typedef struct VectorExprStep
 			bool		strict;
 		}			func;
 		NullTestType nulltesttype;
+		BoolTestType booltesttype;
+		struct
+		{
+			/* SAOP needs the function machinery and the elements together,
+			 * so it cannot share the func member. */
+			FunctionCallInfo fcinfo;
+			FmgrInfo	fn;
+			bool		strict;
+			Datum	   *elems;
+			bool	   *elem_nulls;
+			int			nelems;
+			bool		useOr;		/* = ANY when set, <> ALL otherwise */
+		}			saop;
 	}			u;
 } VectorExprStep;
 
@@ -188,6 +207,48 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 				}
 				return true;
 			}
+		case T_CoalesceExpr:
+			foreach(lc, ((CoalesceExpr *) expr)->args)
+			{
+				if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
+					return false;
+			}
+			return true;
+		case T_CaseExpr:
+			{
+				CaseExpr   *ce = (CaseExpr *) expr;
+
+				/* searched CASE only; simple CASE carries a CaseTestExpr */
+				if (ce->arg != NULL)
+					return false;
+				foreach(lc, ce->args)
+				{
+					CaseWhen   *w = (CaseWhen *) lfirst(lc);
+
+					if (!VectorExprIsSupported(w->expr, vars) ||
+						!VectorExprIsSupported(w->result, vars))
+						return false;
+				}
+				return ce->defresult == NULL ||
+					VectorExprIsSupported(ce->defresult, vars);
+			}
+		case T_ScalarArrayOpExpr:
+			{
+				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) expr;
+				Expr	   *rexpr;
+
+				if (!OidIsValid(sa->opfuncid) ||
+					func_volatile(sa->opfuncid) != PROVOLATILE_IMMUTABLE)
+					return false;
+				if (list_length(sa->args) != 2)
+					return false;
+				rexpr = lsecond(sa->args);
+				if (!IsA(rexpr, Const) || ((Const *) rexpr)->constisnull)
+					return false;
+				return VectorExprIsSupported(linitial(sa->args), vars);
+			}
+		case T_BooleanTest:
+			return VectorExprIsSupported(((BooleanTest *) expr)->arg, vars);
 		default:
 			return false;
 	}
@@ -202,7 +263,8 @@ alloc_step(VectorExprKind kind, int nargs, int capacity)
 	step->nargs = nargs;
 	if (nargs > 0)
 		step->args = palloc0(sizeof(VectorExprStep *) * nargs);
-	if (kind == VEC_AND || kind == VEC_OR)
+	if (kind == VEC_AND || kind == VEC_OR || kind == VEC_COALESCE ||
+		kind == VEC_CASE)
 	{
 		step->scratch[0] = palloc(sizeof(int32) * capacity);
 		step->scratch[1] = palloc(sizeof(int32) * capacity);
@@ -314,6 +376,89 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
 				step->u.nulltesttype = test->nulltesttype;
 				step->args[0] = build_step(test->arg, batch, vars);
+				return step->args[0] ? step : NULL;
+			}
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *ce = (CoalesceExpr *) expr;
+
+				step = alloc_step(VEC_COALESCE, list_length(ce->args),
+								  batch->capacity);
+				init_value(&step->value, ce->coalescetype, -1,
+						   batch->capacity, true);
+				argno = 0;
+				foreach(lc, ce->args)
+				{
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
+					if (step->args[argno] == NULL)
+						return NULL;
+					argno++;
+				}
+				return step;
+			}
+		case T_CaseExpr:
+			{
+				CaseExpr   *ce = (CaseExpr *) expr;
+				int			nwhens = list_length(ce->args);
+				int			slot = 0;
+
+				if (ce->arg != NULL)
+					return NULL;	/* simple CASE; rejected earlier */
+				step = alloc_step(VEC_CASE, 2 * nwhens + 1, batch->capacity);
+				init_value(&step->value, ce->casetype, -1, batch->capacity, true);
+				foreach(lc, ce->args)
+				{
+					CaseWhen   *w = (CaseWhen *) lfirst(lc);
+
+					step->args[slot++] = build_step(w->expr, batch, vars);
+					if (step->args[slot - 1] == NULL)
+						return NULL;
+					step->args[slot++] = build_step(w->result, batch, vars);
+					if (step->args[slot - 1] == NULL)
+						return NULL;
+				}
+				/* the ELSE slot stays NULL when the CASE has no ELSE */
+				step->args[slot] = ce->defresult ?
+					build_step(ce->defresult, batch, vars) : NULL;
+				if (ce->defresult && step->args[slot] == NULL)
+					return NULL;
+				return step;
+			}
+		case T_ScalarArrayOpExpr:
+			{
+				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) expr;
+				Const	   *arr = (Const *) lsecond(sa->args);
+				Oid			elemtype = get_element_type(arr->consttype);
+				int16		elmlen;
+				bool		elembyval;
+				char		elemalign;
+
+				if (!OidIsValid(elemtype))
+					return NULL;
+				step = alloc_step(VEC_SAOP, 1, batch->capacity);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				get_typlenbyvalalign(elemtype, &elmlen, &elembyval, &elemalign);
+				deconstruct_array(DatumGetArrayTypeP(arr->constvalue),
+								  elemtype, elmlen, elembyval, elemalign,
+								  &step->u.saop.elems, &step->u.saop.elem_nulls,
+								  &step->u.saop.nelems);
+				step->u.saop.useOr = sa->useOr;
+				fmgr_info(sa->opfuncid, &step->u.saop.fn);
+				step->u.saop.fcinfo = palloc0(SizeForFunctionCallInfo(2));
+				InitFunctionCallInfoData(*step->u.saop.fcinfo, &step->u.saop.fn,
+										 2, sa->inputcollid, NULL, NULL);
+				step->u.saop.strict = step->u.saop.fn.fn_strict;
+				step->args[0] = build_step((Expr *) linitial(sa->args), batch, vars);
+				return step->args[0] ? step : NULL;
+			}
+		case T_BooleanTest:
+			{
+				BooleanTest *bt = (BooleanTest *) expr;
+
+				step = alloc_step(VEC_BOOLTEST, 1, batch->capacity);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				step->u.booltesttype = bt->booltesttype;
+				step->args[0] = build_step(bt->arg, batch, vars);
 				return step->args[0] ? step : NULL;
 			}
 		case T_List:
@@ -523,6 +668,198 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				bool		isnull = value_is_null(&step->args[0]->value, row);
 				bool		result = step->u.nulltesttype == IS_NULL ? isnull : !isnull;
 
+				value_set(&step->value, row, BoolGetDatum(result), false);
+			}
+			return;
+		case VEC_COALESCE:
+			{
+				int32	   *pending = step->scratch[0];
+				int			npending = nselected;
+				int			argno;
+
+				memcpy(pending, selection, sizeof(int32) * nselected);
+				for (argno = 0; argno < step->nargs && npending > 0; argno++)
+				{
+					VectorExprStep *arg = step->args[argno];
+					int			write = 0;
+					int			p;
+
+					eval_step(arg, batch, pending, npending);
+					/* in-place: rows kept never overtake the read position */
+					for (p = 0; p < npending; p++)
+					{
+						int			row = pending[p];
+
+						if (value_is_null(&arg->value, row))
+							pending[write++] = row;
+						else
+							value_set(&step->value, row, arg->value.values[row],
+									  false);
+					}
+					npending = write;
+				}
+				for (pos = 0; pos < npending; pos++)
+					value_set(&step->value, pending[pos], (Datum) 0, true);
+			}
+			return;
+		case VEC_CASE:
+			{
+				int32	   *pending = step->scratch[0];
+				int32	   *taken = step->scratch[1];
+				int			npending = nselected;
+				int			nwhens = (step->nargs - 1) / 2;
+				int			w;
+
+				memcpy(pending, selection, sizeof(int32) * nselected);
+				for (w = 0; w < nwhens && npending > 0; w++)
+				{
+					VectorExprStep *when = step->args[2 * w];
+					VectorExprStep *then = step->args[2 * w + 1];
+					int			ntaken = 0;
+					int			keep = 0;
+					int			p;
+
+					eval_step(when, batch, pending, npending);
+					for (p = 0; p < npending; p++)
+					{
+						int			row = pending[p];
+
+						if (!value_is_null(&when->value, row) &&
+							DatumGetBool(when->value.values[row]))
+							taken[ntaken++] = row;
+						else
+							pending[keep++] = row;
+					}
+					npending = keep;
+
+					if (ntaken > 0)
+					{
+						int			t;
+
+						eval_step(then, batch, taken, ntaken);
+						for (t = 0; t < ntaken; t++)
+						{
+							int			row = taken[t];
+
+							value_set(&step->value, row, then->value.values[row],
+									  value_is_null(&then->value, row));
+						}
+					}
+				}
+				if (npending > 0)
+				{
+					VectorExprStep *els = step->args[2 * nwhens];
+					int			p;
+
+					if (els != NULL)
+					{
+						eval_step(els, batch, pending, npending);
+						for (p = 0; p < npending; p++)
+						{
+							int			row = pending[p];
+
+							value_set(&step->value, row, els->value.values[row],
+									  value_is_null(&els->value, row));
+						}
+					}
+					else
+					{
+						for (p = 0; p < npending; p++)
+							value_set(&step->value, pending[p], (Datum) 0, true);
+					}
+				}
+			}
+			return;
+		case VEC_SAOP:
+			{
+				VectorExprStep *arg = step->args[0];
+				FunctionCallInfo fcinfo = step->u.saop.fcinfo;
+
+				eval_step(arg, batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					bool		anynull = false;
+					int			decided = -1;
+					int			e;
+
+					if (value_is_null(&arg->value, row))
+					{
+						value_set(&step->value, row, (Datum) 0, true);
+						continue;
+					}
+					fcinfo->args[0].value = arg->value.values[row];
+					fcinfo->args[0].isnull = false;
+					for (e = 0; e < step->u.saop.nelems && decided < 0; e++)
+					{
+						Datum		r;
+						bool		rnull;
+
+						if (step->u.saop.elem_nulls[e])
+						{
+							anynull = true;
+							continue;
+						}
+						fcinfo->args[1].value = step->u.saop.elems[e];
+						fcinfo->args[1].isnull = false;
+						fcinfo->isnull = false;
+						r = FunctionCallInvoke(fcinfo);
+						rnull = fcinfo->isnull;
+						if (!rnull && DatumGetBool(r))
+						{
+							if (step->u.saop.useOr)
+								decided = 1;	/* = ANY saw a match */
+						}
+						else if (!rnull)
+						{
+							if (!step->u.saop.useOr)
+								decided = 0;	/* <> ALL saw a mismatch */
+						}
+						else
+							anynull = true;
+					}
+					if (decided == 1)
+						value_set(&step->value, row, BoolGetDatum(true), false);
+					else if (decided == 0)
+						value_set(&step->value, row, BoolGetDatum(false), false);
+					else if (anynull)
+						value_set(&step->value, row, (Datum) 0, true);
+					else
+						value_set(&step->value, row,
+								  BoolGetDatum(!step->u.saop.useOr), false);
+				}
+			}
+			return;
+		case VEC_BOOLTEST:
+			eval_step(step->args[0], batch, selection, nselected);
+			for (pos = 0; pos < nselected; pos++)
+			{
+				int			row = selection[pos];
+				bool		isnull = value_is_null(&step->args[0]->value, row);
+				bool		value = !isnull && DatumGetBool(step->args[0]->value.values[row]);
+				bool		result = false;
+
+				switch (step->u.booltesttype)
+				{
+					case IS_TRUE:
+						result = value;
+						break;
+					case IS_NOT_TRUE:
+						result = !value;
+						break;
+					case IS_FALSE:
+						result = !isnull && !value;
+						break;
+					case IS_NOT_FALSE:
+						result = isnull || value;
+						break;
+					case IS_UNKNOWN:
+						result = isnull;
+						break;
+					case IS_NOT_UNKNOWN:
+						result = !isnull;
+						break;
+				}
 				value_set(&step->value, row, BoolGetDatum(result), false);
 			}
 			return;
