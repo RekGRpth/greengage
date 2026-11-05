@@ -1,6 +1,8 @@
 SET client_min_messages = warning;
 DROP TABLE IF EXISTS vector_aoco_test;
 DROP TABLE IF EXISTS vector_aoco_small;
+DROP TABLE IF EXISTS vector_join_l;
+DROP TABLE IF EXISTS vector_join_r;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -22,6 +24,14 @@ DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_small
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_aoco_small;
+CREATE TABLE vector_join_l (id int4, l text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+CREATE TABLE vector_join_r (id int4, r text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_join_l SELECT g, 'l' || g FROM generate_series(1, 5) AS g;
+INSERT INTO vector_join_r VALUES (3, 'r3a'), (3, 'r3b'), (4, 'r4'), (6, 'r6'), (8, 'r8');
+ANALYZE vector_join_l;
+ANALYZE vector_join_r;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -54,6 +64,26 @@ SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;
 SELECT later, val, count(*), sum(big), min(num), max(num), min(val), max(val)
 FROM vector_aoco_test
 GROUP BY later, val ORDER BY later, val LIMIT 5;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l RIGHT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l FULL JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
+DROP TABLE vector_join_l;
+DROP TABLE vector_join_r;

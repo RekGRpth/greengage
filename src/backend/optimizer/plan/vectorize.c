@@ -19,6 +19,7 @@
 #include "executor/nodeVectorRegion.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
+#include "executor/vectorHashJoin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
@@ -194,6 +195,12 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		ctx->slice = saved_slice;
 		return result;
 	}
+
+	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
+		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
+		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node)) &&
+		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(innerPlan(node))))
+		return (Node *) make_region(ctx, (Plan *) node);
 
 	if (IsA(node, Agg) && slice_runs_on_segments(ctx) &&
 		VectorAggPlanIsSupported((Agg *) node) &&

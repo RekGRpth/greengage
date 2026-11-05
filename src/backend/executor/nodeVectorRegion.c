@@ -21,6 +21,7 @@
 #include "executor/vectorAgg.h"
 #include "executor/vectorBatch.h"
 #include "executor/vectorExpr.h"
+#include "executor/vectorHashJoin.h"
 #include "nodes/extensible.h"
 #include "utils/rel.h"
 
@@ -32,7 +33,9 @@ typedef struct VectorRegionState
 	SeqScanState *scan;
 	PlanState  *input;
 	AggState   *agg;
+	HashJoinState *hj;
 	VectorAggState *vagg;
+	VectorHashJoinState *vhj;
 	VectorBatch *batch;
 	VectorExprState *qual;
 	int		   *output_attnos;
@@ -132,6 +135,11 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->input = outer;
 	}
+	else if (IsA(child, HashJoinState))
+	{
+		state->hj = (HashJoinState *) child;
+		state->scan = (SeqScanState *) outerPlanState(state->hj);
+	}
 	else if (IsA(child, SeqScanState))
 		state->scan = (SeqScanState *) child;
 	else
@@ -149,7 +157,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			elog(ERROR, "vector region leaf is not an AOCS relation");
 	}
 
-	if (state->agg == NULL)
+	if (state->agg == NULL && state->hj == NULL)
 	{
 		state->output_ncols = list_length(scan->plan.targetlist);
 		if (state->output_ncols != node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts)
@@ -194,6 +202,12 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 										  state->batch);
 			if (state->vagg == NULL)
 				elog(ERROR, "vector region could not initialize its aggregate");
+		}
+		if (state->hj != NULL)
+		{
+			state->vhj = VectorHashJoinCreate(estate->es_query_cxt, state->hj);
+			if (state->vhj == NULL)
+				elog(ERROR, "vector region could not initialize its hash join");
 		}
 	}
 }
@@ -287,6 +301,24 @@ VectorRegionExec(CustomScanState *node)
 	int			row;
 	int			col;
 
+	if (state->hj != NULL)
+	{
+		for (;;)
+		{
+			TupleTableSlot *result;
+
+			if (!VectorRegionNextBatch(state))
+				return VectorHashJoinFinish(state->vhj);
+			if (VectorHashJoinInProgress(state->vhj))
+				result = VectorHashJoinContinue(state->vhj);
+			else
+				result = VectorHashJoinNextRow(state->vhj, state->batch,
+										   state->position++);
+			if (result != NULL)
+				return result;
+		}
+	}
+
 	if (state->agg != NULL)
 	{
 		while (VectorRegionNextBatch(state))
@@ -320,6 +352,8 @@ VectorRegionEnd(CustomScanState *node)
 	VectorRegionState *state = (VectorRegionState *) node;
 	ListCell   *lc;
 
+	if (state->vhj != NULL)
+		VectorHashJoinDestroy(state->vhj);
 	if (state->vagg != NULL)
 		VectorAggDestroy(state->vagg);
 	if (state->batch != NULL)
@@ -344,7 +378,9 @@ VectorRegionRescan(CustomScanState *node)
 	state->eof = false;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
-	if (state->vagg != NULL)
+	if (state->vhj != NULL)
+		VectorHashJoinReset(state->vhj);
+	else if (state->vagg != NULL)
 		VectorAggReset(state->vagg);
 	else
 	{
