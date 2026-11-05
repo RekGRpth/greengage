@@ -473,6 +473,31 @@ EXPLAIN (COSTS OFF) SELECT id FROM vector_aoco_test LIMIT 3;
                ->  Seq Scan on vector_aoco_test
 (5 rows)
 
+EXPLAIN (COSTS OFF) SELECT id, id * 2 AS d FROM vector_aoco_test LIMIT 3;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Limit
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Seq Scan on vector_aoco_test
+(6 rows)
+
+SELECT sum(id * 2 + 1) FROM vector_aoco_test;
+   sum    
+----------
+ 22827385
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id, val FROM vector_aoco_test LIMIT 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Limit
+               ->  Seq Scan on vector_aoco_test
+(5 rows)
+
 SET statement_mem = '256kB';
 EXPLAIN (COSTS OFF) SELECT val, count(*) FROM vector_aoco_test GROUP BY val;
                          QUERY PLAN                         

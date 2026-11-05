@@ -176,12 +176,14 @@ conversion_cost(Plan *plan)
 {
 	double		cost = 0;
 
-	/* The row-to-batch adapter converts every value crossing its boundary. */
+	/*
+	 * The row-to-batch adapter converts every value crossing its boundary.
+	 * A scan region has no boundary to cross: it fills its own batches, and
+	 * measured batch reads beat row scans on by-value data.
+	 */
 	if (IsA(plan, Agg) && !IsA(outerPlan(plan), SeqScan))
 		cost += input_rows(plan) * list_length(outerPlan(plan)->targetlist) *
 			(17.0 / 15000.0);
-	if (IsA(plan, SeqScan))
-		cost += plan->plan_rows * list_length(plan->targetlist) * (10.0 / 15000.0);
 	return cost;
 }
 
@@ -251,9 +253,37 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 
 	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_FORCE)
 		return true;
-	if (!IsA(plan, Agg) && !IsA(plan, HashJoin))
+	/*
+	 * A bare scan is worth wrapping under auto only when its targetlist
+	 * carries projection expressions: the batch scan alone beats the row
+	 * scan on pass-by-value data, but the planner already delivers plain
+	 * columns row-wise just as fast as we can materialize them, while a
+	 * projection evaluates once per batch instead of once per row.
+	 */
+	if (IsA(plan, SeqScan))
 	{
-		decision(ctx, plan, "auto mode does not wrap a bare scan");
+		ListCell   *lc;
+		bool		has_projection = false;
+
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+			if (!IsA(te->expr, Var))
+			{
+				has_projection = true;
+				break;
+			}
+		}
+		if (!has_projection)
+		{
+			decision(ctx, plan, "auto mode does not wrap a plain scan");
+			return false;
+		}
+	}
+	else if (!IsA(plan, Agg) && !IsA(plan, HashJoin))
+	{
+		decision(ctx, plan, "auto mode does not wrap this node");
 		return false;
 	}
 	if (input_rows(plan) < (double) gp_vectorized_min_rows)
@@ -261,7 +291,7 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 		decision(ctx, plan, "estimated input rows are below gp_vectorized_min_rows");
 		return false;
 	}
-	if (leaf_has_byref(outerPlan(plan)) ||
+	if (leaf_has_byref(IsA(plan, SeqScan) ? plan : outerPlan(plan)) ||
 		(IsA(plan, HashJoin) && leaf_has_byref(outerPlan(innerPlan(plan)))))
 	{
 		decision(ctx, plan, "the leaf reads pass-by-reference columns");
