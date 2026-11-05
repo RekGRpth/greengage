@@ -415,6 +415,10 @@ extern bool create_restartpoint_on_ckpt_record_replay;
 #define GP_VECTORIZED_EXECUTION_AUTO	2
 
 extern int	gp_vectorized_execution;
+extern int	gp_vectorized_min_rows;
+extern double gp_vectorized_cost_op_factor;
+extern double gp_vectorized_cost_margin;
+extern bool gp_vectorized_explain_decisions;
 
 /* Optimizer related gucs */
 extern bool	optimizer;

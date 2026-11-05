@@ -256,6 +256,10 @@ bool		gp_eager_two_phase_agg = false;
 bool		gp_force_random_redistribution = false;
 
 int			gp_vectorized_execution = GP_VECTORIZED_EXECUTION_OFF;
+int			gp_vectorized_min_rows = 10000;
+double		gp_vectorized_cost_op_factor = 0.25;
+double		gp_vectorized_cost_margin = 0.25;
+bool		gp_vectorized_explain_decisions = false;
 
 /* Optimizer related gucs */
 bool		optimizer;
@@ -1832,6 +1836,16 @@ struct config_bool ConfigureNamesBool_gp[] =
 	},
 
 	{
+		{"gp_vectorized_explain_decisions", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log decisions made by the vectorized execution planner pass."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_vectorized_explain_decisions,
+		false, NULL, NULL
+	},
+
+	{
 		{"optimizer", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enable GPORCA."),
 			NULL
@@ -3193,6 +3207,17 @@ struct config_int ConfigureNamesInt_gp[] =
 	},
 
 	{
+		{"gp_vectorized_min_rows", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the minimum estimated input rows for a vectorized region."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_vectorized_min_rows,
+		10000, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"statement_mem", PGC_USERSET, RESOURCES_MEM,
 			gettext_noop("Sets the memory to be reserved for a statement."),
 			NULL,
@@ -4416,6 +4441,28 @@ struct config_int ConfigureNamesInt_gp[] =
 
 struct config_real ConfigureNamesReal_gp[] =
 {
+	{
+		{"gp_vectorized_cost_op_factor", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the estimated cost of a vectorized operator relative to the row executor."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_vectorized_cost_op_factor,
+		0.25, 0.0, 10.0,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"gp_vectorized_cost_margin", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the required fractional cost advantage of a vectorized region."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_vectorized_cost_margin,
+		0.25, 0.0, 10.0,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"disable_cost", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Sets the planner's cost of a disabled path."),

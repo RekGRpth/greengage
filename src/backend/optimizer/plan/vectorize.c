@@ -16,6 +16,7 @@
 #include "cdb/cdbllize.h"
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
+#include "cdb/memquota.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
@@ -103,6 +104,118 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 	return true;
 }
 
+static const char *
+plan_node_name(Plan *plan)
+{
+	switch (nodeTag(plan))
+	{
+		case T_Agg: return "Agg";
+		case T_HashJoin: return "HashJoin";
+		case T_SeqScan: return "SeqScan";
+		default: return "plan node";
+	}
+}
+
+static void
+decision(VectorizeContext *ctx, Plan *plan, const char *reason)
+{
+	if (!gp_vectorized_explain_decisions)
+		return;
+	elog(DEBUG1, "vectorized execution: %s (plan node %d): %s",
+		 plan_node_name(plan), plan->plan_node_id, reason);
+}
+
+static double
+input_rows(Plan *plan)
+{
+	if (IsA(plan, Agg))
+		return outerPlan(plan)->plan_rows;
+	if (IsA(plan, HashJoin))
+		return outerPlan(plan)->plan_rows + innerPlan(plan)->plan_rows;
+	return plan->plan_rows;
+}
+
+static double
+conversion_cost(Plan *plan)
+{
+	double		cost = 0;
+
+	/* The row-to-batch adapter converts every value crossing its boundary. */
+	if (IsA(plan, Agg) && !IsA(outerPlan(plan), SeqScan))
+		cost += input_rows(plan) * list_length(outerPlan(plan)->targetlist) *
+			(17.0 / 15000.0);
+	if (IsA(plan, SeqScan))
+		cost += plan->plan_rows * list_length(plan->targetlist) * (10.0 / 15000.0);
+	return cost;
+}
+
+static double
+workset_kb(Plan *plan)
+{
+	if (IsA(plan, Agg) && ((Agg *) plan)->aggstrategy == AGG_HASHED)
+	{
+		Agg		   *agg = (Agg *) plan;
+		double		bytes = Max(agg->numGroups, 1) *
+			(outerPlan(agg)->plan_width +
+			 list_length(agg->plan.targetlist) * sizeof(AggStatePerGroupData));
+
+		return bytes * 2.0 / 1024.0;
+	}
+	if (IsA(plan, HashJoin))
+	{
+		Plan	   *inner = outerPlan(innerPlan(plan));
+
+		return inner->plan_rows * inner->plan_width * 2.0 / 1024.0;
+	}
+	return 0;
+}
+
+static uint64
+memory_quota_kb(Plan *plan)
+{
+	if (IsA(plan, HashJoin))
+		return innerPlan(plan)->operatorMemKB;
+	return plan->operatorMemKB;
+}
+
+static bool
+auto_allowed(VectorizeContext *ctx, Plan *plan)
+{
+	double		pg_cost;
+	double		vector_cost;
+	double		quota;
+
+	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_FORCE)
+		return true;
+	if (!IsA(plan, Agg) && !IsA(plan, HashJoin))
+	{
+		decision(ctx, plan, "auto mode does not wrap a bare scan");
+		return false;
+	}
+	if (input_rows(plan) < (double) gp_vectorized_min_rows)
+	{
+		decision(ctx, plan, "estimated input rows are below gp_vectorized_min_rows");
+		return false;
+	}
+
+	quota = memory_quota_kb(plan);
+	if (quota > 0 && workset_kb(plan) > quota)
+	{
+		decision(ctx, plan, "the estimated working set exceeds the operator memory quota");
+		return false;
+	}
+
+	pg_cost = plan->total_cost;
+	vector_cost = pg_cost * gp_vectorized_cost_op_factor + conversion_cost(plan);
+	if (vector_cost * (1.0 + gp_vectorized_cost_margin) >= pg_cost)
+	{
+		decision(ctx, plan, "the cost gate prefers the standard executor");
+		return false;
+	}
+	decision(ctx, plan, "vector region accepted by the cost gate");
+	return true;
+}
+
 /*
  * Build a scan-only region.  The original SeqScan remains a custom child so
  * executor initialization keeps its relation lock and EXPLAIN shows the leaf.
@@ -173,6 +286,10 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.parallel_aware = root->parallel_aware;
 	cs->scan.plan.parallel_safe = root->parallel_safe;
 	cs->scan.plan.flow = root->flow;
+	cs->scan.plan.operatorMemKB = memory_quota_kb(root);
+	if ((IsA(root, Agg) && ((Agg *) root)->aggstrategy == AGG_HASHED) ||
+		IsA(root, HashJoin))
+		cs->flags |= CUSTOMSCAN_GP_MEMORY_INTENSIVE | CUSTOMSCAN_GP_BLOCKING;
 
 	ctx->wrapped++;
 	return (Plan *) cs;
@@ -199,18 +316,21 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
 		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node)) &&
-		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(innerPlan(node))))
+		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(innerPlan(node))) &&
+		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
 	if (IsA(node, Agg) && slice_runs_on_segments(ctx) &&
 		VectorAggPlanIsSupported((Agg *) node) &&
 		(!IsA(outerPlan(node), SeqScan) ||
-		 is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node))))
+		 is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node))) &&
+		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
 		((SeqScan *) node)->plan.targetlist != NIL &&
-		is_simple_aoco_scan(ctx, (SeqScan *) node))
+		is_simple_aoco_scan(ctx, (SeqScan *) node) &&
+		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
 	return plan_tree_mutator(node, vectorize_mutator, ctx, false);
@@ -221,7 +341,8 @@ VectorizePlan(PlannedStmt *stmt)
 {
 	VectorizeContext ctx;
 
-	if (gp_vectorized_execution != GP_VECTORIZED_EXECUTION_FORCE ||
+	if ((gp_vectorized_execution != GP_VECTORIZED_EXECUTION_FORCE &&
+		  gp_vectorized_execution != GP_VECTORIZED_EXECUTION_AUTO) ||
 		Gp_role != GP_ROLE_DISPATCH ||
 		stmt == NULL || stmt->commandType != CMD_SELECT ||
 		stmt->planTree == NULL)
@@ -232,10 +353,21 @@ VectorizePlan(PlannedStmt *stmt)
 	ctx.stmt = stmt;
 	ctx.next_plan_node_id = 1;
 	max_plan_node_id_walker((Node *) stmt->planTree, &ctx);
+
+	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_AUTO)
+	{
+		uint64		bytes = (uint64) statement_mem * 1024L;
+
+		if (IsResManagerMemoryPolicyAuto())
+			PolicyAutoAssignOperatorMemoryKB(stmt, bytes);
+		else if (IsResManagerMemoryPolicyEagerFree())
+			PolicyEagerFreeAssignOperatorMemoryKB(stmt, bytes);
+	}
+
 	stmt->planTree = (Plan *) vectorize_mutator((Node *) stmt->planTree, &ctx);
 
 	if (ctx.wrapped > 0)
-		elog(DEBUG1, "vectorized execution: %d AOCS scan region(s) planned",
+		elog(DEBUG1, "vectorized execution: %d region(s) planned",
 			 ctx.wrapped);
 	return stmt;
 }

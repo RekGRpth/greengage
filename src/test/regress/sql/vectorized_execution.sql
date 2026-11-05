@@ -82,6 +82,16 @@ ORDER BY l.id;
 SELECT l.id FROM vector_join_l l
 WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
 ORDER BY l.id;
+SET gp_vectorized_execution = auto;
+SET gp_vectorized_min_rows = 1000000;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
+SET gp_vectorized_min_rows = 1;
+EXPLAIN (COSTS OFF) SELECT sum(big), sum(id) FROM vector_aoco_test;
+EXPLAIN (COSTS OFF) SELECT id FROM vector_aoco_test LIMIT 3;
+SET statement_mem = '256kB';
+EXPLAIN (COSTS OFF) SELECT val, count(*) FROM vector_aoco_test GROUP BY val;
+RESET statement_mem;
+RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
