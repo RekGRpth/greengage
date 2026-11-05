@@ -178,6 +178,34 @@ memory_quota_kb(Plan *plan)
 	return plan->operatorMemKB;
 }
 
+/*
+ * Measured on TPC-H SF1 (6M-row AOCO lineitem, 3 primaries, -O0 build):
+ * regions over pass-by-value columns ran 13-18x faster than the row
+ * executor, while every referenced pass-by-reference column pays a
+ * datumCopy per row on the way into a batch and made numeric-heavy
+ * queries ~15% slower.  Until by-ref columns get cheap handling, auto
+ * only accepts leaves whose referenced columns are all by-value.
+ */
+static bool
+leaf_has_byref(Plan *leaf)
+{
+	ListCell   *lc;
+
+	if (leaf == NULL)
+		return false;
+	foreach(lc, leaf->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+		int16		typlen;
+		bool		typbyval;
+
+		get_typlenbyval(exprType((Node *) te->expr), &typlen, &typbyval);
+		if (!typbyval)
+			return true;
+	}
+	return false;
+}
+
 static bool
 auto_allowed(VectorizeContext *ctx, Plan *plan)
 {
@@ -195,6 +223,12 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 	if (input_rows(plan) < (double) gp_vectorized_min_rows)
 	{
 		decision(ctx, plan, "estimated input rows are below gp_vectorized_min_rows");
+		return false;
+	}
+	if (leaf_has_byref(outerPlan(plan)) ||
+		(IsA(plan, HashJoin) && leaf_has_byref(outerPlan(innerPlan(plan)))))
+	{
+		decision(ctx, plan, "the leaf reads pass-by-reference columns");
 		return false;
 	}
 
