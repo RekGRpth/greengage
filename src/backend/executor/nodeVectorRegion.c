@@ -37,6 +37,7 @@ typedef struct VectorRegionState
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
 	VectorBatch *batch;
+	VectorExprState **proj;		/* per output column; NULL for plain columns */
 	VectorExprState *qual;
 	int		   *output_attnos;
 	int			output_ncols;
@@ -170,12 +171,16 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			TargetEntry *te = (TargetEntry *) lfirst(lc);
 			Var		   *var;
 
-			if (!IsA(te->expr, Var))
-				elog(ERROR, "vector region supports only plain column projections");
-			var = (Var *) te->expr;
-			if (var->varattno <= 0 || var->varattno > RelationGetNumberOfAttributes(relation))
-				elog(ERROR, "vector region encountered an invalid output attribute");
-			state->output_attnos[col++] = var->varattno - 1;
+			/* plain column: read straight from the batch column */
+			if (IsA(te->expr, Var) &&
+				(var = (Var *) te->expr, true) &&
+				var->varattno > 0 &&
+				var->varattno <= RelationGetNumberOfAttributes(relation))
+			{
+				state->output_attnos[col++] = var->varattno - 1;
+				continue;
+			}
+			state->output_attnos[col++] = -1;	/* compiled projection */
 		}
 	}
 
@@ -195,6 +200,34 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 											state->batch, &vars);
 			if (state->qual == NULL)
 				elog(ERROR, "vector region could not compile its scan qual");
+		}
+		/*
+		 * Projection entries of the scan targetlist (ORCA keeps computed
+		 * expressions there): one compiled step per output column, NULL for
+		 * plain columns.
+		 */
+		if (state->scan != NULL && state->agg == NULL && state->hj == NULL)
+		{
+			VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+
+			col = 0;
+			foreach(lc, scan->plan.targetlist)
+			{
+				TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+				if (state->output_attnos[col] == -1)
+				{
+					if (state->proj == NULL)
+						state->proj = MemoryContextAllocZero(estate->es_query_cxt,
+											  sizeof(VectorExprState *) * state->output_ncols);
+					state->proj[col] = VectorExprCompile(estate->es_query_cxt,
+														 te->expr,
+														 state->batch, &vars);
+					if (state->proj[col] == NULL)
+						elog(ERROR, "vector region could not compile its projection");
+				}
+				col++;
+			}
 		}
 		if (state->agg != NULL)
 		{
@@ -334,13 +367,29 @@ VectorRegionExec(CustomScanState *node)
 	if (!VectorRegionNextBatch(state))
 		return slot;
 
+	/* evaluate projection steps once per batch, after the qual filter */
+	if (state->proj != NULL)
+	{
+		for (col = 0; col < state->output_ncols; col++)
+			if (state->proj[col] != NULL)
+				VectorExprEval(state->batch, state->proj[col]);
+	}
+
 	row = VectorBatchSelectedRow(state->batch, state->position++);
 	for (col = 0; col < state->output_ncols; col++)
 	{
 		int			attno = state->output_attnos[col];
 
-		slot->tts_values[col] = state->batch->columns[attno].values[row];
-		slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+		if (attno >= 0)
+		{
+			slot->tts_values[col] = state->batch->columns[attno].values[row];
+			slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+		}
+		else
+		{
+			slot->tts_values[col] = VectorExprGetValue(state->proj[col], row,
+													   &slot->tts_isnull[col]);
+		}
 	}
 	slot->tts_nvalid = state->output_ncols;
 	return ExecStoreVirtualTuple(slot);
@@ -354,6 +403,15 @@ VectorRegionEnd(CustomScanState *node)
 
 	if (state->vhj != NULL)
 		VectorHashJoinDestroy(state->vhj);
+	if (state->proj != NULL)
+	{
+		int			col;
+
+		for (col = 0; col < state->output_ncols; col++)
+			if (state->proj[col] != NULL)
+				VectorExprDestroy(state->proj[col]);
+		pfree(state->proj);
+	}
 	if (state->vagg != NULL)
 		VectorAggDestroy(state->vagg);
 	if (state->batch != NULL)

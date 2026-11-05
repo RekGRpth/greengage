@@ -22,12 +22,14 @@ struct VectorHashJoinState
 bool
 VectorHashJoinPlanIsSupported(HashJoin *join)
 {
-	Hash	   *hash;
-
 	if (!IsA(innerPlan(join), Hash))
 		return false;
-	hash = (Hash *) innerPlan(join);
-	if (!IsA(outerPlan(hash), SeqScan) || join->hashclauses == NIL ||
+	/*
+	 * The build side is consumed row-wise through the standard Hash node,
+	 * so its input may be any plan; only the probe side feeds on batches
+	 * and must be a simple scan.
+	 */
+	if (join->hashclauses == NIL ||
 		join->hashqualclauses != NIL || join->hashkeys == NIL ||
 		join->join.plan.initPlan != NIL || join->join.plan.extParam != NULL ||
 		join->join.plan.allParam != NULL)

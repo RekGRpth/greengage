@@ -242,6 +242,73 @@ FROM vector_aoco_test;
  74813.60
 (1 row)
 
+SELECT id, big + 1 AS b1 FROM vector_aoco_test ORDER BY id LIMIT 5;
+ id | b1 
+----+----
+  1 | 11
+  2 | 21
+  3 | 31
+  4 | 41
+  5 | 51
+(5 rows)
+
+SELECT id, CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END AS parity
+FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
+  id  | parity 
+------+--------
+ 4998 | even
+ 4999 | odd
+ 5000 | even
+ 5001 | odd
+ 5002 | even
+ 5003 | odd
+ 5004 | even
+ 5006 | even
+ 5007 | odd
+ 5008 | even
+ 5009 | odd
+ 5010 | even
+(12 rows)
+
+SELECT id, coalesce(val, 'NONE') FROM vector_aoco_test WHERE id % 500 = 0 ORDER BY id;
+  id  | coalesce 
+------+----------
+  500 | v500
+ 1000 | v1000
+ 1500 | v1500
+ 2000 | v2000
+ 2500 | v2500
+ 3000 | v3000
+ 3500 | NONE
+ 4000 | v4000
+ 4500 | v4500
+ 5000 | v5000
+(10 rows)
+
+SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
+  id  
+------
+ 5010
+ 5009
+ 5008
+(3 rows)
+
+SELECT count(*) FROM vector_aoco_test l
+JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 10 = r.g;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test l
+LEFT JOIN (SELECT id % 3 AS g FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 3 = r.g;
+ count 
+-------
+  4555
+(1 row)
+
 SELECT count(*) FROM vector_aoco_test;
  count 
 -------

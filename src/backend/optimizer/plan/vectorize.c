@@ -104,6 +104,42 @@ is_simple_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
 	return true;
 }
 
+/*
+ * A scan that a region may wrap as its own root: like is_simple_aoco_scan,
+ * but the targetlist may also carry projection expressions (ORCA keeps them
+ * in the scan's targetlist) and junk entries (sort keys of an ORDER BY
+ * above the region).
+ */
+static bool
+is_projection_aoco_scan(VectorizeContext *ctx, SeqScan *scan)
+{
+	RangeTblEntry *rte;
+	ListCell   *lc;
+	VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+
+	if (scan->scanrelid <= 0 ||
+		scan->plan.lefttree != NULL || scan->plan.righttree != NULL ||
+		scan->plan.initPlan != NIL || scan->plan.extParam != NULL ||
+		scan->plan.allParam != NULL)
+		return false;
+
+	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
+	if (rte->rtekind != RTE_RELATION ||
+		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID)
+		return false;
+	if (!VectorExprIsSupported((Expr *) scan->plan.qual, &vars))
+		return false;
+
+	foreach(lc, scan->plan.targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (!VectorExprIsSupported(te->expr, &vars))
+			return false;
+	}
+	return true;
+}
+
 static const char *
 plan_node_name(Plan *plan)
 {
@@ -355,7 +391,8 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
 		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(node)) &&
-		is_simple_aoco_scan(ctx, (SeqScan *) outerPlan(innerPlan(node))) &&
+		/* the build side reads row-wise through the Hash node: any input */
+		IsA(innerPlan(node), Hash) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
@@ -368,7 +405,7 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
 		((SeqScan *) node)->plan.targetlist != NIL &&
-		is_simple_aoco_scan(ctx, (SeqScan *) node) &&
+		is_projection_aoco_scan(ctx, (SeqScan *) node) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 

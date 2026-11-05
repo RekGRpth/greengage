@@ -92,6 +92,17 @@ SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS UNKNOWN;
 SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS NOT UNKNOWN;
 SELECT sum(CASE WHEN id % 3 = 0 THEN num * 2 WHEN id % 3 = 1 THEN num ELSE NULL END)
 FROM vector_aoco_test;
+SELECT id, big + 1 AS b1 FROM vector_aoco_test ORDER BY id LIMIT 5;
+SELECT id, CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END AS parity
+FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
+SELECT id, coalesce(val, 'NONE') FROM vector_aoco_test WHERE id % 500 = 0 ORDER BY id;
+SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
+SELECT count(*) FROM vector_aoco_test l
+JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 10 = r.g;
+SELECT count(*) FROM vector_aoco_test l
+LEFT JOIN (SELECT id % 3 AS g FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 3 = r.g;
 SELECT count(*) FROM vector_aoco_test;
 SELECT count(*), sum(id) FROM vector_aoco_small WHERE id < 0;
 SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;
