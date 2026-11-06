@@ -35,6 +35,7 @@ typedef enum VectorExprKind
 	VEC_NULLTEST,
 	VEC_COALESCE,
 	VEC_CASE,
+	VEC_CASETEST,
 	VEC_SAOP,
 	VEC_BOOLTEST
 } VectorExprKind;
@@ -56,6 +57,7 @@ typedef struct VectorExprStep
 	struct VectorExprStep **args;
 	int			nargs;
 	int32	   *scratch[2];
+	struct VectorExprStep *case_operand;
 	union
 	{
 		struct
@@ -89,7 +91,8 @@ struct VectorExprState
 };
 
 static VectorExprStep *build_step(Expr *expr, VectorBatch *batch,
-								  const VectorExprVarMap *vars);
+								  const VectorExprVarMap *vars,
+								  VectorExprStep *case_test);
 static void eval_step(VectorExprStep *step, VectorBatch *batch,
 					  int32 *selection, int nselected);
 
@@ -218,8 +221,8 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 			{
 				CaseExpr   *ce = (CaseExpr *) expr;
 
-				/* searched CASE only; simple CASE carries a CaseTestExpr */
-				if (ce->arg != NULL)
+				if (ce->arg != NULL &&
+					!VectorExprIsSupported(ce->arg, vars))
 					return false;
 				foreach(lc, ce->args)
 				{
@@ -232,6 +235,8 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 				return ce->defresult == NULL ||
 					VectorExprIsSupported(ce->defresult, vars);
 			}
+		case T_CaseTestExpr:
+			return true;
 		case T_ScalarArrayOpExpr:
 			{
 				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) expr;
@@ -274,7 +279,8 @@ alloc_step(VectorExprKind kind, int nargs, int capacity)
 
 static VectorExprStep *
 build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
-				Oid collation, List *args, VectorBatch *batch, const VectorExprVarMap *vars)
+				Oid collation, List *args, VectorBatch *batch,
+				const VectorExprVarMap *vars, VectorExprStep *case_test)
 {
 	VectorExprStep *step;
 	ListCell   *lc;
@@ -290,7 +296,7 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 
 	foreach(lc, args)
 	{
-		step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
+		step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars, case_test);
 		if (step->args[argno] == NULL)
 			return NULL;
 		argno++;
@@ -299,7 +305,8 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 }
 
 static VectorExprStep *
-build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
+build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
+		   VectorExprStep *case_test)
 {
 	VectorExprStep *step;
 	ListCell   *lc;
@@ -342,7 +349,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				RelabelType *relabel = (RelabelType *) expr;
 
 				step = alloc_step(VEC_RELABEL, 1, batch->capacity);
-				step->args[0] = build_step(relabel->arg, batch, vars);
+				step->args[0] = build_step(relabel->arg, batch, vars, case_test);
 				if (step->args[0] == NULL)
 					return NULL;
 				step->value = step->args[0]->value;
@@ -355,7 +362,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				OpExpr	   *op = (OpExpr *) expr;
 
 				return build_func_step(op->opfuncid, op->opresulttype, -1,
-									   op->inputcollid, op->args, batch, vars);
+									   op->inputcollid, op->args, batch, vars, case_test);
 			}
 		case T_FuncExpr:
 			{
@@ -364,7 +371,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				if (func->funcvariadic)
 					return NULL;
 				return build_func_step(func->funcid, func->funcresulttype, -1,
-									   func->inputcollid, func->args, batch, vars);
+									   func->inputcollid, func->args, batch, vars, case_test);
 			}
 		case T_NullTest:
 			{
@@ -375,7 +382,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				step = alloc_step(VEC_NULLTEST, 1, batch->capacity);
 				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
 				step->u.nulltesttype = test->nulltesttype;
-				step->args[0] = build_step(test->arg, batch, vars);
+				step->args[0] = build_step(test->arg, batch, vars, case_test);
 				return step->args[0] ? step : NULL;
 			}
 		case T_CoalesceExpr:
@@ -389,7 +396,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				argno = 0;
 				foreach(lc, ce->args)
 				{
-					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars, case_test);
 					if (step->args[argno] == NULL)
 						return NULL;
 					argno++;
@@ -399,29 +406,43 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 		case T_CaseExpr:
 			{
 				CaseExpr   *ce = (CaseExpr *) expr;
+				VectorExprStep *when_case = case_test;
 				int			nwhens = list_length(ce->args);
 				int			slot = 0;
 
-				if (ce->arg != NULL)
-					return NULL;	/* simple CASE; rejected earlier */
 				step = alloc_step(VEC_CASE, 2 * nwhens + 1, batch->capacity);
 				init_value(&step->value, ce->casetype, -1, batch->capacity, true);
+				if (ce->arg != NULL)
+				{
+					step->case_operand = build_step(ce->arg, batch, vars, case_test);
+					if (step->case_operand == NULL)
+						return NULL;
+					when_case = step->case_operand;
+				}
 				foreach(lc, ce->args)
 				{
 					CaseWhen   *w = (CaseWhen *) lfirst(lc);
 
-					step->args[slot++] = build_step(w->expr, batch, vars);
+					step->args[slot++] = build_step(w->expr, batch, vars, when_case);
 					if (step->args[slot - 1] == NULL)
 						return NULL;
-					step->args[slot++] = build_step(w->result, batch, vars);
+					step->args[slot++] = build_step(w->result, batch, vars, case_test);
 					if (step->args[slot - 1] == NULL)
 						return NULL;
 				}
 				/* the ELSE slot stays NULL when the CASE has no ELSE */
 				step->args[slot] = ce->defresult ?
-					build_step(ce->defresult, batch, vars) : NULL;
+					build_step(ce->defresult, batch, vars, case_test) : NULL;
 				if (ce->defresult && step->args[slot] == NULL)
 					return NULL;
+				return step;
+			}
+		case T_CaseTestExpr:
+			{
+				if (case_test == NULL)
+					return NULL;
+				step = alloc_step(VEC_CASETEST, 0, batch->capacity);
+				step->value = case_test->value;
 				return step;
 			}
 		case T_ScalarArrayOpExpr:
@@ -448,7 +469,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				InitFunctionCallInfoData(*step->u.saop.fcinfo, &step->u.saop.fn,
 										 2, sa->inputcollid, NULL, NULL);
 				step->u.saop.strict = step->u.saop.fn.fn_strict;
-				step->args[0] = build_step((Expr *) linitial(sa->args), batch, vars);
+				step->args[0] = build_step((Expr *) linitial(sa->args), batch, vars, case_test);
 				return step->args[0] ? step : NULL;
 			}
 		case T_BooleanTest:
@@ -458,7 +479,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				step = alloc_step(VEC_BOOLTEST, 1, batch->capacity);
 				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
 				step->u.booltesttype = bt->booltesttype;
-				step->args[0] = build_step(bt->arg, batch, vars);
+				step->args[0] = build_step(bt->arg, batch, vars, case_test);
 				return step->args[0] ? step : NULL;
 			}
 		case T_List:
@@ -470,7 +491,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				argno = 0;
 				foreach(lc, clauses)
 				{
-					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars, case_test);
 					if (step->args[argno] == NULL)
 						return NULL;
 					argno++;
@@ -496,7 +517,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars)
 				argno = 0;
 				foreach(lc, b->args)
 				{
-					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars);
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars, case_test);
 					if (step->args[argno] == NULL)
 						return NULL;
 					argno++;
@@ -525,7 +546,7 @@ VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
 										 ALLOCSET_DEFAULT_MAXSIZE);
 	state->capacity = batch->capacity;
 	oldcontext = MemoryContextSwitchTo(state->context);
-	state->root = build_step(expr, batch, vars);
+	state->root = build_step(expr, batch, vars, NULL);
 	MemoryContextSwitchTo(oldcontext);
 	if (state->root == NULL)
 	{
@@ -636,6 +657,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 	{
 		case VEC_VAR:
 		case VEC_CONST:
+		case VEC_CASETEST:
 			return;
 		case VEC_RELABEL:
 			eval_step(step->args[0], batch, selection, nselected);
@@ -710,6 +732,8 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				int			nwhens = (step->nargs - 1) / 2;
 				int			w;
 
+				if (step->case_operand != NULL)
+					eval_step(step->case_operand, batch, selection, nselected);
 				memcpy(pending, selection, sizeof(int32) * nselected);
 				for (w = 0; w < nwhens && npending > 0; w++)
 				{

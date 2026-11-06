@@ -256,6 +256,57 @@ FROM vector_aoco_test;
  74813.60
 (1 row)
 
+SELECT CASE id % 4 WHEN 0 THEN 'zero' WHEN 1 THEN 'one' ELSE 'other' END AS bucket,
+       count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ bucket | count 
+--------+-------
+ one    |  1139
+ other  |  2277
+ zero   |  1139
+(3 rows)
+
+SELECT sum(CASE id % 3 WHEN 0 THEN big WHEN 1 THEN -big ELSE 0 END)
+FROM vector_aoco_test;
+  sum  
+-------
+ 66840
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test
+WHERE CASE val WHEN 'new1' THEN true WHEN NULL THEN true ELSE false END;
+ count 
+-------
+     1
+(1 row)
+
+SELECT sum(CASE id % 2 WHEN 0 THEN CASE WHEN num > 10 THEN 1 ELSE 2 END ELSE 0 END)
+FROM vector_aoco_test;
+ sum  
+------
+ 3011
+(1 row)
+
+SELECT sum(CASE id % 2 WHEN 0 THEN CASE id % 3 WHEN 0 THEN 1 ELSE 2 END ELSE 0 END)
+FROM vector_aoco_test;
+ sum  
+------
+ 3796
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small
+WHERE CASE id WHEN 0 THEN 1 / (id - id) = 1 ELSE true END;
+ sum 
+-----
+  55
+(1 row)
+
+SELECT count(CASE id % 10 WHEN 0 THEN id END) FROM vector_aoco_test;
+ count 
+-------
+   456
+(1 row)
+
 SELECT id, big + 1 AS b1 FROM vector_aoco_test ORDER BY id LIMIT 5;
  id | b1 
 ----+----
@@ -266,7 +317,7 @@ SELECT id, big + 1 AS b1 FROM vector_aoco_test ORDER BY id LIMIT 5;
   5 | 51
 (5 rows)
 
-SELECT id, CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END AS parity
+SELECT id, CASE id % 2 WHEN 0 THEN 'even' ELSE 'odd' END AS parity
 FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
   id  | parity 
 ------+--------

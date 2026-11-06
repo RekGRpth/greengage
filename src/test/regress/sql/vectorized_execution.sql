@@ -106,8 +106,22 @@ SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS UNKNOWN;
 SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS NOT UNKNOWN;
 SELECT sum(CASE WHEN id % 3 = 0 THEN num * 2 WHEN id % 3 = 1 THEN num ELSE NULL END)
 FROM vector_aoco_test;
+SELECT CASE id % 4 WHEN 0 THEN 'zero' WHEN 1 THEN 'one' ELSE 'other' END AS bucket,
+       count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+SELECT sum(CASE id % 3 WHEN 0 THEN big WHEN 1 THEN -big ELSE 0 END)
+FROM vector_aoco_test;
+SELECT count(*) FROM vector_aoco_test
+WHERE CASE val WHEN 'new1' THEN true WHEN NULL THEN true ELSE false END;
+SELECT sum(CASE id % 2 WHEN 0 THEN CASE WHEN num > 10 THEN 1 ELSE 2 END ELSE 0 END)
+FROM vector_aoco_test;
+SELECT sum(CASE id % 2 WHEN 0 THEN CASE id % 3 WHEN 0 THEN 1 ELSE 2 END ELSE 0 END)
+FROM vector_aoco_test;
+SELECT sum(id) FROM vector_aoco_small
+WHERE CASE id WHEN 0 THEN 1 / (id - id) = 1 ELSE true END;
+SELECT count(CASE id % 10 WHEN 0 THEN id END) FROM vector_aoco_test;
 SELECT id, big + 1 AS b1 FROM vector_aoco_test ORDER BY id LIMIT 5;
-SELECT id, CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END AS parity
+SELECT id, CASE id % 2 WHEN 0 THEN 'even' ELSE 'odd' END AS parity
 FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
 SELECT id, coalesce(val, 'NONE') FROM vector_aoco_test WHERE id % 500 = 0 ORDER BY id;
 SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
