@@ -17,6 +17,7 @@
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "miscadmin.h"
+#include "utils/tuplesort.h"
 
 struct VectorAggState
 {
@@ -24,6 +25,8 @@ struct VectorAggState
 	AggState   *agg;
 	VectorExprVarMap vars;
 	VectorExprState ***args;
+	VectorExprState **filters;
+	int32	   *filtered_selection;
 	Datum	  **values;
 	bool	  **nulls;
 	TupleTableSlot *input_slot;	/* full input row, for spilling */
@@ -130,9 +133,13 @@ VectorAggPlanIsSupported(Agg *agg)
 
 			if (aggref->aggkind != AGGKIND_NORMAL || aggref->agglevelsup != 0 ||
 				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
-				aggref->aggorder != NIL || aggref->aggdistinct != NIL ||
-				aggref->aggfilter != NULL || aggref->aggdirectargs != NIL ||
-				aggref->aggtype == INTERNALOID)
+				aggref->aggorder != NIL || aggref->aggdirectargs != NIL ||
+				aggref->aggtype == INTERNALOID ||
+				(aggref->aggdistinct != NIL &&
+				 (agg->aggstrategy != AGG_PLAIN || list_length(aggref->args) != 1)))
+				goto done;
+			if (aggref->aggfilter != NULL &&
+				!VectorExprIsSupported(aggref->aggfilter, &vars))
 				goto done;
 			foreach(arglc, aggref->args)
 			{
@@ -175,6 +182,8 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 	}
 
 	state->args = palloc0(sizeof(VectorExprState **) * agg->numtrans);
+	state->filters = palloc0(sizeof(VectorExprState *) * agg->numtrans);
+	state->filtered_selection = palloc(sizeof(int32) * batch->capacity);
 	state->values = palloc0(sizeof(Datum *) * agg->numtrans);
 	state->nulls = palloc0(sizeof(bool *) * agg->numtrans);
 	for (transno = 0; transno < agg->numtrans; transno++)
@@ -202,10 +211,27 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 			}
 			argno++;
 		}
+		if (pertrans->aggref->aggfilter != NULL)
+		{
+			state->filters[transno] = VectorExprCompile(state->context,
+											 pertrans->aggref->aggfilter,
+											 batch, &state->vars);
+			if (state->filters[transno] == NULL)
+			{
+				MemoryContextSwitchTo(oldcontext);
+				VectorAggDestroy(state);
+				return NULL;
+			}
+		}
 		Assert(argno == pertrans->numTransInputs);
 	}
 	if (agg->aggstrategy == AGG_PLAIN)
+	{
+		/* nodeAgg owns its tuplesorts and frees them after the region state. */
+		MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
 		VectorAggInitializePlain(agg);
+		MemoryContextSwitchTo(state->context);
+	}
 	MemoryContextSwitchTo(oldcontext);
 
 	/*
@@ -237,10 +263,33 @@ eval_arguments(VectorAggState *state, VectorBatch *batch)
 	for (transno = 0; transno < agg->numtrans; transno++)
 	{
 		int			nargs = agg->pertrans[transno].numTransInputs;
+		int32	   *selection = batch->selection;
+		int			nselected = batch->nselected;
 		int			argno;
 
+		/* A filter runs before the aggregate arguments, as in evaltrans. */
+		if (state->filters[transno] != NULL)
+		{
+			int			pos;
+
+			VectorExprEval(batch, state->filters[transno]);
+			nselected = 0;
+			for (pos = 0; pos < batch->nselected; pos++)
+			{
+				int			row = VectorBatchSelectedRow(batch, pos);
+				bool		isnull;
+				Datum		value = VectorExprGetValue(state->filters[transno], row,
+													 &isnull);
+
+				if (!isnull && DatumGetBool(value))
+					state->filtered_selection[nselected++] = row;
+			}
+			selection = state->filtered_selection;
+		}
+
 		for (argno = 0; argno < nargs; argno++)
-			VectorExprEval(batch, state->args[transno][argno]);
+			VectorExprEvalSelection(batch, state->args[transno][argno],
+									selection, nselected);
 	}
 }
 
@@ -337,15 +386,34 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 
 		for (transno = 0; transno < agg->numtrans; transno++)
 		{
-			int			nargs = agg->pertrans[transno].numTransInputs;
+			AggStatePerTrans pertrans = &agg->pertrans[transno];
+			int			nargs = pertrans->numTransInputs;
 			int			argno;
 
+			if (state->filters[transno] != NULL)
+			{
+				bool		isnull;
+				Datum		value = VectorExprGetValue(state->filters[transno], row,
+													 &isnull);
+
+				if (isnull || !DatumGetBool(value))
+					continue;
+			}
 			for (argno = 0; argno < nargs; argno++)
 				state->values[transno][argno] =
 					VectorExprGetValue(state->args[transno][argno], row,
 									   &state->nulls[transno][argno]);
-			VectorAggAdvanceTransition(agg, pergroup, transno,
-									   state->values[transno], state->nulls[transno]);
+			if (pertrans->numSortCols > 0)
+			{
+				/* Scalar single-input DISTINCT uses nodeAgg's tuplesort. */
+				Assert(agg->aggstrategy == AGG_PLAIN && nargs == 1);
+				tuplesort_putdatum(pertrans->sortstates[0],
+								   state->values[transno][0],
+								   state->nulls[transno][0]);
+			}
+			else
+				VectorAggAdvanceTransition(agg, pergroup, transno,
+										   state->values[transno], state->nulls[transno]);
 		}
 	}
 	/* Transition garbage is bounded by the batch size; reset once. */
@@ -387,7 +455,13 @@ VectorAggReset(VectorAggState *state)
 {
 	ExecReScanAgg(state->agg);
 	if (state->agg->aggstrategy == AGG_PLAIN)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(
+			state->agg->ss.ps.state->es_query_cxt);
+
 		VectorAggInitializePlain(state->agg);
+		MemoryContextSwitchTo(oldcontext);
+	}
 	/* A reused hash table must be iterated, not populated a second time. */
 	state->input_done = state->agg->aggstrategy == AGG_HASHED &&
 		state->agg->table_filled;

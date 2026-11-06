@@ -156,6 +156,20 @@ SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;
 SELECT later, val, count(*), sum(big), min(num), max(num), min(val), max(val)
 FROM vector_aoco_test
 GROUP BY later, val ORDER BY later, val LIMIT 5;
+SELECT count(*) FILTER (WHERE id % 2 = 0),
+       sum(id) FILTER (WHERE id % 3 = 0),
+       count(val) FILTER (WHERE num > 10)
+FROM vector_aoco_test;
+SELECT sum(1 / (id - id)) FILTER (WHERE id < 0) FROM vector_aoco_small;
+SELECT id % 3 AS g, count(*) FILTER (WHERE val IS NULL),
+       sum(id) FILTER (WHERE id % 2 = 0)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM vector_aoco_small;
+SELECT count(DISTINCT id), sum(DISTINCT id % 100),
+       count(DISTINCT val), sum(DISTINCT num)
+FROM vector_aoco_test;
+SELECT count(DISTINCT id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_test;
+SELECT count(DISTINCT id) FROM vector_aoco_small WHERE id < 0;
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;
@@ -179,6 +193,7 @@ SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id 
 SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t1.id = t2.id AND t2.id < 1000;
 SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
 SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
+SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;
 ALTER DATABASE regression RESET statement_mem;
 EXPLAIN (COSTS OFF)
 SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test

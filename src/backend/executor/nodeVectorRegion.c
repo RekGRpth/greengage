@@ -110,8 +110,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	VectorRegionState *state = (VectorRegionState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	PlanState  *child;
-	SeqScan	   *scan;
-	Relation	relation;
+	SeqScan	   *scan = NULL;
+	Relation	relation = NULL;
 	ListCell   *lc;
 	int			col = 0;
 

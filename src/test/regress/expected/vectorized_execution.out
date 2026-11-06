@@ -505,6 +505,61 @@ GROUP BY later, val ORDER BY later, val LIMIT 5;
      6 | new6 |     1 | 50060 | 1.25 | 1.25 | new6 | new6
 (5 rows)
 
+SELECT count(*) FILTER (WHERE id % 2 = 0),
+       sum(id) FILTER (WHERE id % 3 = 0),
+       count(val) FILTER (WHERE num > 10)
+FROM vector_aoco_test;
+ count |   sum   | count 
+-------+---------+-------
+  2278 | 3807147 |  2687
+(1 row)
+
+SELECT sum(1 / (id - id)) FILTER (WHERE id < 0) FROM vector_aoco_small;
+ sum 
+-----
+    
+(1 row)
+
+SELECT id % 3 AS g, count(*) FILTER (WHERE val IS NULL),
+       sum(id) FILTER (WHERE id % 2 = 0)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ g | count |   sum   
+---+-------+---------
+ 0 |   217 | 1906080
+ 1 |   217 | 1902738
+ 2 |   216 | 1899396
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM vector_aoco_small;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on vector_aoco_small
+(6 rows)
+
+SELECT count(DISTINCT id), sum(DISTINCT id % 100),
+       count(DISTINCT val), sum(DISTINCT num)
+FROM vector_aoco_test;
+ count | sum  | count |   sum   
+-------+------+-------+---------
+  4555 | 4950 |  3905 | 1651.25
+(1 row)
+
+SELECT count(DISTINCT id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_test;
+ count 
+-------
+  2278
+(1 row)
+
+SELECT count(DISTINCT id) FROM vector_aoco_small WHERE id < 0;
+ count 
+-------
+     0
+(1 row)
+
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;
@@ -606,6 +661,12 @@ SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
  count 
 -------
  50000
+(1 row)
+
+SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;
+ count | sum  
+-------+------
+ 50000 | 4950
 (1 row)
 
 ALTER DATABASE regression RESET statement_mem;

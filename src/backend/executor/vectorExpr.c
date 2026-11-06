@@ -1069,6 +1069,13 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 void
 VectorExprEval(VectorBatch *batch, VectorExprState *state)
 {
+	VectorExprEvalSelection(batch, state, batch->selection, batch->nselected);
+}
+
+void
+VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
+						int32 *selection, int nselected)
+{
 	MemoryContext oldcontext;
 
 	if (state == NULL)
@@ -1076,7 +1083,7 @@ VectorExprEval(VectorBatch *batch, VectorExprState *state)
 
 	CHECK_FOR_INTERRUPTS();
 	oldcontext = MemoryContextSwitchTo(batch->varlena_context);
-	eval_step(state->root, batch, batch->selection, batch->nselected);
+	eval_step(state->root, batch, selection, nselected);
 	MemoryContextSwitchTo(oldcontext);
 }
 
