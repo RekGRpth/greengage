@@ -756,6 +756,81 @@ FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
  2 | {2}
 (3 rows)
 
+EXPLAIN (COSTS OFF)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Sequence
+         ->  Shared Scan (share slice:id 1:0)
+               ->  Custom Scan (GGVectorRegion)
+                     ->  GroupAggregate
+                           Group Key: vector_aoco_small.id
+                           ->  Sort
+                                 Sort Key: vector_aoco_small.id
+                                 ->  Seq Scan on vector_aoco_small
+         ->  Redistribute Motion 1:3  (slice2)
+               ->  Aggregate
+                     ->  Limit
+                           ->  Gather Motion 3:1  (slice3; segments: 3)
+                                 Merge Key: share0_ref3.id
+                                 ->  Nested Loop
+                                       Join Filter: true
+                                       ->  Shared Scan (share slice:id 3:0)
+                                       ->  Materialize
+                                             ->  Result
+                                                   ->  Broadcast Motion 1:3  (slice4)
+                                                         ->  Finalize Aggregate
+                                                               ->  Gather Motion 3:1  (slice5; segments: 3)
+                                                                     ->  Partial Aggregate
+                                                                           ->  Shared Scan (share slice:id 5:0)
+(25 rows)
+
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id),
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small;
+ percentile_cont | percentile_disc 
+-----------------+-----------------
+             5.5 |               5
+(1 row)
+
+SELECT id % 3 AS g, percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g | percentile_cont 
+---+-----------------
+ 0 |               6
+ 1 |             5.5
+ 2 |               5
+(3 rows)
+
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY num),
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY num)
+FROM vector_aoco_test;
+ percentile_cont | percentile_cont 
+-----------------+-----------------
+               8 |           24.67
+(1 row)
+
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small WHERE id < 0;
+ percentile_cont 
+-----------------
+                
+(1 row)
+
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY val)
+FROM vector_aoco_small WHERE id < 0;
+ percentile_disc 
+-----------------
+ 
+(1 row)
+
+SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+ percentile_cont 
+-----------------
+                
+(1 row)
+
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

@@ -756,6 +756,61 @@ FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
  2 | {2}
 (3 rows)
 
+EXPLAIN (COSTS OFF)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_aoco_small
+(5 rows)
+
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id),
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small;
+ percentile_cont | percentile_disc 
+-----------------+-----------------
+             5.5 |               5
+(1 row)
+
+SELECT id % 3 AS g, percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g | percentile_cont 
+---+-----------------
+ 0 |               6
+ 1 |             5.5
+ 2 |               5
+(3 rows)
+
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY num),
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY num)
+FROM vector_aoco_test;
+ percentile_cont | percentile_cont 
+-----------------+-----------------
+               8 |           24.67
+(1 row)
+
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small WHERE id < 0;
+ percentile_cont 
+-----------------
+                
+(1 row)
+
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY val)
+FROM vector_aoco_small WHERE id < 0;
+ percentile_disc 
+-----------------
+ 
+(1 row)
+
+SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+ percentile_cont 
+-----------------
+                
+(1 row)
+
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

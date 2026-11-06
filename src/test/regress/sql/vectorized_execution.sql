@@ -207,6 +207,21 @@ SELECT id % 3 AS g, count(DISTINCT id) FROM vector_aoco_small
 GROUP BY 1 HAVING count(DISTINCT id) > 3 ORDER BY 1;
 SELECT id % 100 AS g, array_agg(DISTINCT id % 10 ORDER BY id % 10)
 FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
+EXPLAIN (COSTS OFF)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id),
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small;
+SELECT id % 3 AS g, percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY num),
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY num)
+FROM vector_aoco_test;
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small WHERE id < 0;
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY val)
+FROM vector_aoco_small WHERE id < 0;
+SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

@@ -132,9 +132,13 @@ VectorAggPlanIsSupported(Agg *agg)
 			Aggref	   *aggref = (Aggref *) te->expr;
 			ListCell   *arglc;
 
-			if (aggref->aggkind != AGGKIND_NORMAL || aggref->agglevelsup != 0 ||
+			if ((aggref->aggkind != AGGKIND_NORMAL &&
+				 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
+				aggref->agglevelsup != 0 ||
 				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
-				aggref->aggdirectargs != NIL || aggref->aggtype == INTERNALOID ||
+				(aggref->aggdirectargs != NIL &&
+				 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
+				aggref->aggtype == INTERNALOID ||
 				((aggref->aggorder != NIL || aggref->aggdistinct != NIL) &&
 				 agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_SORTED) ||
 				(aggref->aggdistinct != NIL && list_length(aggref->args) != 1))
