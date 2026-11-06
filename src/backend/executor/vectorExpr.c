@@ -41,7 +41,8 @@ typedef enum VectorExprKind
 	VEC_BOOLTEST,
 	VEC_NULLIF,
 	VEC_DISTINCT,
-	VEC_MINMAX
+	VEC_MINMAX,
+	VEC_ARRAY
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -62,6 +63,7 @@ typedef struct VectorExprStep
 	int			nargs;
 	int32	   *scratch[2];
 	struct VectorExprStep *case_operand;
+	bool	   *array_nulls;
 	union
 	{
 		struct
@@ -82,6 +84,10 @@ typedef struct VectorExprStep
 			Datum	   *elems;
 			bool	   *elem_nulls;
 			int			nelems;
+			int16		typlen;
+			bool		typbyval;
+			char		typalign;
+			bool		const_array;
 			bool		useOr;		/* = ANY when set, <> ALL otherwise */
 		}			saop;
 		struct
@@ -90,6 +96,7 @@ typedef struct VectorExprStep
 			FmgrInfo	fn;
 			MinMaxOp	op;
 		}			minmax;
+		Datum	   *array_elems;
 	}			u;
 } VectorExprStep;
 
@@ -265,6 +272,19 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 			}
 		case T_CaseTestExpr:
 			return true;
+		case T_ArrayExpr:
+			{
+				ArrayExpr  *ae = (ArrayExpr *) expr;
+
+				if (ae->multidims)
+					return false;
+				foreach(lc, ae->elements)
+				{
+					if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
+						return false;
+				}
+				return true;
+			}
 		case T_ScalarArrayOpExpr:
 			{
 				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) expr;
@@ -276,7 +296,8 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 				if (list_length(sa->args) != 2)
 					return false;
 				rexpr = lsecond(sa->args);
-				if (!IsA(rexpr, Const) || ((Const *) rexpr)->constisnull)
+				if (!OidIsValid(get_element_type(exprType((Node *) rexpr))) ||
+					!VectorExprIsSupported(rexpr, vars))
 					return false;
 				return VectorExprIsSupported(linitial(sa->args), vars);
 			}
@@ -513,24 +534,52 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->value = case_test->value;
 				return step;
 			}
+		case T_ArrayExpr:
+			{
+				ArrayExpr  *ae = (ArrayExpr *) expr;
+				int			nargs = list_length(ae->elements);
+
+				if (ae->multidims)
+					return NULL;
+				step = alloc_step(VEC_ARRAY, nargs, batch->capacity);
+				init_value(&step->value, ae->array_typeid, -1,
+						   batch->capacity, true);
+				step->u.array_elems = palloc(sizeof(Datum) * Max(nargs, 1));
+				step->array_nulls = palloc(sizeof(bool) * Max(nargs, 1));
+				argno = 0;
+				foreach(lc, ae->elements)
+				{
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars,
+												   case_test);
+					if (step->args[argno] == NULL)
+						return NULL;
+					argno++;
+				}
+				return step;
+			}
 		case T_ScalarArrayOpExpr:
 			{
 				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) expr;
-				Const	   *arr = (Const *) lsecond(sa->args);
-				Oid			elemtype = get_element_type(arr->consttype);
+				Expr	   *array_expr = (Expr *) lsecond(sa->args);
+				Oid			elemtype = get_element_type(exprType((Node *) array_expr));
 				int16		elmlen;
 				bool		elembyval;
 				char		elemalign;
 
 				if (!OidIsValid(elemtype))
 					return NULL;
-				step = alloc_step(VEC_SAOP, 1, batch->capacity);
+				step = alloc_step(VEC_SAOP, 2, batch->capacity);
 				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
 				get_typlenbyvalalign(elemtype, &elmlen, &elembyval, &elemalign);
-				deconstruct_array(DatumGetArrayTypeP(arr->constvalue),
-								  elemtype, elmlen, elembyval, elemalign,
-								  &step->u.saop.elems, &step->u.saop.elem_nulls,
-								  &step->u.saop.nelems);
+				step->u.saop.typlen = elmlen;
+				step->u.saop.typbyval = elembyval;
+				step->u.saop.typalign = elemalign;
+				step->u.saop.const_array = IsA(array_expr, Const);
+				if (IsA(array_expr, Const) && !((Const *) array_expr)->constisnull)
+					deconstruct_array(DatumGetArrayTypeP(((Const *) array_expr)->constvalue),
+									  elemtype, elmlen, elembyval, elemalign,
+									  &step->u.saop.elems, &step->u.saop.elem_nulls,
+									  &step->u.saop.nelems);
 				step->u.saop.useOr = sa->useOr;
 				fmgr_info(sa->opfuncid, &step->u.saop.fn);
 				step->u.saop.fcinfo = palloc0(SizeForFunctionCallInfo(2));
@@ -538,7 +587,8 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 										 2, sa->inputcollid, NULL, NULL);
 				step->u.saop.strict = step->u.saop.fn.fn_strict;
 				step->args[0] = build_step((Expr *) linitial(sa->args), batch, vars, case_test);
-				return step->args[0] ? step : NULL;
+				step->args[1] = build_step(array_expr, batch, vars, case_test);
+				return step->args[0] && step->args[1] ? step : NULL;
 			}
 		case T_BooleanTest:
 			{
@@ -862,12 +912,47 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				}
 			}
 			return;
+		case VEC_ARRAY:
+			{
+				Oid			elemtype = get_element_type(step->value.typid);
+				int16		elmlen;
+				bool		elembyval;
+				char		elemalign;
+				int			argno;
+
+				get_typlenbyvalalign(elemtype, &elmlen, &elembyval, &elemalign);
+				for (argno = 0; argno < step->nargs; argno++)
+					eval_step(step->args[argno], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					ArrayType  *array;
+
+					for (argno = 0; argno < step->nargs; argno++)
+					{
+						step->u.array_elems[argno] = step->args[argno]->value.values[row];
+						step->array_nulls[argno] = value_is_null(&step->args[argno]->value, row);
+					}
+					{
+						int			dims[1] = {step->nargs};
+						int			lbs[1] = {1};
+
+						array = construct_md_array(step->u.array_elems,
+												   step->array_nulls, 1, dims, lbs,
+												   elemtype, elmlen, elembyval, elemalign);
+					}
+					value_set(&step->value, row, PointerGetDatum(array), false);
+				}
+				return;
+			}
 		case VEC_SAOP:
 			{
 				VectorExprStep *arg = step->args[0];
+				VectorExprStep *array = step->args[1];
 				FunctionCallInfo fcinfo = step->u.saop.fcinfo;
 
 				eval_step(arg, batch, selection, nselected);
+				eval_step(array, batch, selection, nselected);
 				for (pos = 0; pos < nselected; pos++)
 				{
 					int			row = selection[pos];
@@ -875,11 +960,20 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 					int			decided = -1;
 					int			e;
 
-					if (value_is_null(&arg->value, row))
+					if (value_is_null(&arg->value, row) ||
+						value_is_null(&array->value, row))
 					{
 						value_set(&step->value, row, (Datum) 0, true);
 						continue;
 					}
+					if (!step->u.saop.const_array)
+						deconstruct_array(DatumGetArrayTypeP(array->value.values[row]),
+										  get_element_type(array->value.typid),
+										  step->u.saop.typlen, step->u.saop.typbyval,
+										  step->u.saop.typalign,
+										  &step->u.saop.elems,
+										  &step->u.saop.elem_nulls,
+										  &step->u.saop.nelems);
 					fcinfo->args[0].value = arg->value.values[row];
 					fcinfo->args[0].isnull = false;
 					for (e = 0; e < step->u.saop.nelems && decided < 0; e++)

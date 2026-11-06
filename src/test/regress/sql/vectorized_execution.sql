@@ -112,6 +112,11 @@ SELECT count(*) FROM vector_aoco_test WHERE id IN (1, 2, 3, 5000, 99999);
 SELECT count(*) FROM vector_aoco_test WHERE id NOT IN (4, 5, 6000);
 SELECT count(*) FROM vector_aoco_test WHERE val IN ('new1', 'new2', 'v10', 'nope');
 SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
+SELECT id, ARRAY[id, NULL, id + 1] AS a FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+SELECT id, id = ANY(ARRAY[id % 5, 2]) AS any_match FROM vector_aoco_small ORDER BY id;
+SELECT count(*) FROM vector_aoco_small WHERE id = ANY(ARRAY[]::int[]);
+SELECT count(*) FROM vector_aoco_small WHERE id = ANY(NULL::int[]);
+SELECT count(*) FROM vector_aoco_small WHERE id <> ALL(ARRAY[id % 5, 2]);
 SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
 FROM vector_aoco_test;
 SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;

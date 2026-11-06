@@ -253,6 +253,47 @@ SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
     55
 (1 row)
 
+SELECT id, ARRAY[id, NULL, id + 1] AS a FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ id |     a      
+----+------------
+  1 | {1,NULL,2}
+  2 | {2,NULL,3}
+  3 | {3,NULL,4}
+(3 rows)
+
+SELECT id, id = ANY(ARRAY[id % 5, 2]) AS any_match FROM vector_aoco_small ORDER BY id;
+ id | any_match 
+----+-----------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | f
+  6 | f
+  7 | f
+  8 | f
+  9 | f
+ 10 | f
+(10 rows)
+
+SELECT count(*) FROM vector_aoco_small WHERE id = ANY(ARRAY[]::int[]);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id = ANY(NULL::int[]);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id <> ALL(ARRAY[id % 5, 2]);
+ count 
+-------
+     6
+(1 row)
+
 SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
 FROM vector_aoco_test;
  sum  | count | count 
