@@ -5433,6 +5433,31 @@ VectorAggRetrievePlain(AggState *aggstate)
 	return result;
 }
 
+bool
+VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot)
+{
+	Agg		   *node = aggstate->phase->aggnode;
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+
+	tmpcontext->ecxt_outertuple = slot;
+	tmpcontext->ecxt_innertuple = aggstate->ss.ss_ScanTupleSlot;
+	return ExecQualAndReset(aggstate->phase->eqfunctions[node->numCols - 1],
+							tmpcontext);
+}
+
+TupleTableSlot *
+VectorAggRetrieveGroup(AggState *aggstate)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+
+	ReScanExprContext(econtext);
+	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, 0);
+	select_current_set(aggstate, 0, false);
+	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[0]);
+	return project_aggregates(aggstate);
+}
+
 TupleTableSlot *
 VectorAggRetrieveHashed(AggState *aggstate)
 {

@@ -188,6 +188,21 @@ SELECT array_agg(DISTINCT id % 3 ORDER BY id % 3) FROM vector_aoco_small;
 SELECT array_agg(id ORDER BY id) FROM vector_aoco_small WHERE id < 0;
 SELECT string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
 FROM vector_aoco_test WHERE id < 10;
+EXPLAIN (COSTS OFF)
+SELECT id % 3 AS g, string_agg(val, ',' ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+SELECT id % 3 AS g, count(DISTINCT val), sum(DISTINCT id % 10)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+SELECT id % 3 AS g, string_agg(val, ',' ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+SELECT id % 2 AS g, string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
+FROM vector_aoco_test WHERE id < 20 GROUP BY 1 ORDER BY 1;
+SELECT id % 3 AS g, array_agg(id ORDER BY id) FILTER (WHERE val IS NOT NULL)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+SELECT id % 3 AS g, count(DISTINCT id) FROM vector_aoco_small
+GROUP BY 1 HAVING count(DISTINCT id) > 3 ORDER BY 1;
+SELECT id % 100 AS g, array_agg(DISTINCT id % 10 ORDER BY id % 10)
+FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

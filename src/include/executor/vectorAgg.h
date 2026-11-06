@@ -18,6 +18,8 @@ extern VectorAggState *VectorAggCreate(MemoryContext parent, AggState *agg,
 									   VectorBatch *batch);
 extern void VectorAggDestroy(VectorAggState *state);
 extern void VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch);
+extern TupleTableSlot *VectorAggProcessBatchSorted(VectorAggState *state,
+												 VectorBatch *batch, int *position);
 extern void VectorAggFinish(VectorAggState *state);
 extern TupleTableSlot *VectorAggNext(VectorAggState *state);
 extern void VectorAggReset(VectorAggState *state);
@@ -33,6 +35,8 @@ extern void VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot,
 								uint32 hash);
 extern void VectorAggFinishInput(AggState *aggstate);
 extern TupleTableSlot *VectorAggRetrievePlain(AggState *aggstate);
+extern TupleTableSlot *VectorAggRetrieveGroup(AggState *aggstate);
+extern bool VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot);
 extern TupleTableSlot *VectorAggRetrieveHashed(AggState *aggstate);
 
 #endif							/* VECTORAGG_H */

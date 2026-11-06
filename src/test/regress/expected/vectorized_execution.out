@@ -649,6 +649,74 @@ FROM vector_aoco_test WHERE id < 10;
  v9:9|v8:8|v6:6|v5:5|v4:4|v3:3|v2:2|v1:1
 (1 row)
 
+EXPLAIN (COSTS OFF)
+SELECT id % 3 AS g, string_agg(val, ',' ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.g
+   ->  Custom Scan (GGVectorRegion)
+         ->  GroupAggregate
+               Group Key: ((vector_aoco_small.id % 3))
+               ->  Sort
+                     Sort Key: ((vector_aoco_small.id % 3))
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: ((vector_aoco_small.id % 3))
+                           ->  Seq Scan on vector_aoco_small
+(11 rows)
+
+SELECT id % 3 AS g, count(DISTINCT val), sum(DISTINCT id % 10)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ g | count | sum 
+---+-------+-----
+ 0 |  1302 |  45
+ 1 |  1301 |  45
+ 2 |  1302 |  45
+(3 rows)
+
+SELECT id % 3 AS g, string_agg(val, ',' ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g |  string_agg  
+---+--------------
+ 0 | v3,v6,v9
+ 1 | v1,v4,v7,v10
+ 2 | v2,v5,v8
+(3 rows)
+
+SELECT id % 2 AS g, string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
+FROM vector_aoco_test WHERE id < 20 GROUP BY 1 ORDER BY 1;
+ g |                   string_agg                    
+---+-------------------------------------------------
+ 0 | v18:18|v16:16|v12:12|v10:10|v8:8|v6:6|v4:4|v2:2
+ 1 | v19:19|v17:17|v15:15|v13:13|v9:9|v5:5|v3:3|v1:1
+(2 rows)
+
+SELECT id % 3 AS g, array_agg(id ORDER BY id) FILTER (WHERE val IS NOT NULL)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g | array_agg  
+---+------------
+ 0 | {3,6,9}
+ 1 | {1,4,7,10}
+ 2 | {2,5,8}
+(3 rows)
+
+SELECT id % 3 AS g, count(DISTINCT id) FROM vector_aoco_small
+GROUP BY 1 HAVING count(DISTINCT id) > 3 ORDER BY 1;
+ g | count 
+---+-------
+ 1 |     4
+(1 row)
+
+SELECT id % 100 AS g, array_agg(DISTINCT id % 10 ORDER BY id % 10)
+FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
+ g | array_agg 
+---+-----------
+ 0 | {0}
+ 1 | {1}
+ 2 | {2}
+(3 rows)
+
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

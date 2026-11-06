@@ -422,10 +422,28 @@ VectorRegionExec(CustomScanState *node)
 
 	if (state->agg != NULL)
 	{
-		while (VectorRegionNextBatch(state))
+		AggState   *agg = state->agg;
+
+		if (agg->aggstrategy == AGG_SORTED)
 		{
-			VectorAggProcessBatch(state->vagg, state->batch);
-			state->position = state->batch->nselected;
+			while (state->position < state->batch->nselected ||
+				   VectorRegionNextBatch(state))
+			{
+				TupleTableSlot *result = VectorAggProcessBatchSorted(state->vagg,
+															 state->batch,
+															 &state->position);
+
+				if (result != NULL)
+					return result;
+			}
+		}
+		else
+		{
+			while (VectorRegionNextBatch(state))
+			{
+				VectorAggProcessBatch(state->vagg, state->batch);
+				state->position = state->batch->nselected;
+			}
 		}
 		VectorAggFinish(state->vagg);
 		return VectorAggNext(state->vagg);

@@ -30,6 +30,7 @@ struct VectorAggState
 	Datum	  **values;
 	bool	  **nulls;
 	TupleTableSlot *input_slot;	/* full input row, for spilling */
+	bool		group_open;
 	bool		input_done;
 	bool		output_done;
 };
@@ -43,7 +44,7 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	int			col = 0;
 
 	if (!IsA(outer, SeqScan) && !IsA(outer, Motion) &&
-		agg->aggstrategy != AGG_HASHED)
+		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED)
 		return false;
 
 	vars->outer_ncols = list_length(outer->targetlist);
@@ -92,7 +93,8 @@ VectorAggPlanIsSupported(Agg *agg)
 	int			col;
 	bool		supported = false;
 
-	if ((agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED) ||
+	if ((agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED &&
+		 agg->aggstrategy != AGG_SORTED) ||
 		(agg->aggsplit != AGGSPLIT_SIMPLE &&
 		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
 		agg->groupingSets != NIL || agg->chain != NIL ||
@@ -100,7 +102,7 @@ VectorAggPlanIsSupported(Agg *agg)
 		agg->plan.initPlan != NIL || agg->plan.extParam != NULL || agg->plan.allParam != NULL)
 		return false;
 	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
-		(agg->aggstrategy == AGG_HASHED && agg->numCols == 0))
+		(agg->aggstrategy != AGG_PLAIN && agg->numCols == 0))
 		return false;
 	if (!build_var_map(agg, CurrentMemoryContext, &vars))
 		return false;
@@ -134,7 +136,7 @@ VectorAggPlanIsSupported(Agg *agg)
 				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
 				aggref->aggdirectargs != NIL || aggref->aggtype == INTERNALOID ||
 				((aggref->aggorder != NIL || aggref->aggdistinct != NIL) &&
-				 agg->aggstrategy != AGG_PLAIN) ||
+				 agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_SORTED) ||
 				(aggref->aggdistinct != NIL && list_length(aggref->args) != 1))
 				goto done;
 			if (aggref->aggfilter != NULL &&
@@ -222,7 +224,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 				return NULL;
 			}
 		}
-		Assert(argno == pertrans->numTransInputs);
+		Assert(argno == pertrans->numInputs);
 	}
 	if (agg->aggstrategy == AGG_PLAIN)
 	{
@@ -261,7 +263,7 @@ eval_arguments(VectorAggState *state, VectorBatch *batch)
 
 	for (transno = 0; transno < agg->numtrans; transno++)
 	{
-		int			nargs = agg->pertrans[transno].numTransInputs;
+		int			nargs = agg->pertrans[transno].numInputs;
 		int32	   *selection = batch->selection;
 		int			nselected = batch->nselected;
 		int			argno;
@@ -356,6 +358,59 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	return NULL;
 }
 
+static void
+advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
+{
+	AggState   *agg = state->agg;
+	int			transno;
+
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &agg->pertrans[transno];
+		int			nargs = pertrans->numInputs;
+		int			argno;
+
+		if (state->filters[transno] != NULL)
+		{
+			bool		isnull;
+			Datum		value = VectorExprGetValue(state->filters[transno], row,
+												 &isnull);
+
+			if (isnull || !DatumGetBool(value))
+				continue;
+		}
+		for (argno = 0; argno < nargs; argno++)
+			state->values[transno][argno] =
+				VectorExprGetValue(state->args[transno][argno], row,
+								   &state->nulls[transno][argno]);
+		if (pertrans->numSortCols > 0)
+		{
+			Assert(agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_SORTED);
+			if (nargs == 1)
+				tuplesort_putdatum(pertrans->sortstates[0],
+								   state->values[transno][0],
+								   state->nulls[transno][0]);
+			else
+			{
+				TupleTableSlot *sortslot = pertrans->sortslot;
+
+				ExecClearTuple(sortslot);
+				for (argno = 0; argno < nargs; argno++)
+				{
+					sortslot->tts_values[argno] = state->values[transno][argno];
+					sortslot->tts_isnull[argno] = state->nulls[transno][argno];
+				}
+				sortslot->tts_nvalid = nargs;
+				ExecStoreVirtualTuple(sortslot);
+				tuplesort_puttupleslot(pertrans->sortstates[0], sortslot);
+			}
+		}
+		else
+			VectorAggAdvanceTransition(agg, pergroup, transno,
+									   state->values[transno], state->nulls[transno]);
+	}
+}
+
 void
 VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 {
@@ -370,7 +425,6 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 	{
 		int			row = VectorBatchSelectedRow(batch, pos);
 		AggStatePerGroup pergroup;
-		int			transno;
 
 		if ((pos & 0xff) == 0)
 			CHECK_FOR_INTERRUPTS();
@@ -383,54 +437,63 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 		else
 			pergroup = agg->pergroups[0];
 
-		for (transno = 0; transno < agg->numtrans; transno++)
-		{
-			AggStatePerTrans pertrans = &agg->pertrans[transno];
-			int			nargs = pertrans->numTransInputs;
-			int			argno;
-
-			if (state->filters[transno] != NULL)
-			{
-				bool		isnull;
-				Datum		value = VectorExprGetValue(state->filters[transno], row,
-													 &isnull);
-
-				if (isnull || !DatumGetBool(value))
-					continue;
-			}
-			for (argno = 0; argno < nargs; argno++)
-				state->values[transno][argno] =
-					VectorExprGetValue(state->args[transno][argno], row,
-									   &state->nulls[transno][argno]);
-			if (pertrans->numSortCols > 0)
-			{
-				Assert(agg->aggstrategy == AGG_PLAIN);
-				if (nargs == 1)
-					tuplesort_putdatum(pertrans->sortstates[0],
-									   state->values[transno][0],
-									   state->nulls[transno][0]);
-				else
-				{
-					TupleTableSlot *sortslot = pertrans->sortslot;
-
-					ExecClearTuple(sortslot);
-					for (argno = 0; argno < nargs; argno++)
-					{
-						sortslot->tts_values[argno] = state->values[transno][argno];
-						sortslot->tts_isnull[argno] = state->nulls[transno][argno];
-					}
-					sortslot->tts_nvalid = nargs;
-					ExecStoreVirtualTuple(sortslot);
-					tuplesort_puttupleslot(pertrans->sortstates[0], sortslot);
-				}
-			}
-			else
-				VectorAggAdvanceTransition(agg, pergroup, transno,
-										   state->values[transno], state->nulls[transno]);
-		}
+		advance_row(state, pergroup, row);
 	}
 	/* Transition garbage is bounded by the batch size; reset once. */
 	ResetExprContext(agg->tmpcontext);
+}
+
+static void
+start_sorted_group(VectorAggState *state, VectorBatch *batch, int row)
+{
+	AggState   *agg = state->agg;
+	TupleTableSlot *input;
+	HeapTuple	first;
+	MemoryContext oldcontext;
+
+	ReScanExprContext(agg->aggcontexts[0]);
+	input = fill_input_slot(state, batch, row);
+	first = ExecCopySlotHeapTuple(input);
+	ExecForceStoreHeapTuple(first, agg->ss.ss_ScanTupleSlot, true);
+	oldcontext = MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
+	VectorAggInitializePlain(agg);
+	MemoryContextSwitchTo(oldcontext);
+	state->group_open = true;
+}
+
+TupleTableSlot *
+VectorAggProcessBatchSorted(VectorAggState *state, VectorBatch *batch,
+							int *position)
+{
+	AggState   *agg = state->agg;
+
+	if (batch->nselected == 0)
+		return NULL;
+
+	eval_arguments(state, batch);
+	while (*position < batch->nselected)
+	{
+		int			row = VectorBatchSelectedRow(batch, *position);
+
+		if ((*position & 0xff) == 0)
+			CHECK_FOR_INTERRUPTS();
+		if (state->group_open &&
+			!VectorAggSameGroup(agg, fill_input_slot(state, batch, row)))
+		{
+			TupleTableSlot *result = VectorAggRetrieveGroup(agg);
+
+			state->group_open = false;
+			ResetExprContext(agg->tmpcontext);
+			if (result != NULL)
+				return result;	/* resume at this row, the next group's first */
+		}
+		if (!state->group_open)
+			start_sorted_group(state, batch, row);
+		advance_row(state, agg->pergroups[0], row);
+		(*position)++;
+	}
+	ResetExprContext(agg->tmpcontext);
+	return NULL;
 }
 
 void
@@ -451,12 +514,29 @@ VectorAggNext(VectorAggState *state)
 	if (state->output_done)
 		return NULL;
 
+	if (state->agg->aggstrategy == AGG_SORTED && state->group_open)
+	{
+		TupleTableSlot *result;
+
+		ResetExprContext(state->agg->tmpcontext);
+		result = VectorAggRetrieveGroup(state->agg);
+		state->group_open = false;
+		if (result != NULL)
+			return result;
+	}
+
 	if (state->agg->aggstrategy == AGG_HASHED)
 	{
 		result = VectorAggRetrieveHashed(state->agg);
 		if (result == NULL)
 			state->output_done = true;
 		return result;
+	}
+
+	if (state->agg->aggstrategy == AGG_SORTED)
+	{
+		state->output_done = true;
+		return NULL;
 	}
 
 	state->output_done = true;
@@ -478,5 +558,6 @@ VectorAggReset(VectorAggState *state)
 	/* A reused hash table must be iterated, not populated a second time. */
 	state->input_done = state->agg->aggstrategy == AGG_HASHED &&
 		state->agg->table_filled;
+	state->group_open = false;
 	state->output_done = false;
 }
