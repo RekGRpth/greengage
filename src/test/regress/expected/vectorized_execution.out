@@ -181,6 +181,90 @@ SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
     55
 (1 row)
 
+SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
+FROM vector_aoco_test;
+ sum  | count | count 
+------+-------+-------
+ 4554 |  3904 |  3905
+(1 row)
+
+SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;
+ id | nz 
+----+----
+  1 |  1
+  2 |  2
+  3 |   
+  4 |  1
+  5 |  2
+  6 |   
+(6 rows)
+
+SELECT count(*) FROM vector_aoco_test WHERE nullif(id % 3, 0) IS NULL;
+ count 
+-------
+  1519
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
+ count 
+-------
+     9
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
+ count 
+-------
+  4554
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE val IS NOT DISTINCT FROM NULL;
+ count 
+-------
+   650
+(1 row)
+
+SELECT id, greatest(id % 5, 2) AS g, least(id % 5, 2) AS l
+FROM vector_aoco_small ORDER BY id;
+ id | g | l 
+----+---+---
+  1 | 2 | 1
+  2 | 2 | 2
+  3 | 3 | 2
+  4 | 4 | 2
+  5 | 2 | 0
+  6 | 2 | 1
+  7 | 2 | 2
+  8 | 3 | 2
+  9 | 4 | 2
+ 10 | 2 | 0
+(10 rows)
+
+SELECT sum(greatest(id % 3, 1)), sum(least(id % 3, 1)) FROM vector_aoco_test;
+ sum  | sum  
+------+------
+ 6073 | 3036
+(1 row)
+
+SELECT count(greatest(val, 'fallback')), count(least(val, 'fallback')),
+       count(greatest(val, NULL)), count(least(val, NULL))
+FROM vector_aoco_test;
+ count | count | count | count 
+-------+-------+-------+-------
+  4555 |  4555 |  3905 |  3905
+(1 row)
+
+SELECT sum(greatest(num, 10)), sum(least(num, 10)) FROM vector_aoco_test;
+   sum    |   sum    
+----------+----------
+ 82110.00 | 38406.25
+(1 row)
+
 SELECT coalesce(val, 'MISSING'), count(*)
 FROM vector_aoco_test GROUP BY 1 ORDER BY 1 LIMIT 4;
  coalesce | count 

@@ -22,6 +22,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 
 typedef enum VectorExprKind
 {
@@ -37,7 +38,10 @@ typedef enum VectorExprKind
 	VEC_CASE,
 	VEC_CASETEST,
 	VEC_SAOP,
-	VEC_BOOLTEST
+	VEC_BOOLTEST,
+	VEC_NULLIF,
+	VEC_DISTINCT,
+	VEC_MINMAX
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -80,6 +84,12 @@ typedef struct VectorExprStep
 			int			nelems;
 			bool		useOr;		/* = ANY when set, <> ALL otherwise */
 		}			saop;
+		struct
+		{
+			FunctionCallInfo fcinfo;
+			FmgrInfo	fn;
+			MinMaxOp	op;
+		}			minmax;
 	}			u;
 } VectorExprStep;
 
@@ -182,6 +192,8 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 					return false;
 			}
 			return true;
+		case T_DistinctExpr:
+		case T_NullIfExpr:
 		case T_OpExpr:
 			{
 				OpExpr	   *op = (OpExpr *) expr;
@@ -204,6 +216,22 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 					func_volatile(func->funcid) != PROVOLATILE_IMMUTABLE)
 					return false;
 				foreach(lc, func->args)
+				{
+					if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
+						return false;
+				}
+				return true;
+			}
+		case T_MinMaxExpr:
+			{
+				MinMaxExpr *mm = (MinMaxExpr *) expr;
+				TypeCacheEntry *typentry = lookup_type_cache(mm->minmaxtype,
+													TYPECACHE_CMP_PROC);
+
+				if (!OidIsValid(typentry->cmp_proc) ||
+					func_volatile(typentry->cmp_proc) != PROVOLATILE_IMMUTABLE)
+					return false;
+				foreach(lc, mm->args)
 				{
 					if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
 						return false;
@@ -357,12 +385,23 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->value.typmod = relabel->resulttypmod;
 				return step;
 			}
+		case T_DistinctExpr:
+		case T_NullIfExpr:
 		case T_OpExpr:
 			{
 				OpExpr	   *op = (OpExpr *) expr;
+				Oid			resulttype = IsA(expr, NullIfExpr) ?
+					exprType((Node *) expr) : op->opresulttype;
+				int32		resulttypmod = IsA(expr, NullIfExpr) ?
+					exprTypmod((Node *) expr) : -1;
 
-				return build_func_step(op->opfuncid, op->opresulttype, -1,
+				step = build_func_step(op->opfuncid, resulttype, resulttypmod,
 									   op->inputcollid, op->args, batch, vars, case_test);
+				if (step != NULL && IsA(expr, NullIfExpr))
+					step->kind = VEC_NULLIF;
+				else if (step != NULL && IsA(expr, DistinctExpr))
+					step->kind = VEC_DISTINCT;
+				return step;
 			}
 		case T_FuncExpr:
 			{
@@ -372,6 +411,35 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					return NULL;
 				return build_func_step(func->funcid, func->funcresulttype, -1,
 									   func->inputcollid, func->args, batch, vars, case_test);
+			}
+		case T_MinMaxExpr:
+			{
+				MinMaxExpr *mm = (MinMaxExpr *) expr;
+				TypeCacheEntry *typentry;
+
+				step = alloc_step(VEC_MINMAX, list_length(mm->args),
+								  batch->capacity);
+				init_value(&step->value, mm->minmaxtype, -1,
+						   batch->capacity, true);
+				typentry = lookup_type_cache(mm->minmaxtype, TYPECACHE_CMP_PROC);
+				if (!OidIsValid(typentry->cmp_proc))
+					return NULL;
+				fmgr_info(typentry->cmp_proc, &step->u.minmax.fn);
+				fmgr_info_set_expr((Node *) expr, &step->u.minmax.fn);
+				step->u.minmax.fcinfo = palloc0(SizeForFunctionCallInfo(2));
+				InitFunctionCallInfoData(*step->u.minmax.fcinfo, &step->u.minmax.fn,
+										 2, mm->inputcollid, NULL, NULL);
+				step->u.minmax.op = mm->op;
+				argno = 0;
+				foreach(lc, mm->args)
+				{
+					step->args[argno] = build_step((Expr *) lfirst(lc), batch, vars,
+												   case_test);
+					if (step->args[argno] == NULL)
+						return NULL;
+					argno++;
+				}
+				return step;
 			}
 		case T_NullTest:
 			{
@@ -854,6 +922,114 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				}
 			}
 			return;
+		case VEC_NULLIF:
+			{
+				FunctionCallInfo fcinfo = step->u.func.fcinfo;
+
+				for (pos = 0; pos < step->nargs; pos++)
+					eval_step(step->args[pos], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					VectorValue *left = &step->args[0]->value;
+					VectorValue *right = &step->args[1]->value;
+					bool		leftnull = value_is_null(left, row);
+					bool		rightnull = value_is_null(right, row);
+
+					fcinfo->args[0].value = left->values[row];
+					fcinfo->args[0].isnull = leftnull;
+					fcinfo->args[1].value = right->values[row];
+					fcinfo->args[1].isnull = rightnull;
+					if (!leftnull && !rightnull)
+					{
+						Datum		equal;
+
+						fcinfo->isnull = false;
+						equal = step->u.func.fn.fn_addr(fcinfo);
+						if (!fcinfo->isnull && DatumGetBool(equal))
+						{
+							value_set(&step->value, row, (Datum) 0, true);
+							continue;
+						}
+					}
+					value_set(&step->value, row, left->values[row], leftnull);
+				}
+				return;
+			}
+		case VEC_DISTINCT:
+			{
+				FunctionCallInfo fcinfo = step->u.func.fcinfo;
+
+				for (pos = 0; pos < step->nargs; pos++)
+					eval_step(step->args[pos], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					VectorValue *left = &step->args[0]->value;
+					VectorValue *right = &step->args[1]->value;
+					bool		leftnull = value_is_null(left, row);
+					bool		rightnull = value_is_null(right, row);
+
+					if (leftnull || rightnull)
+					{
+						value_set(&step->value, row,
+								  BoolGetDatum(leftnull != rightnull), false);
+						continue;
+					}
+					fcinfo->args[0].value = left->values[row];
+					fcinfo->args[0].isnull = false;
+					fcinfo->args[1].value = right->values[row];
+					fcinfo->args[1].isnull = false;
+					fcinfo->isnull = false;
+					{
+						Datum		equal = step->u.func.fn.fn_addr(fcinfo);
+
+						value_set(&step->value, row,
+								  BoolGetDatum(!DatumGetBool(equal)), fcinfo->isnull);
+					}
+				}
+				return;
+			}
+		case VEC_MINMAX:
+			{
+				FunctionCallInfo fcinfo = step->u.minmax.fcinfo;
+				int			argno;
+
+				for (argno = 0; argno < step->nargs; argno++)
+					eval_step(step->args[argno], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					Datum		result = (Datum) 0;
+					bool		isnull = true;
+
+					for (argno = 0; argno < step->nargs; argno++)
+					{
+						VectorValue *arg = &step->args[argno]->value;
+						int			cmpresult;
+
+						if (value_is_null(arg, row))
+							continue;
+						if (isnull)
+						{
+							result = arg->values[row];
+							isnull = false;
+							continue;
+						}
+						fcinfo->args[0].value = result;
+						fcinfo->args[1].value = arg->values[row];
+						fcinfo->isnull = false;
+						cmpresult = DatumGetInt32(FunctionCallInvoke(fcinfo));
+						if (fcinfo->isnull)
+							continue;
+						if ((cmpresult > 0 && step->u.minmax.op == IS_LEAST) ||
+							(cmpresult < 0 && step->u.minmax.op == IS_GREATEST))
+							result = arg->values[row];
+					}
+					value_set(&step->value, row, result, isnull);
+				}
+				return;
+			}
 		case VEC_BOOLTEST:
 			eval_step(step->args[0], batch, selection, nselected);
 			for (pos = 0; pos < nselected; pos++)

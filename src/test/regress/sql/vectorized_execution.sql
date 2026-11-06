@@ -91,6 +91,21 @@ SELECT count(*) FROM vector_aoco_test WHERE id IN (1, 2, 3, 5000, 99999);
 SELECT count(*) FROM vector_aoco_test WHERE id NOT IN (4, 5, 6000);
 SELECT count(*) FROM vector_aoco_test WHERE val IN ('new1', 'new2', 'v10', 'nope');
 SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
+SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
+FROM vector_aoco_test;
+SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;
+SELECT count(*) FROM vector_aoco_test WHERE nullif(id % 3, 0) IS NULL;
+SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
+SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
+SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
+SELECT count(*) FROM vector_aoco_test WHERE val IS NOT DISTINCT FROM NULL;
+SELECT id, greatest(id % 5, 2) AS g, least(id % 5, 2) AS l
+FROM vector_aoco_small ORDER BY id;
+SELECT sum(greatest(id % 3, 1)), sum(least(id % 3, 1)) FROM vector_aoco_test;
+SELECT count(greatest(val, 'fallback')), count(least(val, 'fallback')),
+       count(greatest(val, NULL)), count(least(val, NULL))
+FROM vector_aoco_test;
+SELECT sum(greatest(num, 10)), sum(least(num, 10)) FROM vector_aoco_test;
 SELECT coalesce(val, 'MISSING'), count(*)
 FROM vector_aoco_test GROUP BY 1 ORDER BY 1 LIMIT 4;
 SELECT sum(coalesce(later, 0)), count(coalesce(val, 'x')) FROM vector_aoco_test;
