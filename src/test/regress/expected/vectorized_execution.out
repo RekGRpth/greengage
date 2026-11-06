@@ -628,6 +628,30 @@ FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
   7 | t
 (7 rows)
 
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vector_aoco_test l
+JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 10 = r.g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Hash Join
+                           Hash Cond: ((l.id % 10) = r.g)
+                           ->  Seq Scan on vector_aoco_test l
+                           ->  Hash
+                                 ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                       ->  Subquery Scan on r
+                                             ->  HashAggregate
+                                                   Group Key: gg_vector_region.c1
+                                                   ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                         Hash Key: gg_vector_region.c1
+                                                         ->  Custom Scan (GGVectorRegion)
+                                                               ->  Seq Scan on vector_aoco_small
+(17 rows)
+
 SELECT count(*) FROM vector_aoco_test l
 JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
   ON l.id % 10 = r.g;
@@ -1018,22 +1042,23 @@ EXPLAIN (COSTS OFF)
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;
-                         QUERY PLAN                         
-------------------------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: gg_vector_region.c1, gg_vector_region.c4
+   Merge Key: gg_vector_region_1.c1, gg_vector_region_1.c4
    ->  Sort
-         Sort Key: gg_vector_region.c1, gg_vector_region.c4
+         Sort Key: gg_vector_region_1.c1, gg_vector_region_1.c4
          ->  Custom Scan (GGVectorRegion)
                ->  Merge Join
-                     Merge Cond: (l.id = r.id)
+                     Merge Cond: (l.id = gg_vector_region.c1)
                      ->  Sort
                            Sort Key: l.id
                            ->  Seq Scan on vector_join_l l
-                     ->  Sort
-                           Sort Key: r.id
-                           ->  Seq Scan on vector_join_r r
-(14 rows)
+                     ->  Custom Scan (GGVectorRegion)
+                           ->  Sort
+                                 Sort Key: r.id
+                                 ->  Seq Scan on vector_join_r r
+(15 rows)
 
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id

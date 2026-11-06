@@ -435,9 +435,15 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
-		IsA(innerPlan(node), Hash) &&
-		auto_allowed(ctx, (Plan *) node))
-		return (Node *) make_region(ctx, (Plan *) node);
+		IsA(innerPlan(node), Hash))
+	{
+		Plan	   *hash = innerPlan(node);
+
+		outerPlan(hash) = (Plan *) vectorize_mutator((Node *) outerPlan(hash), ctx);
+		if (auto_allowed(ctx, (Plan *) node))
+			return (Node *) make_region(ctx, (Plan *) node);
+		return node;
+	}
 
 	if (IsA(node, Material) && slice_runs_on_segments(ctx) &&
 		VectorMaterialPlanIsSupported((Material *) node) &&
@@ -462,9 +468,13 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		IsA(outerPlan(node), Sort) &&
 		VectorSortPlanIsSupported((Sort *) outerPlan(node)) &&
 		IsA(outerPlan(outerPlan(node)), SeqScan) &&
-		is_simple_scan(ctx, (SeqScan *) outerPlan(outerPlan(node))) &&
-		auto_allowed(ctx, (Plan *) node))
-		return (Node *) make_region(ctx, (Plan *) node);
+		is_simple_scan(ctx, (SeqScan *) outerPlan(outerPlan(node))))
+	{
+		innerPlan(node) = (Plan *) vectorize_mutator((Node *) innerPlan(node), ctx);
+		if (auto_allowed(ctx, (Plan *) node))
+			return (Node *) make_region(ctx, (Plan *) node);
+		return node;
+	}
 
 	if (IsA(node, Unique) && slice_runs_on_segments(ctx) &&
 		VectorUniquePlanIsSupported((Unique *) node) &&
