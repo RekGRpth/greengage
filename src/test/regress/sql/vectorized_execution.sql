@@ -117,6 +117,15 @@ SELECT id, id = ANY(ARRAY[id % 5, 2]) AS any_match FROM vector_aoco_small ORDER 
 SELECT count(*) FROM vector_aoco_small WHERE id = ANY(ARRAY[]::int[]);
 SELECT count(*) FROM vector_aoco_small WHERE id = ANY(NULL::int[]);
 SELECT count(*) FROM vector_aoco_small WHERE id <> ALL(ARRAY[id % 5, 2]);
+SELECT id, (ARRAY[id, id + 1, id + 2])[2] AS second FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+SELECT id, (ARRAY[id, id + 1, id + 2])[id] AS elem FROM vector_aoco_small WHERE id <= 3 ORDER BY id;
+SELECT (ARRAY[1, 2, 3])[0] AS below, (ARRAY[1, 2, 3])[NULL] AS null_index,
+       (NULL::int[])[1] AS null_array;
+SELECT (ARRAY[1, 2, 3, 4])[2:3] AS mid, (ARRAY[1, 2, 3, 4])[2:] AS tail,
+       (ARRAY[1, 2, 3, 4])[:2] AS head;
+SELECT id, (ARRAY[1, 2, 3, 4])[id:3] AS part FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+SELECT (ARRAY[1, 2, 3, 4])[NULL:2] AS null_lower, (ARRAY[1, 2, 3, 4])[2:NULL] AS null_upper;
+SELECT (ARRAY[1, 2, 3, 4])[1:2][1] AS nested;
 SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
 FROM vector_aoco_test;
 SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;

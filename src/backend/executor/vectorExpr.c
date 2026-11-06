@@ -42,7 +42,8 @@ typedef enum VectorExprKind
 	VEC_NULLIF,
 	VEC_DISTINCT,
 	VEC_MINMAX,
-	VEC_ARRAY
+	VEC_ARRAY,
+	VEC_SUBSCRIPT
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -97,6 +98,19 @@ typedef struct VectorExprStep
 			MinMaxOp	op;
 		}			minmax;
 		Datum	   *array_elems;
+		struct
+		{
+			int			attrlen;
+			int16		elmlen;
+			bool		elembyval;
+			char		elemalign;
+			int			nupper;
+			int			nlower;
+			bool	   *upperprovided;
+			bool	   *lowerprovided;
+			int		   *upperindex;
+			int		   *lowerindex;
+		}			subscript;
 	}			u;
 } VectorExprStep;
 
@@ -300,6 +314,29 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 					!VectorExprIsSupported(rexpr, vars))
 					return false;
 				return VectorExprIsSupported(linitial(sa->args), vars);
+			}
+		case T_SubscriptingRef:
+			{
+				SubscriptingRef *sr = (SubscriptingRef *) expr;
+				ListCell   *idx;
+
+				if (sr->refassgnexpr != NULL)
+					return false;
+				foreach(idx, sr->refupperindexpr)
+				{
+					Expr	   *e = (Expr *) lfirst(idx);
+
+					if (e != NULL && !VectorExprIsSupported(e, vars))
+						return false;
+				}
+				foreach(idx, sr->reflowerindexpr)
+				{
+					Expr	   *e = (Expr *) lfirst(idx);
+
+					if (e != NULL && !VectorExprIsSupported(e, vars))
+						return false;
+				}
+				return VectorExprIsSupported(sr->refexpr, vars);
 			}
 		case T_BooleanTest:
 			return VectorExprIsSupported(((BooleanTest *) expr)->arg, vars);
@@ -589,6 +626,60 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->args[0] = build_step((Expr *) linitial(sa->args), batch, vars, case_test);
 				step->args[1] = build_step(array_expr, batch, vars, case_test);
 				return step->args[0] && step->args[1] ? step : NULL;
+			}
+		case T_SubscriptingRef:
+			{
+				SubscriptingRef *sr = (SubscriptingRef *) expr;
+				int			nupper = list_length(sr->refupperindexpr);
+				int			nlower = list_length(sr->reflowerindexpr);
+				int			i = 0;
+
+				if (sr->refassgnexpr != NULL)
+					return NULL;
+				step = alloc_step(VEC_SUBSCRIPT, 1 + nupper + nlower,
+								  batch->capacity);
+				init_value(&step->value, exprType((Node *) expr), sr->reftypmod,
+						   batch->capacity, true);
+				step->u.subscript.attrlen = get_typlen(sr->refcontainertype);
+				get_typlenbyvalalign(sr->refelemtype,
+									 &step->u.subscript.elmlen,
+									 &step->u.subscript.elembyval,
+									 &step->u.subscript.elemalign);
+				step->u.subscript.nupper = nupper;
+				step->u.subscript.nlower = nlower;
+				step->u.subscript.upperprovided = palloc0(sizeof(bool) * Max(nupper, 1));
+				step->u.subscript.lowerprovided = palloc0(sizeof(bool) * Max(nlower, 1));
+				step->u.subscript.upperindex = palloc0(sizeof(int) * Max(nupper, 1));
+				step->u.subscript.lowerindex = palloc0(sizeof(int) * Max(nlower, 1));
+				step->args[0] = build_step(sr->refexpr, batch, vars, case_test);
+				if (step->args[0] == NULL)
+					return NULL;
+				foreach(lc, sr->refupperindexpr)
+				{
+					Expr	   *e = (Expr *) lfirst(lc);
+
+					i++;
+					if (e == NULL)
+						continue;
+					step->u.subscript.upperprovided[i - 1] = true;
+					step->args[i] = build_step(e, batch, vars, case_test);
+					if (step->args[i] == NULL)
+						return NULL;
+				}
+				i = 0;
+				foreach(lc, sr->reflowerindexpr)
+				{
+					Expr	   *e = (Expr *) lfirst(lc);
+
+					i++;
+					if (e == NULL)
+						continue;
+					step->u.subscript.lowerprovided[i - 1] = true;
+					step->args[nupper + i] = build_step(e, batch, vars, case_test);
+					if (step->args[nupper + i] == NULL)
+						return NULL;
+				}
+				return step;
 			}
 		case T_BooleanTest:
 			{
@@ -1121,6 +1212,68 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 							result = arg->values[row];
 					}
 					value_set(&step->value, row, result, isnull);
+				}
+				return;
+			}
+		case VEC_SUBSCRIPT:
+			{
+				int			nupper = step->u.subscript.nupper;
+				int			nlower = step->u.subscript.nlower;
+				int			i;
+
+				for (i = 0; i < step->nargs; i++)
+					if (step->args[i] != NULL)
+						eval_step(step->args[i], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					Datum		container = step->args[0]->value.values[row];
+					bool		isnull = value_is_null(&step->args[0]->value, row);
+
+					for (i = 0; i < nupper && !isnull; i++)
+					{
+						if (!step->u.subscript.upperprovided[i])
+							continue;
+						if (value_is_null(&step->args[1 + i]->value, row))
+							isnull = true;
+						else
+							step->u.subscript.upperindex[i] =
+								DatumGetInt32(step->args[1 + i]->value.values[row]);
+					}
+					for (i = 0; i < nlower && !isnull; i++)
+					{
+						if (!step->u.subscript.lowerprovided[i])
+							continue;
+						if (value_is_null(&step->args[1 + nupper + i]->value, row))
+							isnull = true;
+						else
+							step->u.subscript.lowerindex[i] =
+								DatumGetInt32(step->args[1 + nupper + i]->value.values[row]);
+					}
+					if (isnull)
+					{
+						value_set(&step->value, row, (Datum) 0, true);
+						continue;
+					}
+					if (nlower == 0)
+						container = array_get_element(container, nupper,
+											 step->u.subscript.upperindex,
+											 step->u.subscript.attrlen,
+											 step->u.subscript.elmlen,
+											 step->u.subscript.elembyval,
+											 step->u.subscript.elemalign,
+											 &isnull);
+					else
+						container = array_get_slice(container, nupper,
+											step->u.subscript.upperindex,
+											step->u.subscript.lowerindex,
+											step->u.subscript.upperprovided,
+											step->u.subscript.lowerprovided,
+											step->u.subscript.attrlen,
+											step->u.subscript.elmlen,
+											step->u.subscript.elembyval,
+											step->u.subscript.elemalign);
+					value_set(&step->value, row, container, isnull);
 				}
 				return;
 			}
