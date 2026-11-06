@@ -530,6 +530,42 @@ FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
  2 |   216 | 1899396
 (3 rows)
 
+SELECT count(*) FROM vector_aoco_test HAVING count(*) > 4000;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id < 0 HAVING count(*) > 0;
+ count 
+-------
+(0 rows)
+
+SELECT id % 3 AS g, count(*) FROM vector_aoco_test
+GROUP BY 1 HAVING count(*) > 1500 AND sum(id) > 0 ORDER BY 1;
+ g | count 
+---+-------
+ 0 |  1519
+ 1 |  1518
+ 2 |  1518
+(3 rows)
+
+SELECT id % 4 AS g, count(*) FILTER (WHERE val IS NULL) AS nulls
+FROM vector_aoco_test GROUP BY 1 HAVING count(*) FILTER (WHERE val IS NULL) > 100
+ORDER BY 1;
+ g | nulls 
+---+-------
+ 0 |   162
+ 1 |   162
+ 2 |   163
+ 3 |   163
+(4 rows)
+
+SELECT val, count(*) FROM vector_aoco_small GROUP BY val HAVING count(*) = 0;
+ val | count 
+-----+-------
+(0 rows)
+
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM vector_aoco_small;
                       QUERY PLAN                       
 -------------------------------------------------------

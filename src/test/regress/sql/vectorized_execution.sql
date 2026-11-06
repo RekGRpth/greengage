@@ -164,6 +164,14 @@ SELECT sum(1 / (id - id)) FILTER (WHERE id < 0) FROM vector_aoco_small;
 SELECT id % 3 AS g, count(*) FILTER (WHERE val IS NULL),
        sum(id) FILTER (WHERE id % 2 = 0)
 FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+SELECT count(*) FROM vector_aoco_test HAVING count(*) > 4000;
+SELECT count(*) FROM vector_aoco_small WHERE id < 0 HAVING count(*) > 0;
+SELECT id % 3 AS g, count(*) FROM vector_aoco_test
+GROUP BY 1 HAVING count(*) > 1500 AND sum(id) > 0 ORDER BY 1;
+SELECT id % 4 AS g, count(*) FILTER (WHERE val IS NULL) AS nulls
+FROM vector_aoco_test GROUP BY 1 HAVING count(*) FILTER (WHERE val IS NULL) > 100
+ORDER BY 1;
+SELECT val, count(*) FROM vector_aoco_small GROUP BY val HAVING count(*) = 0;
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM vector_aoco_small;
 SELECT count(DISTINCT id), sum(DISTINCT id % 100),
        count(DISTINCT val), sum(DISTINCT num)

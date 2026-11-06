@@ -97,8 +97,7 @@ VectorAggPlanIsSupported(Agg *agg)
 		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
 		agg->groupingSets != NIL || agg->chain != NIL ||
 		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming ||
-		agg->plan.qual != NIL || agg->plan.initPlan != NIL ||
-		agg->plan.extParam != NULL || agg->plan.allParam != NULL)
+		agg->plan.initPlan != NIL || agg->plan.extParam != NULL || agg->plan.allParam != NULL)
 		return false;
 	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
 		(agg->aggstrategy == AGG_HASHED && agg->numCols == 0))
