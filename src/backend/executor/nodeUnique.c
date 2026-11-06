@@ -191,3 +191,26 @@ ExecReScanUnique(UniqueState *node)
 	if (node->ps.lefttree->chgParam == NULL)
 		ExecReScan(node->ps.lefttree);
 }
+
+bool
+VectorUniquePlanIsSupported(Unique *node)
+{
+	return node->numCols > 0 && node->plan.qual == NIL &&
+		node->plan.initPlan == NIL && node->plan.extParam == NULL &&
+		node->plan.allParam == NULL;
+}
+
+TupleTableSlot *
+VectorUniqueNext(UniqueState *node, TupleTableSlot *slot)
+{
+	TupleTableSlot *resultTupleSlot = node->ps.ps_ResultTupleSlot;
+	ExprContext *econtext = node->ps.ps_ExprContext;
+
+	if (TupIsNull(resultTupleSlot))
+		return ExecCopySlot(resultTupleSlot, slot);
+	econtext->ecxt_innertuple = slot;
+	econtext->ecxt_outertuple = resultTupleSlot;
+	if (!ExecQualAndReset(node->eqfunction, econtext))
+		return ExecCopySlot(resultTupleSlot, slot);
+	return NULL;
+}

@@ -9,6 +9,7 @@ DROP TABLE IF EXISTS vector_aoco_spill_wide;
 DROP TABLE IF EXISTS vector_heap_test;
 DROP TABLE IF EXISTS vector_aoro_test;
 DROP TABLE IF EXISTS vector_limit_test;
+DROP TABLE IF EXISTS vector_unique_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -35,6 +36,11 @@ WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_limit_test;
+CREATE TABLE vector_unique_test (id int4, grp int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (grp);
+INSERT INTO vector_unique_test
+SELECT g, g % 100, 'v' || g FROM generate_series(1, 10000) AS g;
+ANALYZE vector_unique_test;
 CREATE TABLE vector_heap_test (id int4, big int8, val text, num numeric(12,2))
 DISTRIBUTED BY (id);
 CREATE TABLE vector_aoro_test (id int4, big int8, val text, num numeric(12,2))
@@ -548,6 +554,63 @@ ORDER BY val NULLS FIRST, id;
  5000 | v5000
 (10 rows)
 
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT ON (grp) id, val FROM vector_unique_test
+WHERE id <= 20 ORDER BY grp, id;
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.c3, gg_vector_region.id
+   ->  Custom Scan (GGVectorRegion)
+         ->  Unique
+               Group Key: vector_unique_test.grp
+               ->  Sort
+                     Sort Key: vector_unique_test.grp, vector_unique_test.id
+                     ->  Seq Scan on vector_unique_test
+                           Filter: (id <= 20)
+(10 rows)
+
+SELECT DISTINCT ON (grp) id, val FROM vector_unique_test
+WHERE id <= 20 ORDER BY grp, id;
+ id | val 
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+  4 | v4
+  5 | v5
+  6 | v6
+  7 | v7
+  8 | v8
+  9 | v9
+ 10 | v10
+ 11 | v11
+ 12 | v12
+ 13 | v13
+ 14 | v14
+ 15 | v15
+ 16 | v16
+ 17 | v17
+ 18 | v18
+ 19 | v19
+ 20 | v20
+(20 rows)
+
+SELECT DISTINCT ON (grp) id FROM vector_unique_test
+ORDER BY grp, id OFFSET 1 LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+SELECT DISTINCT ON (grp) id FROM vector_unique_test ORDER BY grp, id LIMIT 3;
+ id  
+-----
+ 100
+   1
+   2
+(3 rows)
+
 SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
 FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
 ERROR:  column "t.id" must appear in the GROUP BY clause or be used in an aggregate function
@@ -1015,6 +1078,14 @@ SELECT id FROM vector_aoco_spill_wide ORDER BY pad, id LIMIT 3;
   3
 (3 rows)
 
+SELECT DISTINCT ON (grp) id FROM vector_unique_test ORDER BY grp, id LIMIT 3;
+ id  
+-----
+ 100
+   1
+   2
+(3 rows)
+
 ALTER DATABASE regression RESET statement_mem;
 EXPLAIN (COSTS OFF)
 SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test
@@ -1161,3 +1232,4 @@ DROP TABLE vector_aoco_spill_wide;
 DROP TABLE vector_heap_test;
 DROP TABLE vector_aoro_test;
 DROP TABLE vector_limit_test;
+DROP TABLE vector_unique_test;

@@ -21,6 +21,7 @@
 #include "executor/nodeLimit.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSort.h"
+#include "executor/nodeUnique.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorBatch.h"
@@ -40,6 +41,7 @@ typedef struct VectorRegionState
 	AggState   *agg;
 	SortState  *sort;
 	LimitState *limit;
+	UniqueState *unique;
 	HashJoinState *hj;
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
@@ -150,6 +152,25 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->input = outer;
 	}
+	else if (IsA(child, UniqueState))
+	{
+		PlanState  *outer;
+
+		state->unique = (UniqueState *) child;
+		outer = outerPlanState(state->unique);
+		if (!IsA(outer, SortState))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector unique expects a Sort input")));
+		state->sort = (SortState *) outer;
+		outer = outerPlanState(state->sort);
+		if (IsA(outer, SeqScanState))
+			state->scan = (SeqScanState *) outer;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector unique expects a SeqScan below Sort")));
+	}
 	else if (IsA(child, LimitState))
 	{
 		PlanState  *outer;
@@ -186,7 +207,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate, sort, limit or hash join")));
+				 errmsg("vector region expects a scan, aggregate, sort, limit, unique or hash join")));
 
 	if (state->scan != NULL)
 	{
@@ -430,6 +451,41 @@ VectorRegionNextBatch(VectorRegionState *state)
 	return false;
 }
 
+static void
+VectorRegionSortInput(VectorRegionState *state)
+{
+	ScanDirection dir = state->css.ss.ps.state->es_direction;
+
+	state->css.ss.ps.state->es_direction = ForwardScanDirection;
+	while (VectorRegionNextBatch(state))
+	{
+		int			pos;
+
+		for (pos = 0; pos < state->batch->nselected; pos++)
+		{
+			TupleTableSlot *input = state->sort->ss.ss_ScanTupleSlot;
+			int			row = VectorBatchSelectedRow(state->batch, pos);
+			int			col;
+
+			ExecClearTuple(input);
+			for (col = 0; col < state->output_ncols; col++)
+			{
+				int			attno = state->output_attnos[col];
+
+				Assert(attno >= 0);	/* simple scan targetlist */
+				input->tts_values[col] = state->batch->columns[attno].values[row];
+				input->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+			}
+			input->tts_nvalid = state->output_ncols;
+			ExecStoreVirtualTuple(input);
+			VectorSortPutTuple(state->sort, input);
+		}
+		state->position = state->batch->nselected;
+	}
+	VectorSortFinish(state->sort);
+	state->css.ss.ps.state->es_direction = dir;
+}
+
 static TupleTableSlot *
 VectorRegionExec(CustomScanState *node)
 {
@@ -456,37 +512,25 @@ VectorRegionExec(CustomScanState *node)
 		}
 	}
 
+	if (state->unique != NULL)
+	{
+		VectorRegionSortInput(state);
+		for (;;)
+		{
+			TupleTableSlot *input = VectorSortNext(state->sort);
+			TupleTableSlot *result;
+
+			if (TupIsNull(input))
+				return input;
+			result = VectorUniqueNext(state->unique, input);
+			if (result != NULL)
+				return result;
+		}
+	}
+
 	if (state->sort != NULL)
 	{
-		ScanDirection dir = state->css.ss.ps.state->es_direction;
-
-		state->css.ss.ps.state->es_direction = ForwardScanDirection;
-		while (VectorRegionNextBatch(state))
-		{
-			int			pos;
-
-			for (pos = 0; pos < state->batch->nselected; pos++)
-			{
-				TupleTableSlot *input = state->sort->ss.ss_ScanTupleSlot;
-				int			row = VectorBatchSelectedRow(state->batch, pos);
-
-				ExecClearTuple(input);
-				for (col = 0; col < state->output_ncols; col++)
-				{
-					int			attno = state->output_attnos[col];
-
-					Assert(attno >= 0);	/* simple scan targetlist */
-					input->tts_values[col] = state->batch->columns[attno].values[row];
-					input->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
-				}
-				input->tts_nvalid = state->output_ncols;
-				ExecStoreVirtualTuple(input);
-				VectorSortPutTuple(state->sort, input);
-			}
-			state->position = state->batch->nselected;
-		}
-		VectorSortFinish(state->sort);
-		state->css.ss.ps.state->es_direction = dir;
+		VectorRegionSortInput(state);
 		return VectorSortNext(state->sort);
 	}
 

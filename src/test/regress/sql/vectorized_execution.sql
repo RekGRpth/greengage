@@ -9,6 +9,7 @@ DROP TABLE IF EXISTS vector_aoco_spill_wide;
 DROP TABLE IF EXISTS vector_heap_test;
 DROP TABLE IF EXISTS vector_aoro_test;
 DROP TABLE IF EXISTS vector_limit_test;
+DROP TABLE IF EXISTS vector_unique_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -35,6 +36,11 @@ WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_limit_test;
+CREATE TABLE vector_unique_test (id int4, grp int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (grp);
+INSERT INTO vector_unique_test
+SELECT g, g % 100, 'v' || g FROM generate_series(1, 10000) AS g;
+ANALYZE vector_unique_test;
 CREATE TABLE vector_heap_test (id int4, big int8, val text, num numeric(12,2))
 DISTRIBUTED BY (id);
 CREATE TABLE vector_aoro_test (id int4, big int8, val text, num numeric(12,2))
@@ -159,6 +165,14 @@ EXPLAIN (COSTS OFF) SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 
 SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
 SELECT id, val FROM vector_aoco_test WHERE id % 500 = 0
 ORDER BY val NULLS FIRST, id;
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT ON (grp) id, val FROM vector_unique_test
+WHERE id <= 20 ORDER BY grp, id;
+SELECT DISTINCT ON (grp) id, val FROM vector_unique_test
+WHERE id <= 20 ORDER BY grp, id;
+SELECT DISTINCT ON (grp) id FROM vector_unique_test
+ORDER BY grp, id OFFSET 1 LIMIT 1;
+SELECT DISTINCT ON (grp) id FROM vector_unique_test ORDER BY grp, id LIMIT 3;
 SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
 FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
 SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
@@ -262,6 +276,7 @@ SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER
 SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
 SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;
 SELECT id FROM vector_aoco_spill_wide ORDER BY pad, id LIMIT 3;
+SELECT DISTINCT ON (grp) id FROM vector_unique_test ORDER BY grp, id LIMIT 3;
 ALTER DATABASE regression RESET statement_mem;
 EXPLAIN (COSTS OFF)
 SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test
@@ -300,3 +315,4 @@ DROP TABLE vector_aoco_spill_wide;
 DROP TABLE vector_heap_test;
 DROP TABLE vector_aoro_test;
 DROP TABLE vector_limit_test;
+DROP TABLE vector_unique_test;
