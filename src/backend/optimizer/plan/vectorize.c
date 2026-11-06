@@ -20,6 +20,7 @@
 #include "executor/nodeVectorRegion.h"
 #include "executor/nodeLimit.h"
 #include "executor/nodeMergejoin.h"
+#include "executor/nodeNestloop.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeUnique.h"
 #include "executor/vectorAgg.h"
@@ -153,6 +154,7 @@ plan_node_name(Plan *plan)
 		case T_Limit: return "Limit";
 		case T_Unique: return "Unique";
 		case T_MergeJoin: return "MergeJoin";
+		case T_NestLoop: return "NestLoop";
 		case T_SeqScan: return "SeqScan";
 		default: return "plan node";
 	}
@@ -432,6 +434,13 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash) &&
+		auto_allowed(ctx, (Plan *) node))
+		return (Node *) make_region(ctx, (Plan *) node);
+
+	if (IsA(node, NestLoop) && slice_runs_on_segments(ctx) &&
+		VectorNestLoopPlanIsSupported((NestLoop *) node) &&
+		IsA(outerPlan(node), SeqScan) &&
+		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 

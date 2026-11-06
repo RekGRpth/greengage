@@ -20,6 +20,7 @@
 #include "executor/nodeCustom.h"
 #include "executor/nodeLimit.h"
 #include "executor/nodeMergejoin.h"
+#include "executor/nodeNestloop.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeUnique.h"
@@ -44,6 +45,10 @@ typedef struct VectorRegionState
 	LimitState *limit;
 	UniqueState *unique;
 	MergeJoinState *mergejoin;
+	NestLoopState *nestloop;
+	PlanState  *nl_proxy;
+	PlanState  *nl_outer;
+	TupleTableSlot *nl_slot;
 	HashJoinState *hj;
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
@@ -57,6 +62,13 @@ typedef struct VectorRegionState
 	bool		eof;
 } VectorRegionState;
 
+typedef struct VectorNestLoopProxy
+{
+	PlanState	ps;
+	VectorRegionState *region;
+} VectorNestLoopProxy;
+
+static TupleTableSlot *VectorRegionNestLoopOuter(PlanState *pstate);
 static Node *VectorRegionCreateState(CustomScan *cscan);
 static void VectorRegionBegin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *VectorRegionExec(CustomScanState *node);
@@ -154,6 +166,33 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->input = outer;
 	}
+	else if (IsA(child, NestLoopState))
+	{
+		VectorNestLoopProxy *proxy;
+
+		state->nestloop = (NestLoopState *) child;
+		state->nl_outer = outerPlanState(state->nestloop);
+		if (!IsA(state->nl_outer, SeqScanState))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector nest loop expects a SeqScan outer input")));
+		state->scan = (SeqScanState *) state->nl_outer;
+		if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+		{
+			proxy = MemoryContextAllocZero(estate->es_query_cxt,
+										   sizeof(VectorNestLoopProxy));
+			NodeSetTag(&proxy->ps, T_SeqScanState);
+			proxy->ps.plan = state->nl_outer->plan;
+			proxy->ps.state = estate;
+			proxy->ps.ExecProcNode = VectorRegionNestLoopOuter;
+			proxy->region = state;
+			state->nl_proxy = &proxy->ps;
+			state->nl_slot = ExecInitExtraTupleSlot(estate,
+										 state->nl_outer->ps_ResultTupleDesc,
+										 &TTSOpsVirtual);
+			outerPlanState(state->nestloop) = state->nl_proxy;
+		}
+	}
 	else if (IsA(child, MergeJoinState))
 	{
 		PlanState  *outer;
@@ -228,7 +267,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate, sort, limit, unique, merge join or hash join")));
+				 errmsg("vector region expects a scan, aggregate, sort, limit, unique, merge join, nest loop or hash join")));
 
 	if (state->scan != NULL)
 	{
@@ -241,7 +280,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	if (state->agg == NULL && state->hj == NULL)
 	{
 		state->output_ncols = list_length(scan->plan.targetlist);
-		if (state->mergejoin == NULL &&
+		if (state->mergejoin == NULL && state->nestloop == NULL &&
 			state->output_ncols != node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts)
 			elog(ERROR, "vector region output shape does not match its scan");
 
@@ -509,6 +548,31 @@ VectorRegionSortInput(VectorRegionState *state)
 }
 
 static TupleTableSlot *
+VectorRegionNestLoopOuter(PlanState *pstate)
+{
+	VectorNestLoopProxy *proxy = (VectorNestLoopProxy *) pstate;
+	VectorRegionState *state = proxy->region;
+	TupleTableSlot *slot = state->nl_slot;
+	int			row;
+	int			col;
+
+	ExecClearTuple(slot);
+	if (!VectorRegionNextBatch(state))
+		return slot;
+	row = VectorBatchSelectedRow(state->batch, state->position++);
+	for (col = 0; col < state->output_ncols; col++)
+	{
+		int			attno = state->output_attnos[col];
+
+		Assert(attno >= 0);	/* simple scan targetlist */
+		slot->tts_values[col] = state->batch->columns[attno].values[row];
+		slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+	}
+	slot->tts_nvalid = state->output_ncols;
+	return ExecStoreVirtualTuple(slot);
+}
+
+static TupleTableSlot *
 VectorRegionExec(CustomScanState *node)
 {
 	VectorRegionState *state = (VectorRegionState *) node;
@@ -533,6 +597,9 @@ VectorRegionExec(CustomScanState *node)
 				return result;
 		}
 	}
+
+	if (state->nestloop != NULL)
+		return VectorNestLoopNext(state->nestloop, state->nl_proxy, state->nl_outer);
 
 	if (state->mergejoin != NULL)
 	{
@@ -672,10 +739,14 @@ VectorRegionEnd(CustomScanState *node)
 		pfree(state->output_attnos);
 	if (state->read_attrs != NULL)
 		pfree(state->read_attrs);
+	if (state->nestloop != NULL)
+		outerPlanState(state->nestloop) = state->nl_outer;
 
 	foreach(lc, node->custom_ps)
 		ExecEndNode((PlanState *) lfirst(lc));
 	node->custom_ps = NIL;
+	if (state->nl_proxy != NULL)
+		pfree(state->nl_proxy);
 }
 
 static void
@@ -686,6 +757,8 @@ VectorRegionRescan(CustomScanState *node)
 
 	state->position = 0;
 	state->eof = false;
+	if (state->nestloop != NULL)
+		outerPlanState(state->nestloop) = state->nl_outer;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
 	if (state->vhj != NULL)
@@ -697,6 +770,8 @@ VectorRegionRescan(CustomScanState *node)
 		foreach(lc, node->custom_ps)
 			ExecReScan((PlanState *) lfirst(lc));
 	}
+	if (state->nestloop != NULL)
+		outerPlanState(state->nestloop) = state->nl_proxy;
 }
 
 static void

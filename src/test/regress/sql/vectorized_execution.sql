@@ -302,6 +302,41 @@ RESET enable_nestloop;
 RESET enable_mergejoin;
 RESET optimizer_enable_hashjoin;
 RESET optimizer_enable_nljoin;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_mergejoin = off;
+SET optimizer_enable_nljoin = on;
+EXPLAIN (COSTS OFF)
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+SELECT l.id FROM vector_aoco_small l
+WHERE l.id NOT IN (SELECT r.id FROM vector_join_r r) ORDER BY l.id;
+SELECT a.id, a.val, b.id, b.val
+FROM vector_aoco_small a CROSS JOIN vector_aoco_small b
+WHERE a.id <= 2 AND b.id <= 3 ORDER BY a.id, b.id;
+SELECT h.id, r.id FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id
+ORDER BY h.id LIMIT 5;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_mergejoin;
+RESET optimizer_enable_nljoin;
 ALTER DATABASE regression SET statement_mem = '400kB';
 SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
 SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t1.id = t2.id AND t2.id < 1000;
