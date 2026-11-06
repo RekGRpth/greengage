@@ -19,6 +19,7 @@
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
 #include "executor/nodeLimit.h"
+#include "executor/nodeMergejoin.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeUnique.h"
@@ -42,6 +43,7 @@ typedef struct VectorRegionState
 	SortState  *sort;
 	LimitState *limit;
 	UniqueState *unique;
+	MergeJoinState *mergejoin;
 	HashJoinState *hj;
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
@@ -152,6 +154,25 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->input = outer;
 	}
+	else if (IsA(child, MergeJoinState))
+	{
+		PlanState  *outer;
+
+		state->mergejoin = (MergeJoinState *) child;
+		outer = outerPlanState(state->mergejoin);
+		if (!IsA(outer, SortState))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector merge join expects a Sort outer input")));
+		state->sort = (SortState *) outer;
+		outer = outerPlanState(state->sort);
+		if (IsA(outer, SeqScanState))
+			state->scan = (SeqScanState *) outer;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector merge join expects a SeqScan below Sort")));
+	}
 	else if (IsA(child, UniqueState))
 	{
 		PlanState  *outer;
@@ -207,7 +228,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate, sort, limit, unique or hash join")));
+				 errmsg("vector region expects a scan, aggregate, sort, limit, unique, merge join or hash join")));
 
 	if (state->scan != NULL)
 	{
@@ -220,7 +241,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	if (state->agg == NULL && state->hj == NULL)
 	{
 		state->output_ncols = list_length(scan->plan.targetlist);
-		if (state->output_ncols != node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts)
+		if (state->mergejoin == NULL &&
+			state->output_ncols != node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts)
 			elog(ERROR, "vector region output shape does not match its scan");
 
 		state->output_attnos = MemoryContextAlloc(estate->es_query_cxt,
@@ -510,6 +532,13 @@ VectorRegionExec(CustomScanState *node)
 			if (result != NULL)
 				return result;
 		}
+	}
+
+	if (state->mergejoin != NULL)
+	{
+		VectorRegionSortInput(state);
+		state->sort->ss.ps.ExecProcNode = VectorSortExec;
+		return VectorMergeJoinNext(state->mergejoin);
 	}
 
 	if (state->unique != NULL)

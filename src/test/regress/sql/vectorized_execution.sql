@@ -269,9 +269,53 @@ ORDER BY l.id;
 SELECT l.id FROM vector_join_l l
 WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
 ORDER BY l.id;
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_nljoin = off;
+EXPLAIN (COSTS OFF)
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l RIGHT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l FULL JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+SELECT count(*) FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id;
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_nljoin;
 ALTER DATABASE regression SET statement_mem = '400kB';
 SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
 SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t1.id = t2.id AND t2.id < 1000;
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_nljoin = off;
+SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_nljoin;
 SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
 SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
 SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;

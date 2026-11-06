@@ -1030,6 +1030,112 @@ ORDER BY l.id;
   5
 (3 rows)
 
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_nljoin = off;
+EXPLAIN (COSTS OFF)
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.c1, gg_vector_region.c4
+   ->  Sort
+         Sort Key: gg_vector_region.c1, gg_vector_region.c4
+         ->  Custom Scan (GGVectorRegion)
+               ->  Merge Join
+                     Merge Cond: (l.id = r.id)
+                     ->  Sort
+                           Sort Key: l.id
+                           ->  Seq Scan on vector_join_l l
+                     ->  Sort
+                           Sort Key: r.id
+                           ->  Seq Scan on vector_join_r r
+(14 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+(3 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+(6 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l RIGHT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+    |    |  6 | r6
+    |    |  8 | r8
+(5 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l FULL JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+    |    |  6 | r6
+    |    |  8 | r8
+(8 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  3
+  4
+(2 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  1
+  2
+  5
+(3 rows)
+
+SELECT count(*) FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id;
+ count 
+-------
+ 10000
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_nljoin;
 ALTER DATABASE regression SET statement_mem = '400kB';
 SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
  count 
@@ -1043,6 +1149,22 @@ SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t
   5000
 (1 row)
 
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_nljoin = off;
+SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
+ count 
+-------
+  5000
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_nljoin;
 SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
  grp | count |  sum   
 -----+-------+--------

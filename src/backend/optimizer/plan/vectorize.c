@@ -19,6 +19,7 @@
 #include "cdb/memquota.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/nodeLimit.h"
+#include "executor/nodeMergejoin.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeUnique.h"
 #include "executor/vectorAgg.h"
@@ -151,6 +152,7 @@ plan_node_name(Plan *plan)
 		case T_Sort: return "Sort";
 		case T_Limit: return "Limit";
 		case T_Unique: return "Unique";
+		case T_MergeJoin: return "MergeJoin";
 		case T_SeqScan: return "SeqScan";
 		default: return "plan node";
 	}
@@ -217,7 +219,7 @@ memory_quota_kb(Plan *plan)
 {
 	if (IsA(plan, HashJoin))
 		return innerPlan(plan)->operatorMemKB;
-	if (IsA(plan, Unique))
+	if (IsA(plan, Unique) || IsA(plan, MergeJoin))
 		return outerPlan(plan)->operatorMemKB;
 	return plan->operatorMemKB;
 }
@@ -394,7 +396,8 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.flow = root->flow;
 	cs->scan.plan.operatorMemKB = memory_quota_kb(root);
 	if ((IsA(root, Agg) && ((Agg *) root)->aggstrategy == AGG_HASHED) ||
-		IsA(root, HashJoin) || IsA(root, Sort) || IsA(root, Unique))
+		IsA(root, HashJoin) || IsA(root, Sort) || IsA(root, Unique) ||
+		IsA(root, MergeJoin))
 		cs->flags |= CUSTOMSCAN_GP_MEMORY_INTENSIVE | CUSTOMSCAN_GP_BLOCKING;
 
 	ctx->wrapped++;
@@ -429,6 +432,15 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash) &&
+		auto_allowed(ctx, (Plan *) node))
+		return (Node *) make_region(ctx, (Plan *) node);
+
+	if (IsA(node, MergeJoin) && slice_runs_on_segments(ctx) &&
+		VectorMergeJoinPlanIsSupported((MergeJoin *) node) &&
+		IsA(outerPlan(node), Sort) &&
+		VectorSortPlanIsSupported((Sort *) outerPlan(node)) &&
+		IsA(outerPlan(outerPlan(node)), SeqScan) &&
+		is_simple_scan(ctx, (SeqScan *) outerPlan(outerPlan(node))) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 

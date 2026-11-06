@@ -679,3 +679,9 @@ VectorSortNext(SortState *node)
 		ExecEagerFreeSort(node);
 	return slot;
 }
+
+TupleTableSlot *
+VectorSortExec(PlanState *pstate)
+{
+	return VectorSortNext(castNode(SortState, pstate));
+}

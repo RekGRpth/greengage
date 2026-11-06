@@ -35,5 +35,6 @@ extern bool VectorSortPlanIsSupported(Sort *sort);
 extern void VectorSortPutTuple(SortState *node, TupleTableSlot *slot);
 extern void VectorSortFinish(SortState *node);
 extern TupleTableSlot *VectorSortNext(SortState *node);
+extern TupleTableSlot *VectorSortExec(PlanState *pstate);
 
 #endif							/* NODESORT_H */
