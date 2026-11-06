@@ -18,6 +18,7 @@
 #include "cdb/cdbaocsam.h"
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
+#include "executor/nodeLimit.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeVectorRegion.h"
@@ -38,6 +39,7 @@ typedef struct VectorRegionState
 	PlanState  *input;
 	AggState   *agg;
 	SortState  *sort;
+	LimitState *limit;
 	HashJoinState *hj;
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
@@ -148,6 +150,19 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->input = outer;
 	}
+	else if (IsA(child, LimitState))
+	{
+		PlanState  *outer;
+
+		state->limit = (LimitState *) child;
+		outer = outerPlanState(state->limit);
+		if (IsA(outer, SeqScanState))
+			state->scan = (SeqScanState *) outer;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector limit expects a SeqScan input")));
+	}
 	else if (IsA(child, SortState))
 	{
 		PlanState  *outer;
@@ -171,7 +186,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate, sort or hash join")));
+				 errmsg("vector region expects a scan, aggregate, sort, limit or hash join")));
 
 	if (state->scan != NULL)
 	{
@@ -504,36 +519,57 @@ VectorRegionExec(CustomScanState *node)
 		return VectorAggNext(state->vagg);
 	}
 
-	ExecClearTuple(slot);
-	if (!VectorRegionNextBatch(state))
+	if (state->limit != NULL && VectorLimitStart(state->limit))
+	{
+		ExecClearTuple(slot);
 		return slot;
-
-	/* evaluate projection steps once per batch, after the qual filter */
-	if (state->proj != NULL)
-	{
-		for (col = 0; col < state->output_ncols; col++)
-			if (state->proj[col] != NULL)
-				VectorExprEval(state->batch, state->proj[col]);
 	}
 
-	row = VectorBatchSelectedRow(state->batch, state->position++);
-	for (col = 0; col < state->output_ncols; col++)
+	for (;;)
 	{
-		int			attno = state->output_attnos[col];
+		ExecClearTuple(slot);
+		if (!VectorRegionNextBatch(state))
+			return slot;
 
-		if (attno >= 0)
+		/* evaluate projection steps once per batch, after the qual filter */
+		if (state->proj != NULL)
 		{
-			slot->tts_values[col] = state->batch->columns[attno].values[row];
-			slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+			for (col = 0; col < state->output_ncols; col++)
+				if (state->proj[col] != NULL)
+					VectorExprEval(state->batch, state->proj[col]);
 		}
-		else
+
+		while (state->position < state->batch->nselected)
 		{
-			slot->tts_values[col] = VectorExprGetValue(state->proj[col], row,
-													   &slot->tts_isnull[col]);
+			row = VectorBatchSelectedRow(state->batch, state->position++);
+			if (state->limit != NULL)
+			{
+				VectorLimitResult action = VectorLimitNext(state->limit);
+
+				if (action == VECTOR_LIMIT_EOF)
+					return slot;
+				if (action == VECTOR_LIMIT_SKIP)
+					continue;
+			}
+			for (col = 0; col < state->output_ncols; col++)
+			{
+				int			attno = state->output_attnos[col];
+
+				if (attno >= 0)
+				{
+					slot->tts_values[col] = state->batch->columns[attno].values[row];
+					slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+				}
+				else
+				{
+					slot->tts_values[col] = VectorExprGetValue(state->proj[col], row,
+															   &slot->tts_isnull[col]);
+				}
+			}
+			slot->tts_nvalid = state->output_ncols;
+			return ExecStoreVirtualTuple(slot);
 		}
 	}
-	slot->tts_nvalid = state->output_ncols;
-	return ExecStoreVirtualTuple(slot);
 }
 
 static void

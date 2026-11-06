@@ -8,6 +8,7 @@ DROP TABLE IF EXISTS vector_aoco_spill;
 DROP TABLE IF EXISTS vector_aoco_spill_wide;
 DROP TABLE IF EXISTS vector_heap_test;
 DROP TABLE IF EXISTS vector_aoro_test;
+DROP TABLE IF EXISTS vector_limit_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -29,6 +30,11 @@ DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_small
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_aoco_small;
+CREATE TABLE vector_limit_test (id int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
+INSERT INTO vector_limit_test
+SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
+ANALYZE vector_limit_test;
 CREATE TABLE vector_heap_test (id int4, big int8, val text, num numeric(12,2))
 DISTRIBUTED BY (id);
 CREATE TABLE vector_aoro_test (id int4, big int8, val text, num numeric(12,2))
@@ -77,6 +83,67 @@ FROM vector_aoco_test ORDER BY id LIMIT 3;
                            ->  Seq Scan on vector_aoco_test
 (9 rows)
 
+EXPLAIN (COSTS OFF) SELECT id, val FROM vector_limit_test LIMIT 3;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Limit
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Limit
+                     ->  Seq Scan on vector_limit_test
+(6 rows)
+
+SELECT id, val FROM vector_limit_test LIMIT 3;
+ id | val 
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+(3 rows)
+
+SELECT id FROM vector_limit_test LIMIT 0;
+ id 
+----
+(0 rows)
+
+SELECT id FROM vector_limit_test OFFSET 8;
+ id 
+----
+  9
+ 10
+(2 rows)
+
+SELECT id FROM vector_limit_test LIMIT 3 OFFSET 8;
+ id 
+----
+  9
+ 10
+(2 rows)
+
+SELECT id FROM vector_limit_test LIMIT NULL OFFSET NULL;
+ id 
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+SELECT id FROM vector_limit_test LIMIT 3 OFFSET 100;
+ id 
+----
+(0 rows)
+
+SELECT id FROM vector_limit_test LIMIT -1;
+ERROR:  LIMIT must not be negative
+SELECT id FROM vector_limit_test OFFSET -1;
+ERROR:  OFFSET must not be negative
 SELECT sum(big), sum(id), min(num), max(num), min(later), max(later)
 FROM vector_aoco_test;
     sum    |   sum    | min  |  max  | min | max 
@@ -1093,3 +1160,4 @@ DROP TABLE vector_aoco_spill;
 DROP TABLE vector_aoco_spill_wide;
 DROP TABLE vector_heap_test;
 DROP TABLE vector_aoro_test;
+DROP TABLE vector_limit_test;

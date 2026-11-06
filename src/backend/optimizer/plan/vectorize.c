@@ -18,6 +18,7 @@
 #include "cdb/cdbvars.h"
 #include "cdb/memquota.h"
 #include "executor/nodeVectorRegion.h"
+#include "executor/nodeLimit.h"
 #include "executor/nodeSort.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
@@ -147,6 +148,7 @@ plan_node_name(Plan *plan)
 		case T_Agg: return "Agg";
 		case T_HashJoin: return "HashJoin";
 		case T_Sort: return "Sort";
+		case T_Limit: return "Limit";
 		case T_SeqScan: return "SeqScan";
 		default: return "plan node";
 	}
@@ -423,6 +425,13 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash) &&
+		auto_allowed(ctx, (Plan *) node))
+		return (Node *) make_region(ctx, (Plan *) node);
+
+	if (IsA(node, Limit) && slice_runs_on_segments(ctx) &&
+		VectorLimitPlanIsSupported((Limit *) node) &&
+		IsA(outerPlan(node), SeqScan) &&
+		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 

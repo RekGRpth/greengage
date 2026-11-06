@@ -8,6 +8,7 @@ DROP TABLE IF EXISTS vector_aoco_spill;
 DROP TABLE IF EXISTS vector_aoco_spill_wide;
 DROP TABLE IF EXISTS vector_heap_test;
 DROP TABLE IF EXISTS vector_aoro_test;
+DROP TABLE IF EXISTS vector_limit_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -29,6 +30,11 @@ DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_small
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_aoco_small;
+CREATE TABLE vector_limit_test (id int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
+INSERT INTO vector_limit_test
+SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
+ANALYZE vector_limit_test;
 CREATE TABLE vector_heap_test (id int4, big int8, val text, num numeric(12,2))
 DISTRIBUTED BY (id);
 CREATE TABLE vector_aoro_test (id int4, big int8, val text, num numeric(12,2))
@@ -65,6 +71,15 @@ SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
 FROM vector_aoco_test ORDER BY id LIMIT 3;
+EXPLAIN (COSTS OFF) SELECT id, val FROM vector_limit_test LIMIT 3;
+SELECT id, val FROM vector_limit_test LIMIT 3;
+SELECT id FROM vector_limit_test LIMIT 0;
+SELECT id FROM vector_limit_test OFFSET 8;
+SELECT id FROM vector_limit_test LIMIT 3 OFFSET 8;
+SELECT id FROM vector_limit_test LIMIT NULL OFFSET NULL;
+SELECT id FROM vector_limit_test LIMIT 3 OFFSET 100;
+SELECT id FROM vector_limit_test LIMIT -1;
+SELECT id FROM vector_limit_test OFFSET -1;
 SELECT sum(big), sum(id), min(num), max(num), min(later), max(later)
 FROM vector_aoco_test;
 SELECT id, big, val, num, later
@@ -284,3 +299,4 @@ DROP TABLE vector_aoco_spill;
 DROP TABLE vector_aoco_spill_wide;
 DROP TABLE vector_heap_test;
 DROP TABLE vector_aoro_test;
+DROP TABLE vector_limit_test;
