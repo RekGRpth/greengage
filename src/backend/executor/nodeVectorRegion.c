@@ -19,6 +19,7 @@
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
 #include "executor/nodeSeqscan.h"
+#include "executor/nodeSort.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorBatch.h"
@@ -36,6 +37,7 @@ typedef struct VectorRegionState
 	SeqScanState *scan;
 	PlanState  *input;
 	AggState   *agg;
+	SortState  *sort;
 	HashJoinState *hj;
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
@@ -54,6 +56,8 @@ static void VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 static TupleTableSlot *VectorRegionExec(CustomScanState *node);
 static void VectorRegionEnd(CustomScanState *node);
 static void VectorRegionRescan(CustomScanState *node);
+static void VectorRegionMarkPos(CustomScanState *node);
+static void VectorRegionRestrPos(CustomScanState *node);
 
 static const CustomScanMethods vector_region_scan_methods = {
 	VECTOR_REGION_NAME,
@@ -66,8 +70,8 @@ static const CustomExecMethods vector_region_exec_methods = {
 	VectorRegionExec,
 	VectorRegionEnd,
 	VectorRegionRescan,
-	NULL,						/* MarkPos */
-	NULL,						/* RestrPos */
+	VectorRegionMarkPos,
+	VectorRegionRestrPos,
 	NULL,						/* EstimateDSM */
 	NULL,						/* InitializeDSM */
 	NULL,						/* ReInitializeDSM */
@@ -118,8 +122,12 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	foreach(lc, cscan->custom_plans)
 	{
 		Plan	   *plan = (Plan *) lfirst(lc);
-		PlanState  *childstate = ExecInitNode(plan, estate,
-										 eflags & ~(EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK));
+		int			child_eflags = eflags & ~EXEC_FLAG_BACKWARD;
+		PlanState  *childstate;
+
+		if (!IsA(plan, Sort))
+			child_eflags &= ~EXEC_FLAG_MARK;
+		childstate = ExecInitNode(plan, estate, child_eflags);
 
 		node->custom_ps = lappend(node->custom_ps, childstate);
 	}
@@ -140,6 +148,19 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->input = outer;
 	}
+	else if (IsA(child, SortState))
+	{
+		PlanState  *outer;
+
+		state->sort = (SortState *) child;
+		outer = outerPlanState(state->sort);
+		if (IsA(outer, SeqScanState))
+			state->scan = (SeqScanState *) outer;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector sort expects a SeqScan input")));
+	}
 	else if (IsA(child, HashJoinState))
 	{
 		state->hj = (HashJoinState *) child;
@@ -150,7 +171,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate or hash join")));
+				 errmsg("vector region expects a scan, aggregate, sort or hash join")));
 
 	if (state->scan != NULL)
 	{
@@ -420,6 +441,40 @@ VectorRegionExec(CustomScanState *node)
 		}
 	}
 
+	if (state->sort != NULL)
+	{
+		ScanDirection dir = state->css.ss.ps.state->es_direction;
+
+		state->css.ss.ps.state->es_direction = ForwardScanDirection;
+		while (VectorRegionNextBatch(state))
+		{
+			int			pos;
+
+			for (pos = 0; pos < state->batch->nselected; pos++)
+			{
+				TupleTableSlot *input = state->sort->ss.ss_ScanTupleSlot;
+				int			row = VectorBatchSelectedRow(state->batch, pos);
+
+				ExecClearTuple(input);
+				for (col = 0; col < state->output_ncols; col++)
+				{
+					int			attno = state->output_attnos[col];
+
+					Assert(attno >= 0);	/* simple scan targetlist */
+					input->tts_values[col] = state->batch->columns[attno].values[row];
+					input->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+				}
+				input->tts_nvalid = state->output_ncols;
+				ExecStoreVirtualTuple(input);
+				VectorSortPutTuple(state->sort, input);
+			}
+			state->position = state->batch->nselected;
+		}
+		VectorSortFinish(state->sort);
+		state->css.ss.ps.state->es_direction = dir;
+		return VectorSortNext(state->sort);
+	}
+
 	if (state->agg != NULL)
 	{
 		AggState   *agg = state->agg;
@@ -533,4 +588,24 @@ VectorRegionRescan(CustomScanState *node)
 		foreach(lc, node->custom_ps)
 			ExecReScan((PlanState *) lfirst(lc));
 	}
+}
+
+static void
+VectorRegionMarkPos(CustomScanState *node)
+{
+	VectorRegionState *state = (VectorRegionState *) node;
+
+	if (state->sort == NULL)
+		elog(ERROR, "vector region supports MarkPos only for Sort");
+	ExecSortMarkPos(state->sort);
+}
+
+static void
+VectorRegionRestrPos(CustomScanState *node)
+{
+	VectorRegionState *state = (VectorRegionState *) node;
+
+	if (state->sort == NULL)
+		elog(ERROR, "vector region supports RestrPos only for Sort");
+	ExecSortRestrPos(state->sort);
 }

@@ -71,9 +71,9 @@ FROM vector_aoco_test ORDER BY id LIMIT 3;
    ->  Gather Motion 3:1  (slice1; segments: 3)
          Merge Key: gg_vector_region.c1
          ->  Limit
-               ->  Sort
-                     Sort Key: gg_vector_region.c1
-                     ->  Custom Scan (GGVectorRegion)
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Sort
+                           Sort Key: vector_aoco_test.id
                            ->  Seq Scan on vector_aoco_test
 (9 rows)
 
@@ -441,6 +441,45 @@ SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
  5009
  5008
 (3 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: gg_vector_region.id
+         ->  Limit
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Sort
+                           Sort Key: vector_aoco_test.id DESC
+                           ->  Seq Scan on vector_aoco_test
+(9 rows)
+
+SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
+  id  |  big  
+------+-------
+ 5010 | 50100
+ 5009 | 50090
+ 5008 | 50080
+ 5007 | 50070
+ 5006 | 50060
+(5 rows)
+
+SELECT id, val FROM vector_aoco_test WHERE id % 500 = 0
+ORDER BY val NULLS FIRST, id;
+  id  |  val  
+------+-------
+ 3500 | 
+ 1000 | v1000
+ 1500 | v1500
+ 2000 | v2000
+ 2500 | v2500
+ 3000 | v3000
+ 4000 | v4000
+ 4500 | v4500
+  500 | v500
+ 5000 | v5000
+(10 rows)
 
 SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
 FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
@@ -825,6 +864,14 @@ SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;
 -------+------
  50000 | 4950
 (1 row)
+
+SELECT id FROM vector_aoco_spill_wide ORDER BY pad, id LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
 
 ALTER DATABASE regression RESET statement_mem;
 EXPLAIN (COSTS OFF)

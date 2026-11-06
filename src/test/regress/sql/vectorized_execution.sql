@@ -140,6 +140,10 @@ SELECT id, CASE id % 2 WHEN 0 THEN 'even' ELSE 'odd' END AS parity
 FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
 SELECT id, coalesce(val, 'NONE') FROM vector_aoco_test WHERE id % 500 = 0 ORDER BY id;
 SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
+EXPLAIN (COSTS OFF) SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
+SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
+SELECT id, val FROM vector_aoco_test WHERE id % 500 = 0
+ORDER BY val NULLS FIRST, id;
 SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
 FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
 SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
@@ -227,6 +231,7 @@ SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t
 SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
 SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
 SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;
+SELECT id FROM vector_aoco_spill_wide ORDER BY pad, id LIMIT 3;
 ALTER DATABASE regression RESET statement_mem;
 EXPLAIN (COSTS OFF)
 SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test

@@ -18,6 +18,7 @@
 #include "cdb/cdbvars.h"
 #include "cdb/memquota.h"
 #include "executor/nodeVectorRegion.h"
+#include "executor/nodeSort.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "executor/vectorHashJoin.h"
@@ -145,6 +146,7 @@ plan_node_name(Plan *plan)
 	{
 		case T_Agg: return "Agg";
 		case T_HashJoin: return "HashJoin";
+		case T_Sort: return "Sort";
 		case T_SeqScan: return "SeqScan";
 		default: return "plan node";
 	}
@@ -386,7 +388,7 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.flow = root->flow;
 	cs->scan.plan.operatorMemKB = memory_quota_kb(root);
 	if ((IsA(root, Agg) && ((Agg *) root)->aggstrategy == AGG_HASHED) ||
-		IsA(root, HashJoin))
+		IsA(root, HashJoin) || IsA(root, Sort))
 		cs->flags |= CUSTOMSCAN_GP_MEMORY_INTENSIVE | CUSTOMSCAN_GP_BLOCKING;
 
 	ctx->wrapped++;
@@ -421,6 +423,12 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash) &&
+		auto_allowed(ctx, (Plan *) node))
+		return (Node *) make_region(ctx, (Plan *) node);
+
+	if (IsA(node, Sort) && slice_runs_on_segments(ctx) &&
+		VectorSortPlanIsSupported((Sort *) node) &&
+		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
