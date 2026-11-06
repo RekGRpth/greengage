@@ -19,6 +19,7 @@
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
 #include "executor/nodeLimit.h"
+#include "executor/nodeMaterial.h"
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeNestloop.h"
 #include "executor/nodeSeqscan.h"
@@ -45,6 +46,10 @@ typedef struct VectorRegionState
 	LimitState *limit;
 	UniqueState *unique;
 	MergeJoinState *mergejoin;
+	MaterialState *material;
+	PlanState  *mat_proxy;
+	PlanState  *mat_outer;
+	TupleTableSlot *mat_slot;
 	NestLoopState *nestloop;
 	PlanState  *nl_proxy;
 	PlanState  *nl_outer;
@@ -69,6 +74,7 @@ typedef struct VectorNestLoopProxy
 } VectorNestLoopProxy;
 
 static TupleTableSlot *VectorRegionNestLoopOuter(PlanState *pstate);
+static TupleTableSlot *VectorRegionMaterialOuter(PlanState *pstate);
 static Node *VectorRegionCreateState(CustomScan *cscan);
 static void VectorRegionBegin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *VectorRegionExec(CustomScanState *node);
@@ -143,7 +149,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		int			child_eflags = eflags & ~EXEC_FLAG_BACKWARD;
 		PlanState  *childstate;
 
-		if (!IsA(plan, Sort))
+		if (!IsA(plan, Sort) && !IsA(plan, Material))
 			child_eflags &= ~EXEC_FLAG_MARK;
 		childstate = ExecInitNode(plan, estate, child_eflags);
 
@@ -165,6 +171,33 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			state->scan = (SeqScanState *) outer;
 		else
 			state->input = outer;
+	}
+	else if (IsA(child, MaterialState))
+	{
+		VectorNestLoopProxy *proxy;
+
+		state->material = (MaterialState *) child;
+		state->mat_outer = outerPlanState(state->material);
+		if (!IsA(state->mat_outer, SeqScanState))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector material expects a SeqScan input")));
+		state->scan = (SeqScanState *) state->mat_outer;
+		if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+		{
+			proxy = MemoryContextAllocZero(estate->es_query_cxt,
+										   sizeof(VectorNestLoopProxy));
+			NodeSetTag(&proxy->ps, T_SeqScanState);
+			proxy->ps.plan = state->mat_outer->plan;
+			proxy->ps.state = estate;
+			proxy->ps.ExecProcNode = VectorRegionMaterialOuter;
+			proxy->region = state;
+			state->mat_proxy = &proxy->ps;
+			state->mat_slot = ExecInitExtraTupleSlot(estate,
+										  state->mat_outer->ps_ResultTupleDesc,
+										  &TTSOpsVirtual);
+			outerPlanState(state->material) = state->mat_proxy;
+		}
 	}
 	else if (IsA(child, NestLoopState))
 	{
@@ -267,7 +300,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate, sort, limit, unique, merge join, nest loop or hash join")));
+				 errmsg("vector region expects a scan, aggregate, sort, limit, unique, merge join, nest loop, material or hash join")));
 
 	if (state->scan != NULL)
 	{
@@ -548,6 +581,31 @@ VectorRegionSortInput(VectorRegionState *state)
 }
 
 static TupleTableSlot *
+VectorRegionMaterialOuter(PlanState *pstate)
+{
+	VectorNestLoopProxy *proxy = (VectorNestLoopProxy *) pstate;
+	VectorRegionState *state = proxy->region;
+	TupleTableSlot *slot = state->mat_slot;
+	int			row;
+	int			col;
+
+	ExecClearTuple(slot);
+	if (!VectorRegionNextBatch(state))
+		return slot;
+	row = VectorBatchSelectedRow(state->batch, state->position++);
+	for (col = 0; col < state->output_ncols; col++)
+	{
+		int			attno = state->output_attnos[col];
+
+		Assert(attno >= 0);	/* simple scan targetlist */
+		slot->tts_values[col] = state->batch->columns[attno].values[row];
+		slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+	}
+	slot->tts_nvalid = state->output_ncols;
+	return ExecStoreVirtualTuple(slot);
+}
+
+static TupleTableSlot *
 VectorRegionNestLoopOuter(PlanState *pstate)
 {
 	VectorNestLoopProxy *proxy = (VectorNestLoopProxy *) pstate;
@@ -597,6 +655,9 @@ VectorRegionExec(CustomScanState *node)
 				return result;
 		}
 	}
+
+	if (state->material != NULL)
+		return VectorMaterialNext(state->material, state->mat_proxy, state->mat_outer);
 
 	if (state->nestloop != NULL)
 		return VectorNestLoopNext(state->nestloop, state->nl_proxy, state->nl_outer);
@@ -741,12 +802,16 @@ VectorRegionEnd(CustomScanState *node)
 		pfree(state->read_attrs);
 	if (state->nestloop != NULL)
 		outerPlanState(state->nestloop) = state->nl_outer;
+	if (state->material != NULL)
+		outerPlanState(state->material) = state->mat_outer;
 
 	foreach(lc, node->custom_ps)
 		ExecEndNode((PlanState *) lfirst(lc));
 	node->custom_ps = NIL;
 	if (state->nl_proxy != NULL)
 		pfree(state->nl_proxy);
+	if (state->mat_proxy != NULL)
+		pfree(state->mat_proxy);
 }
 
 static void
@@ -759,6 +824,8 @@ VectorRegionRescan(CustomScanState *node)
 	state->eof = false;
 	if (state->nestloop != NULL)
 		outerPlanState(state->nestloop) = state->nl_outer;
+	if (state->material != NULL)
+		outerPlanState(state->material) = state->mat_outer;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
 	if (state->vhj != NULL)
@@ -772,6 +839,8 @@ VectorRegionRescan(CustomScanState *node)
 	}
 	if (state->nestloop != NULL)
 		outerPlanState(state->nestloop) = state->nl_proxy;
+	if (state->material != NULL)
+		outerPlanState(state->material) = state->mat_proxy;
 }
 
 static void
@@ -779,9 +848,12 @@ VectorRegionMarkPos(CustomScanState *node)
 {
 	VectorRegionState *state = (VectorRegionState *) node;
 
-	if (state->sort == NULL)
-		elog(ERROR, "vector region supports MarkPos only for Sort");
-	ExecSortMarkPos(state->sort);
+	if (state->sort != NULL)
+		ExecSortMarkPos(state->sort);
+	else if (state->material != NULL)
+		ExecMaterialMarkPos(state->material);
+	else
+		elog(ERROR, "vector region supports MarkPos only for Sort or Material");
 }
 
 static void
@@ -789,7 +861,10 @@ VectorRegionRestrPos(CustomScanState *node)
 {
 	VectorRegionState *state = (VectorRegionState *) node;
 
-	if (state->sort == NULL)
-		elog(ERROR, "vector region supports RestrPos only for Sort");
-	ExecSortRestrPos(state->sort);
+	if (state->sort != NULL)
+		ExecSortRestrPos(state->sort);
+	else if (state->material != NULL)
+		ExecMaterialRestrPos(state->material);
+	else
+		elog(ERROR, "vector region supports RestrPos only for Sort or Material");
 }

@@ -1146,18 +1146,19 @@ EXPLAIN (COSTS OFF)
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;
-                        QUERY PLAN                         
------------------------------------------------------------
+                          QUERY PLAN                           
+---------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: gg_vector_region.id, gg_vector_region.r
+   Merge Key: gg_vector_region_1.id, gg_vector_region_1.r
    ->  Sort
-         Sort Key: gg_vector_region.id, gg_vector_region.r
+         Sort Key: gg_vector_region_1.id, gg_vector_region_1.r
          ->  Custom Scan (GGVectorRegion)
                ->  Nested Loop
-                     Join Filter: (l.id = r.id)
+                     Join Filter: (l.id = gg_vector_region.id)
                      ->  Seq Scan on vector_join_l l
-                     ->  Seq Scan on vector_join_r r
-(10 rows)
+                     ->  Custom Scan (GGVectorRegion)
+                           ->  Seq Scan on vector_join_r r
+(11 rows)
 
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
@@ -1220,11 +1221,9 @@ WHERE a.id <= 2 AND b.id <= 3 ORDER BY a.id, b.id;
 ----+-----+----+-----
   1 | v1  |  1 | v1
   1 | v1  |  2 | v2
-  1 | v1  |  3 | v3
   2 | v2  |  1 | v1
   2 | v2  |  2 | v2
-  2 | v2  |  3 | v3
-(6 rows)
+(4 rows)
 
 SELECT h.id, r.id FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id
 ORDER BY h.id LIMIT 5;

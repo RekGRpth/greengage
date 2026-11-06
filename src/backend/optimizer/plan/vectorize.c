@@ -19,6 +19,7 @@
 #include "cdb/memquota.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/nodeLimit.h"
+#include "executor/nodeMaterial.h"
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeNestloop.h"
 #include "executor/nodeSort.h"
@@ -155,6 +156,7 @@ plan_node_name(Plan *plan)
 		case T_Unique: return "Unique";
 		case T_MergeJoin: return "MergeJoin";
 		case T_NestLoop: return "NestLoop";
+		case T_Material: return "Material";
 		case T_SeqScan: return "SeqScan";
 		default: return "plan node";
 	}
@@ -399,7 +401,7 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.operatorMemKB = memory_quota_kb(root);
 	if ((IsA(root, Agg) && ((Agg *) root)->aggstrategy == AGG_HASHED) ||
 		IsA(root, HashJoin) || IsA(root, Sort) || IsA(root, Unique) ||
-		IsA(root, MergeJoin))
+		IsA(root, MergeJoin) || IsA(root, Material))
 		cs->flags |= CUSTOMSCAN_GP_MEMORY_INTENSIVE | CUSTOMSCAN_GP_BLOCKING;
 
 	ctx->wrapped++;
@@ -437,12 +439,23 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
-	if (IsA(node, NestLoop) && slice_runs_on_segments(ctx) &&
-		VectorNestLoopPlanIsSupported((NestLoop *) node) &&
+	if (IsA(node, Material) && slice_runs_on_segments(ctx) &&
+		VectorMaterialPlanIsSupported((Material *) node) &&
 		IsA(outerPlan(node), SeqScan) &&
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
+
+	if (IsA(node, NestLoop) && slice_runs_on_segments(ctx) &&
+		VectorNestLoopPlanIsSupported((NestLoop *) node) &&
+		IsA(outerPlan(node), SeqScan) &&
+		is_simple_scan(ctx, (SeqScan *) outerPlan(node)))
+	{
+		innerPlan(node) = (Plan *) vectorize_mutator((Node *) innerPlan(node), ctx);
+		if (auto_allowed(ctx, (Plan *) node))
+			return (Node *) make_region(ctx, (Plan *) node);
+		return node;
+	}
 
 	if (IsA(node, MergeJoin) && slice_runs_on_segments(ctx) &&
 		VectorMergeJoinPlanIsSupported((MergeJoin *) node) &&

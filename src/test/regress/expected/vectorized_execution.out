@@ -1125,19 +1125,20 @@ EXPLAIN (COSTS OFF)
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;
-                         QUERY PLAN                         
-------------------------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: gg_vector_region.c1, gg_vector_region.c4
+   Merge Key: gg_vector_region_1.c1, gg_vector_region_1.c4
    ->  Sort
-         Sort Key: gg_vector_region.c1, gg_vector_region.c4
+         Sort Key: gg_vector_region_1.c1, gg_vector_region_1.c4
          ->  Custom Scan (GGVectorRegion)
                ->  Nested Loop
-                     Join Filter: (l.id = r.id)
+                     Join Filter: (l.id = gg_vector_region.c1)
                      ->  Seq Scan on vector_join_l l
-                     ->  Materialize
-                           ->  Seq Scan on vector_join_r r
-(11 rows)
+                     ->  Custom Scan (GGVectorRegion)
+                           ->  Materialize
+                                 ->  Seq Scan on vector_join_r r
+(12 rows)
 
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
