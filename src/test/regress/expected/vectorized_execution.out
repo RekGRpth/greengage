@@ -596,6 +596,59 @@ SELECT count(DISTINCT id) FROM vector_aoco_small WHERE id < 0;
      0
 (1 row)
 
+EXPLAIN (COSTS OFF)
+SELECT string_agg(val, ',' ORDER BY id DESC) FROM vector_aoco_small;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_aoco_small
+(5 rows)
+
+SELECT string_agg(val, ',' ORDER BY id) FROM vector_aoco_small;
+           string_agg           
+--------------------------------
+ v1,v2,v3,v4,v5,v6,v7,v8,v9,v10
+(1 row)
+
+SELECT string_agg(val, ',' ORDER BY id DESC) FROM vector_aoco_small;
+           string_agg           
+--------------------------------
+ v10,v9,v8,v7,v6,v5,v4,v3,v2,v1
+(1 row)
+
+SELECT array_agg(id ORDER BY id DESC) FROM vector_aoco_small WHERE id <= 5;
+  array_agg  
+-------------
+ {5,4,3,2,1}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_small;
+  array_agg   
+--------------
+ {2,4,6,8,10}
+(1 row)
+
+SELECT array_agg(DISTINCT id % 3 ORDER BY id % 3) FROM vector_aoco_small;
+ array_agg 
+-----------
+ {0,1,2}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) FROM vector_aoco_small WHERE id < 0;
+ array_agg 
+-----------
+ 
+(1 row)
+
+SELECT string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
+FROM vector_aoco_test WHERE id < 10;
+               string_agg                
+-----------------------------------------
+ v9:9|v8:8|v6:6|v5:5|v4:4|v3:3|v2:2|v1:1
+(1 row)
+
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

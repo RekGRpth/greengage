@@ -178,6 +178,16 @@ SELECT count(DISTINCT id), sum(DISTINCT id % 100),
 FROM vector_aoco_test;
 SELECT count(DISTINCT id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_test;
 SELECT count(DISTINCT id) FROM vector_aoco_small WHERE id < 0;
+EXPLAIN (COSTS OFF)
+SELECT string_agg(val, ',' ORDER BY id DESC) FROM vector_aoco_small;
+SELECT string_agg(val, ',' ORDER BY id) FROM vector_aoco_small;
+SELECT string_agg(val, ',' ORDER BY id DESC) FROM vector_aoco_small;
+SELECT array_agg(id ORDER BY id DESC) FROM vector_aoco_small WHERE id <= 5;
+SELECT array_agg(id ORDER BY id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_small;
+SELECT array_agg(DISTINCT id % 3 ORDER BY id % 3) FROM vector_aoco_small;
+SELECT array_agg(id ORDER BY id) FROM vector_aoco_small WHERE id < 0;
+SELECT string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
+FROM vector_aoco_test WHERE id < 10;
 SELECT l.id, l.l, r.id, r.r
 FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
 ORDER BY l.id, r.r;

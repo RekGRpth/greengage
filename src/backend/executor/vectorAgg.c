@@ -132,10 +132,10 @@ VectorAggPlanIsSupported(Agg *agg)
 
 			if (aggref->aggkind != AGGKIND_NORMAL || aggref->agglevelsup != 0 ||
 				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
-				aggref->aggorder != NIL || aggref->aggdirectargs != NIL ||
-				aggref->aggtype == INTERNALOID ||
-				(aggref->aggdistinct != NIL &&
-				 (agg->aggstrategy != AGG_PLAIN || list_length(aggref->args) != 1)))
+				aggref->aggdirectargs != NIL || aggref->aggtype == INTERNALOID ||
+				((aggref->aggorder != NIL || aggref->aggdistinct != NIL) &&
+				 agg->aggstrategy != AGG_PLAIN) ||
+				(aggref->aggdistinct != NIL && list_length(aggref->args) != 1))
 				goto done;
 			if (aggref->aggfilter != NULL &&
 				!VectorExprIsSupported(aggref->aggfilter, &vars))
@@ -404,11 +404,25 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 									   &state->nulls[transno][argno]);
 			if (pertrans->numSortCols > 0)
 			{
-				/* Scalar single-input DISTINCT uses nodeAgg's tuplesort. */
-				Assert(agg->aggstrategy == AGG_PLAIN && nargs == 1);
-				tuplesort_putdatum(pertrans->sortstates[0],
-								   state->values[transno][0],
-								   state->nulls[transno][0]);
+				Assert(agg->aggstrategy == AGG_PLAIN);
+				if (nargs == 1)
+					tuplesort_putdatum(pertrans->sortstates[0],
+									   state->values[transno][0],
+									   state->nulls[transno][0]);
+				else
+				{
+					TupleTableSlot *sortslot = pertrans->sortslot;
+
+					ExecClearTuple(sortslot);
+					for (argno = 0; argno < nargs; argno++)
+					{
+						sortslot->tts_values[argno] = state->values[transno][argno];
+						sortslot->tts_isnull[argno] = state->nulls[transno][argno];
+					}
+					sortslot->tts_nvalid = nargs;
+					ExecStoreVirtualTuple(sortslot);
+					tuplesort_puttupleslot(pertrans->sortstates[0], sortslot);
+				}
 			}
 			else
 				VectorAggAdvanceTransition(agg, pergroup, transno,
