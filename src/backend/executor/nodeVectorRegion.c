@@ -361,7 +361,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		}
 		if (state->scan != NULL && scan->plan.qual != NIL)
 		{
-			VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+			VectorExprVarMap vars = {scan->scanrelid, NULL, 0, estate};
 
 			state->qual = VectorExprCompile(estate->es_query_cxt,
 											(Expr *) scan->plan.qual,
@@ -376,7 +376,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		 */
 		if (state->scan != NULL && state->agg == NULL && state->hj == NULL)
 		{
-			VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+			VectorExprVarMap vars = {scan->scanrelid, NULL, 0, estate};
 
 			col = 0;
 			foreach(lc, scan->plan.targetlist)
@@ -779,6 +779,14 @@ VectorRegionEnd(CustomScanState *node)
 	VectorRegionState *state = (VectorRegionState *) node;
 	ListCell   *lc;
 
+	if (state->nestloop != NULL)
+		outerPlanState(state->nestloop) = state->nl_outer;
+	if (state->material != NULL)
+		outerPlanState(state->material) = state->mat_outer;
+	foreach(lc, node->custom_ps)
+		ExecEndNode((PlanState *) lfirst(lc));
+	node->custom_ps = NIL;
+
 	if (state->vhj != NULL)
 		VectorHashJoinDestroy(state->vhj);
 	if (state->proj != NULL)
@@ -800,14 +808,6 @@ VectorRegionEnd(CustomScanState *node)
 		pfree(state->output_attnos);
 	if (state->read_attrs != NULL)
 		pfree(state->read_attrs);
-	if (state->nestloop != NULL)
-		outerPlanState(state->nestloop) = state->nl_outer;
-	if (state->material != NULL)
-		outerPlanState(state->material) = state->mat_outer;
-
-	foreach(lc, node->custom_ps)
-		ExecEndNode((PlanState *) lfirst(lc));
-	node->custom_ps = NIL;
 	if (state->nl_proxy != NULL)
 		pfree(state->nl_proxy);
 	if (state->mat_proxy != NULL)

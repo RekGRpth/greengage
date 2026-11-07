@@ -19,6 +19,7 @@
 #include "cdb/cdbvars.h"
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
+#include "executor/nodeSubplan.h"
 #include "executor/vectorExpr.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -58,7 +59,9 @@ typedef enum VectorExprKind
 	VEC_ROW,
 	VEC_FIELDSELECT,
 	VEC_CONVERTROWTYPE,
-	VEC_WHOLEVAR
+	VEC_WHOLEVAR,
+	VEC_PARAM,
+	VEC_SUBPLAN
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -172,6 +175,19 @@ typedef struct VectorExprStep
 			Datum	   *values;
 			bool	   *nulls;
 		}			wholevar;
+		struct
+		{
+			EState	   *estate;
+			int			paramid;
+		}			param;
+		struct
+		{
+			SubPlanState *sstate;
+			ExprContext *econtext;
+			TupleTableSlot *slot;
+			EState	   *estate;
+			bool		is_initplan;
+		}			subplan;
 	}			u;
 } VectorExprStep;
 
@@ -434,6 +450,10 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 			}
 		case T_BooleanTest:
 			return VectorExprIsSupported(((BooleanTest *) expr)->arg, vars);
+		case T_Param:
+			return ((Param *) expr)->paramkind == PARAM_EXEC;
+		case T_SubPlan:
+			return true;
 		default:
 			return false;
 	}
@@ -1029,6 +1049,46 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 						return NULL;
 					argno++;
 				}
+				return step;
+			}
+		case T_Param:
+			{
+				Param	   *param = (Param *) expr;
+
+				if (param->paramkind != PARAM_EXEC || vars->estate == NULL)
+					return NULL;
+				step = alloc_step(VEC_PARAM, 0, batch->capacity);
+				init_value(&step->value, param->paramtype, param->paramtypmod,
+						   batch->capacity, true);
+				step->u.param.estate = vars->estate;
+				step->u.param.paramid = param->paramid;
+				return step;
+			}
+		case T_SubPlan:
+			{
+				SubPlan    *sp = (SubPlan *) expr;
+
+				if (vars->estate == NULL || sp->plan_id <= 0 ||
+					sp->plan_id > list_length(vars->estate->es_subplanstates))
+					return NULL;
+				step = alloc_step(VEC_SUBPLAN, 0, batch->capacity);
+				init_value(&step->value, exprType((Node *) sp), -1,
+						   batch->capacity, true);
+				step->u.subplan.sstate = list_nth(vars->estate->es_subplanstates,
+												 sp->plan_id - 1);
+				if (sp->is_initplan)
+				{
+					ParamExecData *prm = &vars->estate->es_param_exec_vals[sp->plan_id];
+					int			row;
+
+					for (row = 0; row < batch->capacity; row++)
+						value_set(&step->value, row, prm->value, prm->isnull);
+				}
+				step->u.subplan.estate = vars->estate;
+				step->u.subplan.is_initplan = step->u.subplan.sstate->subplan->is_initplan ||
+					step->u.subplan.sstate->subplan->setParam != NIL;
+				if (!step->u.subplan.is_initplan)
+					return NULL;
 				return step;
 			}
 		default:
@@ -1738,6 +1798,26 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				}
 				return;
 			}
+		case VEC_PARAM:
+			for (pos = 0; pos < nselected; pos++)
+			{
+				int			row = selection[pos];
+				ParamExecData *prm = &step->u.param.estate->es_param_exec_vals[
+					step->u.param.paramid];
+
+				value_set(&step->value, row, prm->value, prm->isnull);
+			}
+			return;
+		case VEC_SUBPLAN:
+			for (pos = 0; pos < nselected; pos++)
+			{
+				int			row = selection[pos];
+				ParamExecData *prm = &step->u.subplan.estate->es_param_exec_vals[
+					step->u.subplan.sstate->subplan->plan_id];
+
+				value_set(&step->value, row, prm->value, prm->isnull);
+			}
+			return;
 		case VEC_BOOLTEST:
 			eval_step(step->args[0], batch, selection, nselected);
 			for (pos = 0; pos < nselected; pos++)

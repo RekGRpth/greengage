@@ -98,8 +98,7 @@ VectorAggPlanIsSupported(Agg *agg)
 		(agg->aggsplit != AGGSPLIT_SIMPLE &&
 		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
 		agg->groupingSets != NIL || agg->chain != NIL ||
-		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming ||
-		agg->plan.initPlan != NIL || agg->plan.extParam != NULL || agg->plan.allParam != NULL)
+		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming)
 		return false;
 	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
 		(agg->aggstrategy != AGG_PLAIN && agg->numCols == 0))
@@ -185,6 +184,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 		VectorAggDestroy(state);
 		return NULL;
 	}
+	state->vars.estate = agg->ss.ps.state;
 
 	state->args = palloc0(sizeof(VectorExprState **) * agg->numtrans);
 	state->filters = palloc0(sizeof(VectorExprState *) * agg->numtrans);

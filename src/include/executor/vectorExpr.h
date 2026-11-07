@@ -9,6 +9,7 @@
 #define VECTOREXPR_H
 
 #include "executor/vectorBatch.h"
+#include "nodes/execnodes.h"
 #include "nodes/primnodes.h"
 
 typedef struct VectorExprState VectorExprState;
@@ -18,6 +19,7 @@ typedef struct VectorExprVarMap
 	Index		scanrelid;
 	AttrNumber *outer_attnos;
 	int			outer_ncols;
+	EState	   *estate;
 } VectorExprVarMap;
 
 extern bool VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars);

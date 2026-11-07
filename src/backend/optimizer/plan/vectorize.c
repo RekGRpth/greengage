@@ -30,6 +30,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
+#include "optimizer/tlist.h"
 #include "optimizer/walkers.h"
 #include "parser/parsetree.h"
 #include "utils/guc.h"
@@ -83,9 +84,7 @@ is_simple_scan(VectorizeContext *ctx, SeqScan *scan)
 	VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
 
 	if (scan->scanrelid <= 0 ||
-		scan->plan.lefttree != NULL || scan->plan.righttree != NULL ||
-		scan->plan.initPlan != NIL || scan->plan.extParam != NULL ||
-		scan->plan.allParam != NULL)
+		scan->plan.lefttree != NULL || scan->plan.righttree != NULL)
 		return false;
 
 	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
@@ -123,9 +122,7 @@ is_projection_scan(VectorizeContext *ctx, SeqScan *scan)
 	VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
 
 	if (scan->scanrelid <= 0 ||
-		scan->plan.lefttree != NULL || scan->plan.righttree != NULL ||
-		scan->plan.initPlan != NIL || scan->plan.extParam != NULL ||
-		scan->plan.allParam != NULL)
+		scan->plan.lefttree != NULL || scan->plan.righttree != NULL)
 		return false;
 
 	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
@@ -329,6 +326,37 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 }
 
 /*
+ * Ruleutils needs a real Aggref for a combining aggregate, but its OUTER_VAR
+ * arguments must resolve to the original input targetlist, not to the region's
+ * synthetic INDEX_VAR output.
+ */
+static Node *
+display_var_mutator(Node *node, void *context)
+{
+	Plan	   *outer = (Plan *) context;
+	Var		   *var = (Var *) node;
+	TargetEntry *te;
+
+	if (node == NULL)
+		return NULL;
+	if (!IsA(node, Var) || var->varno != OUTER_VAR)
+		return expression_tree_mutator(node, display_var_mutator, context);
+	te = get_tle_by_resno(outer->targetlist, var->varattno);
+	if (te == NULL)
+		elog(ERROR, "vector region could not map display variable %d", var->varattno);
+	return (Node *) copyObject(te->expr);
+}
+
+static Expr *
+display_aggref(Aggref *aggref, Plan *outer)
+{
+	Aggref	   *display = copyObject(aggref);
+
+	display->args = (List *) display_var_mutator((Node *) display->args, outer);
+	return (Expr *) display;
+}
+
+/*
  * Build a scan-only region.  The original SeqScan remains a custom child so
  * executor initialization keeps its relation lock and EXPLAIN shows the leaf.
  */
@@ -363,7 +391,10 @@ make_region(VectorizeContext *ctx, Plan *root)
 		coltypmods = lappend_int(coltypmods, exprTypmod(expr));
 		colcollations = lappend_oid(colcollations, exprCollation(expr));
 		scan_tlist = lappend(scan_tlist,
-							 makeTargetEntry((Expr *) scanvar, k, name, te->resjunk));
+							 makeTargetEntry(IsA(expr, Aggref) ?
+											 display_aggref((Aggref *) expr, outerPlan(root)) :
+											 (Expr *) scanvar,
+											 k, name, te->resjunk));
 		out_tlist = lappend(out_tlist,
 							makeTargetEntry((Expr *) outvar, k, name, te->resjunk));
 		k++;
@@ -398,6 +429,9 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.parallel_aware = root->parallel_aware;
 	cs->scan.plan.parallel_safe = root->parallel_safe;
 	cs->scan.plan.flow = root->flow;
+	cs->scan.plan.initPlan = root->initPlan;
+	cs->scan.plan.extParam = root->extParam;
+	cs->scan.plan.allParam = root->allParam;
 	cs->scan.plan.operatorMemKB = memory_quota_kb(root);
 	if ((IsA(root, Agg) && ((Agg *) root)->aggstrategy == AGG_HASHED) ||
 		IsA(root, HashJoin) || IsA(root, Sort) || IsA(root, Unique) ||

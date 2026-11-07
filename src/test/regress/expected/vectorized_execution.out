@@ -902,14 +902,64 @@ SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has
 FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
  id | has_s 
 ----+-------
-  1 | t
-  2 | t
-  3 | t
-  4 | t
-  5 | t
-  6 | t
-  7 | t
+  1 | f
+  2 | f
+  3 | f
+  4 | f
+  5 | f
+  6 | f
+  7 | f
 (7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.c1
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Custom Scan (GGVectorRegion)
+                       ->  Partial Aggregate
+                             ->  Seq Scan on vector_aoco_small vector_aoco_small_1
+   ->  Sort
+         Sort Key: gg_vector_region.c1
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_aoco_small
+                     Filter: (id > ($0 - 2))
+(14 rows)
+
+SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
+ id 
+----
+  9
+ 10
+(2 rows)
+
+SELECT (SELECT max(id) FROM vector_aoco_small) AS m;
+ m  
+----
+ 10
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE big > (SELECT max(id) FROM vector_aoco_small);
+ count 
+-------
+  4554
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE id IN (SELECT id FROM vector_aoco_small);
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id NOT IN (SELECT id FROM vector_join_r);
+ count 
+-------
+     6
+(1 row)
 
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM vector_aoco_test l

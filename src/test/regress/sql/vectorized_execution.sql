@@ -243,6 +243,13 @@ FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
 SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
 FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
 EXPLAIN (COSTS OFF)
+SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
+SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
+SELECT (SELECT max(id) FROM vector_aoco_small) AS m;
+SELECT count(*) FROM vector_aoco_test WHERE big > (SELECT max(id) FROM vector_aoco_small);
+SELECT count(*) FROM vector_aoco_test WHERE id IN (SELECT id FROM vector_aoco_small);
+SELECT count(*) FROM vector_aoco_small WHERE id NOT IN (SELECT id FROM vector_join_r);
+EXPLAIN (COSTS OFF)
 SELECT count(*) FROM vector_aoco_test l
 JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
   ON l.id % 10 = r.g;
