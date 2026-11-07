@@ -362,6 +362,76 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	return NULL;
 }
 
+static bool
+advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
+				   int transno, int row)
+{
+	AggStatePerTrans pertrans = &state->agg->pertrans[transno];
+	AggStatePerGroup pergroupstate = &pergroup[transno];
+	Datum		value;
+	bool		isnull;
+
+	if (pertrans->numSortCols > 0)
+		return false;
+	if (pertrans->aggref->aggfnoid == 2803)	/* count(*) */
+	{
+		pergroupstate->transValue++;
+		return true;
+	}
+	if (pertrans->numTransInputs != 1)
+		return false;
+
+	value = state->values[transno][0];
+	isnull = state->nulls[transno][0];
+	if (pertrans->aggref->aggfnoid == 2802)	/* count(any) */
+	{
+		if (!isnull)
+			pergroupstate->transValue++;
+		return true;
+	}
+	if (isnull)
+		return true;
+
+	switch (pertrans->aggref->aggfnoid)
+	{
+		case 2108:				/* sum(int4) */
+			pergroupstate->transValue += DatumGetInt32(value);
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2115:				/* max(int8) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt64(pergroupstate->transValue) < DatumGetInt64(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2116:				/* max(int4) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt32(pergroupstate->transValue) < DatumGetInt32(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2131:				/* min(int8) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt64(pergroupstate->transValue) > DatumGetInt64(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2132:				/* min(int4) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt32(pergroupstate->transValue) > DatumGetInt32(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		default:
+			return false;
+	}
+}
+
 static void
 advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 {
@@ -387,6 +457,9 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 			state->values[transno][argno] =
 				VectorExprGetValue(state->args[transno][argno], row,
 								   &state->nulls[transno][argno]);
+		if (pertrans->numSortCols == 0 &&
+			advance_byval_fast(state, pergroup, transno, row))
+			continue;
 		if (pertrans->numSortCols > 0)
 		{
 			Assert(agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_SORTED);
