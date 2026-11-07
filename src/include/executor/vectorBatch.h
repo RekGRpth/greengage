@@ -37,6 +37,7 @@ typedef struct VectorBatch
 	int			nselected;
 	VectorColumn *columns;
 	int32	   *selection;
+	TupleDesc	tupdesc;
 	MemoryContext varlena_context;
 } VectorBatch;
 

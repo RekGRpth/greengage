@@ -28,6 +28,7 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity)
 	batch->capacity = capacity;
 	batch->columns = palloc0(sizeof(VectorColumn) * Max(batch->ncols, 1));
 	batch->selection = palloc(sizeof(int32) * capacity);
+	batch->tupdesc = tupdesc;
 	batch->varlena_context = AllocSetContextCreate(parent,
 											 "Vector Batch Values",
 											 ALLOCSET_DEFAULT_MINSIZE,

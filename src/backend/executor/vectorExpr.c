@@ -57,7 +57,8 @@ typedef enum VectorExprKind
 	VEC_ARRAYCOERCE,
 	VEC_ROW,
 	VEC_FIELDSELECT,
-	VEC_CONVERTROWTYPE
+	VEC_CONVERTROWTYPE,
+	VEC_WHOLEVAR
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -165,6 +166,12 @@ typedef struct VectorExprStep
 			Datum		value;
 			bool		isnull;
 		}			convertrowtype;
+		struct
+		{
+			TupleDesc	tupdesc;
+			Datum	   *values;
+			bool	   *nulls;
+		}			wholevar;
 	}			u;
 } VectorExprStep;
 
@@ -216,7 +223,11 @@ init_value(VectorValue *value, Oid typid, int32 typmod, int capacity,
 static AttrNumber
 map_var_attno(Var *var, const VectorExprVarMap *vars)
 {
-	if (var->varlevelsup != 0 || var->varattno <= 0)
+	if (var->varlevelsup != 0)
+		return 0;
+	if (var->varattno == 0)
+		return var->varno == vars->scanrelid ? -1 : 0;
+	if (var->varattno < 0)
 		return 0;
 	if (var->varno == vars->scanrelid)
 		return var->varattno;
@@ -240,7 +251,7 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 			{
 				Var		   *var = (Var *) expr;
 
-				return map_var_attno(var, vars) > 0;
+				return map_var_attno(var, vars) != 0;
 			}
 		case T_Const:
 			return true;
@@ -489,6 +500,16 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				VectorColumn *column;
 				AttrNumber	attno = map_var_attno(var, vars);
 
+				if (attno == -1)
+				{
+					step = alloc_step(VEC_WHOLEVAR, 0, batch->capacity);
+					init_value(&step->value, var->vartype, var->vartypmod,
+							   batch->capacity, true);
+					step->u.wholevar.tupdesc = batch->tupdesc;
+					step->u.wholevar.values = palloc(sizeof(Datum) * batch->ncols);
+					step->u.wholevar.nulls = palloc(sizeof(bool) * batch->ncols);
+					return step;
+				}
 				if (attno <= 0 || attno > batch->ncols)
 					return NULL;
 				step = alloc_step(VEC_VAR, 0, batch->capacity);
@@ -1597,6 +1618,25 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				}
 				return;
 			}
+		case VEC_WHOLEVAR:
+			for (pos = 0; pos < nselected; pos++)
+			{
+				int			row = selection[pos];
+				int			col;
+				HeapTuple	tuple;
+
+				for (col = 0; col < batch->ncols; col++)
+				{
+					step->u.wholevar.values[col] = batch->columns[col].values[row];
+					step->u.wholevar.nulls[col] =
+						TupleDescAttr(step->u.wholevar.tupdesc, col)->attisdropped ||
+						VectorBatchIsNull(batch, col, row);
+				}
+				tuple = heap_form_tuple(step->u.wholevar.tupdesc,
+									  step->u.wholevar.values, step->u.wholevar.nulls);
+				value_set(&step->value, row, HeapTupleGetDatum(tuple), false);
+			}
+			return;
 		case VEC_ROW:
 			{
 				int			argno;

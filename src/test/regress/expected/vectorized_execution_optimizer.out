@@ -446,6 +446,47 @@ FROM vector_aoco_small;
 (1 row)
 
 DROP TABLE vector_child, vector_parent;
+SELECT vector_aoco_small FROM vector_aoco_small ORDER BY id LIMIT 1;
+ vector_aoco_small 
+-------------------
+ (1,v1)
+(1 row)
+
+SELECT (vector_aoco_small).id AS id, (vector_aoco_small).val AS val
+FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ id | val 
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+(3 rows)
+
+SELECT (vector_heap_test).id AS id FROM vector_heap_test WHERE id < 4 ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT sum((vector_aoco_small).id) FROM vector_aoco_small;
+ sum 
+-----
+  55
+(1 row)
+
+CREATE TABLE vector_whole_test (id int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_whole_test VALUES (1, 'x'), (2, 'y');
+ALTER TABLE vector_whole_test DROP COLUMN val;
+SELECT vector_whole_test FROM vector_whole_test ORDER BY id;
+ vector_whole_test 
+-------------------
+ (1)
+ (2)
+(2 rows)
+
+DROP TABLE vector_whole_test;
 SELECT current_user = session_user AS same_user,
        current_database() = current_catalog AS same_db,
        current_schema() = current_schema AS same_schema,

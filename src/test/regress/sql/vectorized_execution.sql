@@ -150,6 +150,17 @@ SELECT (NULL::vector_child)::vector_parent AS null_conversion;
 SELECT sum(((ROW(id, 'v' || id, id + 1)::vector_child)::vector_parent).a)
 FROM vector_aoco_small;
 DROP TABLE vector_child, vector_parent;
+SELECT vector_aoco_small FROM vector_aoco_small ORDER BY id LIMIT 1;
+SELECT (vector_aoco_small).id AS id, (vector_aoco_small).val AS val
+FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+SELECT (vector_heap_test).id AS id FROM vector_heap_test WHERE id < 4 ORDER BY id;
+SELECT sum((vector_aoco_small).id) FROM vector_aoco_small;
+CREATE TABLE vector_whole_test (id int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_whole_test VALUES (1, 'x'), (2, 'y');
+ALTER TABLE vector_whole_test DROP COLUMN val;
+SELECT vector_whole_test FROM vector_whole_test ORDER BY id;
+DROP TABLE vector_whole_test;
 SELECT current_user = session_user AS same_user,
        current_database() = current_catalog AS same_db,
        current_schema() = current_schema AS same_schema,
