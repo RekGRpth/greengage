@@ -49,7 +49,8 @@ typedef enum VectorExprKind
 	VEC_ARRAY,
 	VEC_SUBSCRIPT,
 	VEC_SQLVALUE,
-	VEC_NEXTVAL
+	VEC_NEXTVAL,
+	VEC_ARRAYCOERCE
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -123,6 +124,19 @@ typedef struct VectorExprStep
 			Oid			seqid;
 			Oid			seqtypid;
 		}			nextval;
+		struct
+		{
+			Oid			resultelemtype;
+			int			attrlen;
+			int16		elmlen;
+			bool		elembyval;
+			char		elemalign;
+			int16		resultlen;
+			bool		resultbyval;
+			char		resultalign;
+			struct VectorExprStep *case_step;
+			struct VectorExprStep *elemstep;
+		}			arraycoerce;
 	}			u;
 } VectorExprStep;
 
@@ -349,6 +363,14 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 						return false;
 				}
 				return VectorExprIsSupported(sr->refexpr, vars);
+			}
+		case T_ArrayCoerceExpr:
+			{
+				ArrayCoerceExpr *ac = (ArrayCoerceExpr *) expr;
+
+				return VectorExprIsSupported(ac->arg, vars) &&
+					(ac->elemexpr == NULL ||
+					 VectorExprIsSupported(ac->elemexpr, vars));
 			}
 		case T_SQLValueFunction:
 			return true;
@@ -701,6 +723,38 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 						return NULL;
 				}
 				return step;
+			}
+		case T_ArrayCoerceExpr:
+			{
+				ArrayCoerceExpr *ac = (ArrayCoerceExpr *) expr;
+				Oid			sourceelemtype = get_element_type(exprType((Node *) ac->arg));
+
+				step = alloc_step(VEC_ARRAYCOERCE, 1, batch->capacity);
+				init_value(&step->value, ac->resulttype, ac->resulttypmod,
+						   batch->capacity, true);
+				step->u.arraycoerce.resultelemtype = get_element_type(ac->resulttype);
+				step->u.arraycoerce.attrlen = get_typlen(ac->resulttype);
+				get_typlenbyvalalign(sourceelemtype,
+									 &step->u.arraycoerce.elmlen,
+									 &step->u.arraycoerce.elembyval,
+									 &step->u.arraycoerce.elemalign);
+				get_typlenbyvalalign(step->u.arraycoerce.resultelemtype,
+									 &step->u.arraycoerce.resultlen,
+									 &step->u.arraycoerce.resultbyval,
+									 &step->u.arraycoerce.resultalign);
+				if (ac->elemexpr != NULL)
+				{
+					step->u.arraycoerce.case_step = alloc_step(VEC_CASETEST, 0,
+															 batch->capacity);
+					init_value(&step->u.arraycoerce.case_step->value,
+							   sourceelemtype, -1, batch->capacity, true);
+					step->u.arraycoerce.elemstep = build_step(ac->elemexpr, batch, vars,
+													 step->u.arraycoerce.case_step);
+					if (step->u.arraycoerce.elemstep == NULL)
+						return NULL;
+				}
+				step->args[0] = build_step(ac->arg, batch, vars, case_test);
+				return step->args[0] ? step : NULL;
 			}
 		case T_SQLValueFunction:
 			{
@@ -1409,6 +1463,66 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				value_set(&step->value, row, value, false);
 			}
 			return;
+		case VEC_ARRAYCOERCE:
+			{
+				VectorExprStep *arg = step->args[0];
+				VectorExprStep *elemstep = step->u.arraycoerce.elemstep;
+
+				eval_step(arg, batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					ArrayType  *array;
+
+					if (value_is_null(&arg->value, row))
+					{
+						value_set(&step->value, row, (Datum) 0, true);
+						continue;
+					}
+					if (elemstep == NULL)
+					{
+						array = DatumGetArrayTypePCopy(arg->value.values[row]);
+						ARR_ELEMTYPE(array) = step->u.arraycoerce.resultelemtype;
+						value_set(&step->value, row, PointerGetDatum(array), false);
+						continue;
+					}
+					{
+						Datum	   *elems;
+						bool	   *elem_nulls;
+						int			nelems;
+						Datum	   *result_elems;
+						bool	   *result_nulls;
+						int			dims[1];
+						int			lbs[1] = {1};
+						int			e;
+
+						deconstruct_array(DatumGetArrayTypeP(arg->value.values[row]),
+										  get_element_type(arg->value.typid),
+										  step->u.arraycoerce.elmlen,
+										  step->u.arraycoerce.elembyval,
+										  step->u.arraycoerce.elemalign,
+										  &elems, &elem_nulls, &nelems);
+						result_elems = palloc(sizeof(Datum) * Max(nelems, 1));
+						result_nulls = palloc(sizeof(bool) * Max(nelems, 1));
+						for (e = 0; e < nelems; e++)
+						{
+							value_set(&step->u.arraycoerce.case_step->value, row,
+									  elems[e], elem_nulls[e]);
+							eval_step(elemstep, batch, &row, 1);
+							result_elems[e] = elemstep->value.values[row];
+							result_nulls[e] = value_is_null(&elemstep->value, row);
+						}
+						dims[0] = nelems;
+						array = construct_md_array(result_elems, result_nulls, 1, dims, lbs,
+												   step->u.arraycoerce.resultelemtype,
+												   step->u.arraycoerce.resultlen,
+												   step->u.arraycoerce.resultbyval,
+												   step->u.arraycoerce.resultalign);
+						value_set(&step->value, row, PointerGetDatum(array), false);
+					}
+				}
+				return;
+			}
 		case VEC_BOOLTEST:
 			eval_step(step->args[0], batch, selection, nselected);
 			for (pos = 0; pos < nselected; pos++)

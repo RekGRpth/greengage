@@ -126,6 +126,12 @@ SELECT (ARRAY[1, 2, 3, 4])[2:3] AS mid, (ARRAY[1, 2, 3, 4])[2:] AS tail,
 SELECT id, (ARRAY[1, 2, 3, 4])[id:3] AS part FROM vector_aoco_small WHERE id < 4 ORDER BY id;
 SELECT (ARRAY[1, 2, 3, 4])[NULL:2] AS null_lower, (ARRAY[1, 2, 3, 4])[2:NULL] AS null_upper;
 SELECT (ARRAY[1, 2, 3, 4])[1:2][1] AS nested;
+SELECT ARRAY[1, 2, NULL]::text[] AS a;
+SELECT ARRAY['1', '2', '3']::int[] AS a;
+SELECT ARRAY[1.25, 2.5]::int[] AS a;
+SELECT ARRAY[1, 2, 3]::oid[] AS a;
+SELECT NULL::int[]::text[] AS a;
+SELECT (ARRAY[1, 2, 3, 4])[1:2]::text[] AS a;
 SELECT current_user = session_user AS same_user,
        current_database() = current_catalog AS same_db,
        current_schema() = current_schema AS same_schema,
