@@ -132,6 +132,15 @@ SELECT ARRAY[1.25, 2.5]::int[] AS a;
 SELECT ARRAY[1, 2, 3]::oid[] AS a;
 SELECT NULL::int[]::text[] AS a;
 SELECT (ARRAY[1, 2, 3, 4])[1:2]::text[] AS a;
+CREATE TYPE vector_pair AS (a int4, b text);
+SELECT ROW(1, 'x') AS anon_pair, ROW(1, 'x')::vector_pair AS named_pair;
+SELECT (ROW(id, 'v' || id)::vector_pair).a AS a,
+       (ROW(id, 'v' || id)::vector_pair).b AS b
+FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+SELECT (ROW(1, NULL)::vector_pair).b AS null_field;
+SELECT (NULL::vector_pair).a AS null_record;
+SELECT sum((ROW(id, id + 1)::vector_pair).a) FROM vector_aoco_small;
+DROP TYPE vector_pair;
 SELECT current_user = session_user AS same_user,
        current_database() = current_catalog AS same_db,
        current_schema() = current_schema AS same_schema,

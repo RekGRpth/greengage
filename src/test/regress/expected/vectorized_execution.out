@@ -380,6 +380,42 @@ SELECT (ARRAY[1, 2, 3, 4])[1:2]::text[] AS a;
  {1,2}
 (1 row)
 
+CREATE TYPE vector_pair AS (a int4, b text);
+SELECT ROW(1, 'x') AS anon_pair, ROW(1, 'x')::vector_pair AS named_pair;
+ anon_pair | named_pair 
+-----------+------------
+ (1,x)     | (1,x)
+(1 row)
+
+SELECT (ROW(id, 'v' || id)::vector_pair).a AS a,
+       (ROW(id, 'v' || id)::vector_pair).b AS b
+FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ a | b  
+---+----
+ 1 | v1
+ 2 | v2
+ 3 | v3
+(3 rows)
+
+SELECT (ROW(1, NULL)::vector_pair).b AS null_field;
+ null_field 
+------------
+ 
+(1 row)
+
+SELECT (NULL::vector_pair).a AS null_record;
+ null_record 
+-------------
+            
+(1 row)
+
+SELECT sum((ROW(id, id + 1)::vector_pair).a) FROM vector_aoco_small;
+ sum 
+-----
+  55
+(1 row)
+
+DROP TYPE vector_pair;
 SELECT current_user = session_user AS same_user,
        current_database() = current_catalog AS same_db,
        current_schema() = current_schema AS same_schema,

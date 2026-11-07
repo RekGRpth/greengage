@@ -12,12 +12,15 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "cdb/cdbvars.h"
 #include "commands/sequence.h"
+#include "executor/execExpr.h"
 #include "executor/vectorExpr.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
@@ -50,7 +53,9 @@ typedef enum VectorExprKind
 	VEC_SUBSCRIPT,
 	VEC_SQLVALUE,
 	VEC_NEXTVAL,
-	VEC_ARRAYCOERCE
+	VEC_ARRAYCOERCE,
+	VEC_ROW,
+	VEC_FIELDSELECT
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -137,6 +142,20 @@ typedef struct VectorExprStep
 			struct VectorExprStep *case_step;
 			struct VectorExprStep *elemstep;
 		}			arraycoerce;
+		struct
+		{
+			TupleDesc	tupdesc;
+			Datum	   *values;
+			bool	   *nulls;
+			int			nelems;
+			int		   *argattr;
+		}			row;
+		struct
+		{
+			ExprEvalStep *op;
+			Datum		value;
+			bool		isnull;
+		}			fieldselect;
 	}			u;
 } VectorExprStep;
 
@@ -364,6 +383,16 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 				}
 				return VectorExprIsSupported(sr->refexpr, vars);
 			}
+		case T_RowExpr:
+			foreach(lc, ((RowExpr *) expr)->args)
+			{
+				if (!VectorExprIsSupported((Expr *) lfirst(lc), vars))
+					return false;
+			}
+			return true;
+		case T_FieldSelect:
+			return ((FieldSelect *) expr)->fieldnum > 0 &&
+				VectorExprIsSupported(((FieldSelect *) expr)->arg, vars);
 		case T_ArrayCoerceExpr:
 			{
 				ArrayCoerceExpr *ac = (ArrayCoerceExpr *) expr;
@@ -723,6 +752,68 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 						return NULL;
 				}
 				return step;
+			}
+		case T_RowExpr:
+			{
+				RowExpr    *re = (RowExpr *) expr;
+				TupleDesc	tupdesc;
+				int			nargs = list_length(re->args);
+				int			i = 0;
+
+				if (re->row_typeid == RECORDOID)
+				{
+					tupdesc = ExecTypeFromExprList(re->args);
+					ExecTypeSetColNames(tupdesc, re->colnames);
+					BlessTupleDesc(tupdesc);
+				}
+				else
+					tupdesc = lookup_rowtype_tupdesc_copy(re->row_typeid, -1);
+				Assert(nargs <= tupdesc->natts);
+				step = alloc_step(VEC_ROW, nargs, batch->capacity);
+				init_value(&step->value, re->row_typeid, -1, batch->capacity, true);
+				step->u.row.tupdesc = tupdesc;
+				step->u.row.nelems = Max(nargs, tupdesc->natts);
+				step->u.row.values = palloc(sizeof(Datum) * step->u.row.nelems);
+				step->u.row.nulls = palloc(sizeof(bool) * step->u.row.nelems);
+				step->u.row.argattr = palloc(sizeof(int) * Max(nargs, 1));
+				argno = 0;
+				foreach(lc, re->args)
+				{
+					Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+					Expr	   *e = (Expr *) lfirst(lc);
+
+					if (!attr->attisdropped)
+					{
+						if (exprType((Node *) e) != attr->atttypid)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATATYPE_MISMATCH),
+									 errmsg("ROW() column has type %s instead of type %s",
+											format_type_be(exprType((Node *) e)),
+											format_type_be(attr->atttypid))));
+						step->args[argno] = build_step(e, batch, vars, case_test);
+						if (step->args[argno] == NULL)
+							return NULL;
+						step->u.row.argattr[argno] = i;
+						argno++;
+					}
+					i++;
+				}
+				return step;
+			}
+		case T_FieldSelect:
+			{
+				FieldSelect *fs = (FieldSelect *) expr;
+
+				step = alloc_step(VEC_FIELDSELECT, 1, batch->capacity);
+				init_value(&step->value, exprType((Node *) expr), -1,
+						   batch->capacity, true);
+				step->u.fieldselect.op = palloc0(sizeof(ExprEvalStep));
+				step->u.fieldselect.op->resvalue = &step->u.fieldselect.value;
+				step->u.fieldselect.op->resnull = &step->u.fieldselect.isnull;
+				step->u.fieldselect.op->d.fieldselect.fieldnum = fs->fieldnum;
+				step->u.fieldselect.op->d.fieldselect.resulttype = exprType((Node *) expr);
+				step->args[0] = build_step(fs->arg, batch, vars, case_test);
+				return step->args[0] ? step : NULL;
 			}
 		case T_ArrayCoerceExpr:
 			{
@@ -1463,6 +1554,47 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				value_set(&step->value, row, value, false);
 			}
 			return;
+		case VEC_ROW:
+			{
+				int			argno;
+
+				for (argno = 0; argno < step->nargs; argno++)
+					eval_step(step->args[argno], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					HeapTuple	tuple;
+
+					memset(step->u.row.nulls, true, step->u.row.nelems);
+					for (argno = 0; argno < step->nargs; argno++)
+					{
+						int			att = step->u.row.argattr[argno];
+
+						step->u.row.values[att] = step->args[argno]->value.values[row];
+						step->u.row.nulls[att] = value_is_null(&step->args[argno]->value, row);
+					}
+					tuple = heap_form_tuple(step->u.row.tupdesc,
+										  step->u.row.values, step->u.row.nulls);
+					value_set(&step->value, row, HeapTupleGetDatum(tuple), false);
+				}
+				return;
+			}
+		case VEC_FIELDSELECT:
+			{
+				ExprEvalStep *op = step->u.fieldselect.op;
+
+				eval_step(step->args[0], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+
+					*op->resvalue = step->args[0]->value.values[row];
+					*op->resnull = value_is_null(&step->args[0]->value, row);
+					ExecEvalFieldSelect(NULL, op, NULL);
+					value_set(&step->value, row, *op->resvalue, *op->resnull);
+				}
+				return;
+			}
 		case VEC_ARRAYCOERCE:
 			{
 				VectorExprStep *arg = step->args[0];
