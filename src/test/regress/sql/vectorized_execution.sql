@@ -126,6 +126,22 @@ SELECT (ARRAY[1, 2, 3, 4])[2:3] AS mid, (ARRAY[1, 2, 3, 4])[2:] AS tail,
 SELECT id, (ARRAY[1, 2, 3, 4])[id:3] AS part FROM vector_aoco_small WHERE id < 4 ORDER BY id;
 SELECT (ARRAY[1, 2, 3, 4])[NULL:2] AS null_lower, (ARRAY[1, 2, 3, 4])[2:NULL] AS null_upper;
 SELECT (ARRAY[1, 2, 3, 4])[1:2][1] AS nested;
+SELECT current_user = session_user AS same_user,
+       current_database() = current_catalog AS same_db,
+       current_schema() = current_schema AS same_schema,
+       current_role = current_user AS same_role;
+SELECT current_date = current_date AS d, current_time = current_time AS t,
+       current_timestamp = current_timestamp AS ts,
+       localtime = localtime AS lt, localtimestamp = localtimestamp AS lts;
+SELECT current_time(2) = current_time(2) AS t,
+       current_timestamp(2) = current_timestamp(2) AS ts,
+       localtime(2) = localtime(2) AS lt,
+       localtimestamp(2) = localtimestamp(2) AS lts;
+SELECT count(*) FROM vector_aoco_small WHERE current_schema IS NOT NULL;
+CREATE SEQUENCE vector_seq;
+SELECT nextval('vector_seq') FROM vector_limit_test LIMIT 3;
+SELECT nextval('vector_seq') FROM vector_limit_test LIMIT 3;
+DROP SEQUENCE vector_seq;
 SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
 FROM vector_aoco_test;
 SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;

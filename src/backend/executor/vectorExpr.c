@@ -14,6 +14,8 @@
 
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
+#include "cdb/cdbvars.h"
+#include "commands/sequence.h"
 #include "executor/vectorExpr.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -21,7 +23,9 @@
 #include "nodes/nodeFuncs.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/lsyscache.h"
+#include "utils/timestamp.h"
 #include "utils/typcache.h"
 
 typedef enum VectorExprKind
@@ -43,7 +47,9 @@ typedef enum VectorExprKind
 	VEC_DISTINCT,
 	VEC_MINMAX,
 	VEC_ARRAY,
-	VEC_SUBSCRIPT
+	VEC_SUBSCRIPT,
+	VEC_SQLVALUE,
+	VEC_NEXTVAL
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -111,6 +117,12 @@ typedef struct VectorExprStep
 			int		   *upperindex;
 			int		   *lowerindex;
 		}			subscript;
+		SQLValueFunctionOp sqlvalueop;
+		struct
+		{
+			Oid			seqid;
+			Oid			seqtypid;
+		}			nextval;
 	}			u;
 } VectorExprStep;
 
@@ -337,6 +349,15 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 						return false;
 				}
 				return VectorExprIsSupported(sr->refexpr, vars);
+			}
+		case T_SQLValueFunction:
+			return true;
+		case T_NextValueExpr:
+			{
+				NextValueExpr *nve = (NextValueExpr *) expr;
+
+				return nve->typeId == INT2OID || nve->typeId == INT4OID ||
+					nve->typeId == INT8OID;
 			}
 		case T_BooleanTest:
 			return VectorExprIsSupported(((BooleanTest *) expr)->arg, vars);
@@ -681,6 +702,90 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				}
 				return step;
 			}
+		case T_SQLValueFunction:
+			{
+				SQLValueFunction *svf = (SQLValueFunction *) expr;
+				Datum		value = (Datum) 0;
+				bool		isnull = false;
+				int			row;
+
+				switch (svf->op)
+				{
+					case SVFOP_CURRENT_DATE:
+						value = DateADTGetDatum(GetSQLCurrentDate());
+						break;
+					case SVFOP_CURRENT_TIME:
+					case SVFOP_CURRENT_TIME_N:
+						value = TimeTzADTPGetDatum(GetSQLCurrentTime(svf->typmod));
+						break;
+					case SVFOP_CURRENT_TIMESTAMP:
+					case SVFOP_CURRENT_TIMESTAMP_N:
+						value = TimestampTzGetDatum(GetSQLCurrentTimestamp(svf->typmod));
+						break;
+					case SVFOP_LOCALTIME:
+					case SVFOP_LOCALTIME_N:
+						value = TimeADTGetDatum(GetSQLLocalTime(svf->typmod));
+						break;
+					case SVFOP_LOCALTIMESTAMP:
+					case SVFOP_LOCALTIMESTAMP_N:
+						value = TimestampGetDatum(GetSQLLocalTimestamp(svf->typmod));
+						break;
+					case SVFOP_CURRENT_ROLE:
+					case SVFOP_CURRENT_USER:
+					case SVFOP_USER:
+						{
+							LOCAL_FCINFO(fcinfo, 0);
+
+							InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
+							value = current_user(fcinfo);
+							isnull = fcinfo->isnull;
+							break;
+						}
+					case SVFOP_SESSION_USER:
+						{
+							LOCAL_FCINFO(fcinfo, 0);
+
+							InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
+							value = session_user(fcinfo);
+							isnull = fcinfo->isnull;
+							break;
+						}
+					case SVFOP_CURRENT_CATALOG:
+						{
+							LOCAL_FCINFO(fcinfo, 0);
+
+							InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
+							value = current_database(fcinfo);
+							isnull = fcinfo->isnull;
+							break;
+						}
+					case SVFOP_CURRENT_SCHEMA:
+						{
+							LOCAL_FCINFO(fcinfo, 0);
+
+							InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
+							value = current_schema(fcinfo);
+							isnull = fcinfo->isnull;
+							break;
+						}
+				}
+				step = alloc_step(VEC_SQLVALUE, 0, batch->capacity);
+				init_value(&step->value, svf->type, svf->typmod,
+						   batch->capacity, true);
+				for (row = 0; row < batch->capacity; row++)
+					value_set(&step->value, row, value, isnull);
+				return step;
+			}
+		case T_NextValueExpr:
+			{
+				NextValueExpr *nve = (NextValueExpr *) expr;
+
+				step = alloc_step(VEC_NEXTVAL, 0, batch->capacity);
+				init_value(&step->value, nve->typeId, -1, batch->capacity, true);
+				step->u.nextval.seqid = nve->seqid;
+				step->u.nextval.seqtypid = nve->typeId;
+				return step;
+			}
 		case T_BooleanTest:
 			{
 				BooleanTest *bt = (BooleanTest *) expr;
@@ -867,6 +972,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 		case VEC_VAR:
 		case VEC_CONST:
 		case VEC_CASETEST:
+		case VEC_SQLVALUE:
 			return;
 		case VEC_RELABEL:
 			eval_step(step->args[0], batch, selection, nselected);
@@ -1277,6 +1383,32 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				}
 				return;
 			}
+		case VEC_NEXTVAL:
+			for (pos = 0; pos < nselected; pos++)
+			{
+				int			row = selection[pos];
+				int64		newval = nextval_internal(step->u.nextval.seqid, false,
+												 Gp_role == GP_ROLE_DISPATCH);
+				Datum		value;
+
+				switch (step->u.nextval.seqtypid)
+				{
+					case INT2OID:
+						value = Int16GetDatum((int16) newval);
+						break;
+					case INT4OID:
+						value = Int32GetDatum((int32) newval);
+						break;
+					case INT8OID:
+						value = Int64GetDatum(newval);
+						break;
+					default:
+						elog(ERROR, "unsupported sequence type %u",
+							 step->u.nextval.seqtypid);
+				}
+				value_set(&step->value, row, value, false);
+			}
+			return;
 		case VEC_BOOLTEST:
 			eval_step(step->args[0], batch, selection, nselected);
 			for (pos = 0; pos < nselected; pos++)

@@ -345,6 +345,56 @@ SELECT (ARRAY[1, 2, 3, 4])[1:2][1] AS nested;
  {}
 (1 row)
 
+SELECT current_user = session_user AS same_user,
+       current_database() = current_catalog AS same_db,
+       current_schema() = current_schema AS same_schema,
+       current_role = current_user AS same_role;
+ same_user | same_db | same_schema | same_role 
+-----------+---------+-------------+-----------
+ t         | t       | t           | t
+(1 row)
+
+SELECT current_date = current_date AS d, current_time = current_time AS t,
+       current_timestamp = current_timestamp AS ts,
+       localtime = localtime AS lt, localtimestamp = localtimestamp AS lts;
+ d | t | ts | lt | lts 
+---+---+----+----+-----
+ t | t | t  | t  | t
+(1 row)
+
+SELECT current_time(2) = current_time(2) AS t,
+       current_timestamp(2) = current_timestamp(2) AS ts,
+       localtime(2) = localtime(2) AS lt,
+       localtimestamp(2) = localtimestamp(2) AS lts;
+ t | ts | lt | lts 
+---+----+----+-----
+ t | t  | t  | t
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE current_schema IS NOT NULL;
+ count 
+-------
+    10
+(1 row)
+
+CREATE SEQUENCE vector_seq;
+SELECT nextval('vector_seq') FROM vector_limit_test LIMIT 3;
+ nextval 
+---------
+       1
+       2
+       3
+(3 rows)
+
+SELECT nextval('vector_seq') FROM vector_limit_test LIMIT 3;
+ nextval 
+---------
+       4
+       5
+       6
+(3 rows)
+
+DROP SEQUENCE vector_seq;
 SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
 FROM vector_aoco_test;
  sum  | count | count 
