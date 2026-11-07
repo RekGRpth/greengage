@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/tupconvert.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "cdb/cdbvars.h"
@@ -55,7 +56,8 @@ typedef enum VectorExprKind
 	VEC_NEXTVAL,
 	VEC_ARRAYCOERCE,
 	VEC_ROW,
-	VEC_FIELDSELECT
+	VEC_FIELDSELECT,
+	VEC_CONVERTROWTYPE
 } VectorExprKind;
 
 typedef struct VectorValue
@@ -156,6 +158,13 @@ typedef struct VectorExprStep
 			Datum		value;
 			bool		isnull;
 		}			fieldselect;
+		struct
+		{
+			ExprEvalStep *op;
+			ExprContext *econtext;
+			Datum		value;
+			bool		isnull;
+		}			convertrowtype;
 	}			u;
 } VectorExprStep;
 
@@ -383,6 +392,8 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 				}
 				return VectorExprIsSupported(sr->refexpr, vars);
 			}
+		case T_ConvertRowtypeExpr:
+			return VectorExprIsSupported(((ConvertRowtypeExpr *) expr)->arg, vars);
 		case T_RowExpr:
 			foreach(lc, ((RowExpr *) expr)->args)
 			{
@@ -752,6 +763,22 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 						return NULL;
 				}
 				return step;
+			}
+		case T_ConvertRowtypeExpr:
+			{
+				ConvertRowtypeExpr *ce = (ConvertRowtypeExpr *) expr;
+
+				step = alloc_step(VEC_CONVERTROWTYPE, 1, batch->capacity);
+				init_value(&step->value, ce->resulttype, -1, batch->capacity, true);
+				step->u.convertrowtype.op = palloc0(sizeof(ExprEvalStep));
+				step->u.convertrowtype.op->resvalue = &step->u.convertrowtype.value;
+				step->u.convertrowtype.op->resnull = &step->u.convertrowtype.isnull;
+				step->u.convertrowtype.op->d.convert_rowtype.inputtype = exprType((Node *) ce->arg);
+				step->u.convertrowtype.op->d.convert_rowtype.outputtype = ce->resulttype;
+				step->u.convertrowtype.econtext = palloc0(sizeof(ExprContext));
+				step->u.convertrowtype.econtext->ecxt_per_query_memory = CurrentMemoryContext;
+				step->args[0] = build_step(ce->arg, batch, vars, case_test);
+				return step->args[0] ? step : NULL;
 			}
 		case T_RowExpr:
 			{
@@ -1554,6 +1581,22 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 				value_set(&step->value, row, value, false);
 			}
 			return;
+		case VEC_CONVERTROWTYPE:
+			{
+				ExprEvalStep *op = step->u.convertrowtype.op;
+
+				eval_step(step->args[0], batch, selection, nselected);
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+
+					*op->resvalue = step->args[0]->value.values[row];
+					*op->resnull = value_is_null(&step->args[0]->value, row);
+					ExecEvalConvertRowtype(NULL, op, step->u.convertrowtype.econtext);
+					value_set(&step->value, row, *op->resvalue, *op->resnull);
+				}
+				return;
+			}
 		case VEC_ROW:
 			{
 				int			argno;

@@ -141,6 +141,15 @@ SELECT (ROW(1, NULL)::vector_pair).b AS null_field;
 SELECT (NULL::vector_pair).a AS null_record;
 SELECT sum((ROW(id, id + 1)::vector_pair).a) FROM vector_aoco_small;
 DROP TYPE vector_pair;
+CREATE TABLE vector_parent (a int4, b text);
+CREATE TABLE vector_child (c int4) INHERITS (vector_parent);
+SELECT (ROW(1, 'x', 5)::vector_child)::vector_parent AS converted;
+SELECT ((ROW(1, 'x', 5)::vector_child)::vector_parent).a AS a,
+       ((ROW(1, 'x', 5)::vector_child)::vector_parent).b AS b;
+SELECT (NULL::vector_child)::vector_parent AS null_conversion;
+SELECT sum(((ROW(id, 'v' || id, id + 1)::vector_child)::vector_parent).a)
+FROM vector_aoco_small;
+DROP TABLE vector_child, vector_parent;
 SELECT current_user = session_user AS same_user,
        current_database() = current_catalog AS same_db,
        current_schema() = current_schema AS same_schema,
