@@ -594,3 +594,94 @@ ExecSortRetrieveInstrumentation(SortState *node)
 	memcpy(si, node->shared_info, size);
 	node->shared_info = si;
 }
+
+bool
+VectorSortPlanIsSupported(Sort *sort)
+{
+	return sort->numCols > 0 && sort->plan.qual == NIL &&
+		sort->plan.initPlan == NIL && sort->plan.extParam == NULL &&
+		sort->plan.allParam == NULL;
+}
+
+static Tuplesortstate *
+VectorSortBegin(SortState *node)
+{
+	Sort	   *plannode = (Sort *) node->ss.ps.plan;
+	Tuplesortstate *tuplesortstate;
+
+	if (node->tuplesortstate != NULL)
+		return (Tuplesortstate *) node->tuplesortstate;
+
+	node->ss.ps.state->es_direction = ForwardScanDirection;
+	tuplesortstate = tuplesort_begin_heap(ExecGetResultType(outerPlanState(node)),
+										 plannode->numCols,
+										 plannode->sortColIdx,
+										 plannode->sortOperators,
+										 plannode->collations,
+										 plannode->nullsFirst,
+										 PlanStateOperatorMemKB((PlanState *) node),
+										 NULL, node->randomAccess);
+	if (node->bounded)
+		tuplesort_set_bound(tuplesortstate, node->bound);
+	node->tuplesortstate = tuplesortstate;
+	if (node->ss.ps.instrument && node->ss.ps.instrument->need_cdb)
+		tuplesort_set_instrument(tuplesortstate, node->ss.ps.instrument,
+								 node->ss.ps.cdbexplainbuf);
+	return tuplesortstate;
+}
+
+void
+VectorSortPutTuple(SortState *node, TupleTableSlot *slot)
+{
+	Assert(!node->sort_Done);
+	tuplesort_puttupleslot(VectorSortBegin(node), slot);
+}
+
+void
+VectorSortFinish(SortState *node)
+{
+	Tuplesortstate *tuplesortstate;
+	ScanDirection dir = node->ss.ps.state->es_direction;
+
+	if (node->sort_Done)
+		return;
+	tuplesortstate = VectorSortBegin(node);
+	tuplesort_performsort(tuplesortstate);
+	node->ss.ps.state->es_direction = dir;
+	node->sort_Done = true;
+	node->bounded_Done = node->bounded;
+	node->bound_Done = node->bound;
+	if (node->shared_info && node->am_worker)
+	{
+		TuplesortInstrumentation *si;
+
+		Assert(IsParallelWorker());
+		Assert(ParallelWorkerNumber <= node->shared_info->num_workers);
+		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
+		tuplesort_get_stats(tuplesortstate, si);
+	}
+}
+
+TupleTableSlot *
+VectorSortNext(SortState *node)
+{
+	Tuplesortstate *tuplesortstate = (Tuplesortstate *) node->tuplesortstate;
+	TupleTableSlot *slot;
+	ScanDirection dir = node->ss.ps.state->es_direction;
+
+	Assert(node->sort_Done);
+	if (tuplesortstate == NULL)
+		return NULL;
+	slot = node->ss.ps.ps_ResultTupleSlot;
+	(void) tuplesort_gettupleslot(tuplesortstate,
+								  ScanDirectionIsForward(dir), false, slot, NULL);
+	if (TupIsNull(slot) && !node->delayEagerFree)
+		ExecEagerFreeSort(node);
+	return slot;
+}
+
+TupleTableSlot *
+VectorSortExec(PlanState *pstate)
+{
+	return VectorSortNext(castNode(SortState, pstate));
+}

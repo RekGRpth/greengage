@@ -254,6 +254,7 @@
 #include "executor/execExpr.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
+#include "executor/vectorAgg.h"
 #include "lib/hyperloglog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -5356,4 +5357,109 @@ agg_hash_explain_extra_message(AggState *aggstate)
 				sum_bucket_total,
 				sum_num_expansions);
 	}
+}
+
+/* Batch-executor entry points into the existing aggregate implementation. */
+void
+VectorAggAdvanceTransition(AggState *aggstate, AggStatePerGroup pergroup,
+						   int transno, Datum *values, bool *isnull)
+{
+	AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+	AggStatePerGroup pergroupstate = &pergroup[transno];
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	int			argno;
+
+	for (argno = 0; argno < pertrans->numTransInputs; argno++)
+	{
+		fcinfo->args[argno + 1].value = values[argno];
+		fcinfo->args[argno + 1].isnull = isnull[argno];
+	}
+	advance_transition_function(aggstate, pertrans, pergroupstate);
+}
+
+void
+VectorAggInitializeEntry(AggState *aggstate, TupleHashEntry entry)
+{
+	initialize_hash_entry(aggstate, aggstate->perhash[0].hashtable, entry);
+}
+
+void
+VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot, uint32 hash)
+{
+	HashAggSpill *spill = &aggstate->hash_spills[0];
+
+	if (spill->partitions == NULL)
+	{
+		hashagg_spill_init(aggstate, spill, aggstate->hash_tapeinfo, 0,
+						   aggstate->perhash[0].aggnode->numGroups,
+						   aggstate->hashentrysize);
+		aggstate->perhash[0].num_spill_parts += spill->npartitions;
+	}
+	hashagg_spill_tuple(aggstate, spill, slot, hash);
+}
+
+void
+VectorAggInitializePlain(AggState *aggstate)
+{
+	initialize_aggregates(aggstate, aggstate->pergroups, 0);
+}
+
+void
+VectorAggFinishInput(AggState *aggstate)
+{
+	aggstate->input_done = true;
+	if (aggstate->aggstrategy == AGG_HASHED)
+	{
+		hashagg_finish_initial_spills(aggstate);
+		aggstate->table_filled = true;
+		select_current_set(aggstate, 0, true);
+		ResetTupleHashIterator(aggstate->perhash[0].hashtable,
+							   &aggstate->perhash[0].hashiter);
+	}
+}
+
+TupleTableSlot *
+VectorAggRetrievePlain(AggState *aggstate)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+	TupleTableSlot *result;
+
+	ResetExprContext(econtext);
+	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, 0);
+	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[0]);
+	result = project_aggregates(aggstate);
+	aggstate->agg_done = true;
+	return result;
+}
+
+bool
+VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot)
+{
+	Agg		   *node = aggstate->phase->aggnode;
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+
+	tmpcontext->ecxt_outertuple = slot;
+	tmpcontext->ecxt_innertuple = aggstate->ss.ss_ScanTupleSlot;
+	return ExecQualAndReset(aggstate->phase->eqfunctions[node->numCols - 1],
+							tmpcontext);
+}
+
+TupleTableSlot *
+VectorAggRetrieveGroup(AggState *aggstate)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+
+	ReScanExprContext(econtext);
+	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, 0);
+	select_current_set(aggstate, 0, false);
+	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[0]);
+	return project_aggregates(aggstate);
+}
+
+TupleTableSlot *
+VectorAggRetrieveHashed(AggState *aggstate)
+{
+	return agg_retrieve_hash_table(aggstate);
 }

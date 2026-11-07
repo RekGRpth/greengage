@@ -1778,3 +1778,29 @@ ExecReScanMergeJoin(MergeJoinState *node)
 		ExecReScan(node->js.ps.righttree);
 
 }
+
+bool
+VectorMergeJoinPlanIsSupported(MergeJoin *node)
+{
+	if (node->mergeclauses == NIL || node->join.plan.initPlan != NIL ||
+		node->join.plan.extParam != NULL || node->join.plan.allParam != NULL)
+		return false;
+	switch (node->join.jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_RIGHT:
+		case JOIN_FULL:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+			return true;
+		default:
+			return false;
+	}
+}
+
+TupleTableSlot *
+VectorMergeJoinNext(MergeJoinState *node)
+{
+	return ExecMergeJoin((PlanState *) node);
+}

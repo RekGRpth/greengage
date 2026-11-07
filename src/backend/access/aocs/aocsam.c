@@ -38,6 +38,7 @@
 #include "cdb/cdbappendonlystoragewrite.h"
 #include "cdb/cdbvars.h"
 #include "executor/executor.h"
+#include "executor/vectorBatch.h"
 #include "commands/defrem.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -758,6 +759,7 @@ void
 aocs_rescan(AOCSScanDesc scan)
 {
 	close_cur_scan_seg(scan);
+	scan->batch_eof = false;
 	if (scan->columnScanInfo.ds)
 		close_ds_read(scan->columnScanInfo.ds, scan->columnScanInfo.relationTupleDesc->natts);
 	initscan_with_colinfo(scan);
@@ -1524,6 +1526,245 @@ ReadNext:
 
 	Assert(!"Never here");
 	return false;
+}
+
+/*
+ * Fill a column batch directly from the projected datum streams.  The row
+ * loop follows aocs_getnext(), including missing attributes and visimap
+ * checks.  By-reference values are copied only for visible rows, since the
+ * stream's block buffers are reused while the batch is being filled.
+ */
+
+/*
+ * Whether any projected column of this scan is missing in some row, so its
+ * datumstream does not advance in step with the others during a scan.
+ */
+static bool
+aocs_any_proj_att_missing(AOCSScanDesc scan)
+{
+	AttrNumber  attno;
+	int			segfile;
+
+	for (int i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+	{
+		attno = scan->columnScanInfo.proj_atts[i];
+		for (segfile = 0; segfile < MAX_AOREL_CONCURRENCY; segfile++)
+		{
+			if (scan->columnScanInfo.attnum_to_rownum[attno * MAX_AOREL_CONCURRENCY + segfile] > 0)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Whether the next advance on this column would have to read a new block.
+ * Ending the batch there keeps every by-ref value in it pointing into a
+ * live block buffer, so filling the batch needs no per-value copies.
+ */
+static bool
+aocs_column_block_exhausted(DatumStreamRead *ds)
+{
+	return (int64) ds->blockRead.nth + 1 >= ds->blockRead.logical_row_count;
+}
+
+/*
+ * Whether a by-ref value read from this column lives in one of the
+ * per-stream buffers that the next read of the same column reuses, and so
+ * cannot survive in a batch without a copy even within one block.
+ */
+static bool
+aocs_datum_in_transient_buffer(DatumStreamRead *ds, Datum value)
+{
+	uint8	   *p = (uint8 *) DatumGetPointer(value);
+	uint8	   *lo = ds->large_object_buffer;
+	uint8	   *up = (uint8 *) ds->datum_upgrade_buffer;
+
+	if (lo && p >= lo && p < lo + ds->large_object_buffer_size)
+		return true;
+	if (up && p >= up && p < up + ds->datum_upgrade_buffer_size)
+		return true;
+	return false;
+}
+
+bool
+aocs_getnext_batch(AOCSScanDesc scan, VectorBatch *batch)
+{
+	int			err = 0;
+	int			nrows = 0;
+	bool		isSnapshotAny = (scan->rs_base.rs_snapshot == SnapshotAny);
+
+	Assert(scan != NULL && batch != NULL);
+	Assert((scan->rs_base.rs_flags & SO_TYPE_ANALYZE) == 0);
+	Assert((scan->rs_base.rs_flags & SO_TYPE_SAMPLESCAN) == 0);
+
+	if (scan->batch_eof)
+	{
+		VectorBatchReset(batch);
+		return false;
+	}
+
+	if (scan->columnScanInfo.relationTupleDesc == NULL)
+	{
+		scan->columnScanInfo.relationTupleDesc =
+			RelationGetDescr(scan->rs_base.rs_rd);
+		PinTupleDesc(scan->columnScanInfo.relationTupleDesc);
+		initscan_with_colinfo(scan);
+		scan->batch_copies_byref = aocs_any_proj_att_missing(scan);
+	}
+
+	Assert(batch->ncols == scan->columnScanInfo.relationTupleDesc->natts);
+	VectorBatchReset(batch);
+
+	while (nrows < batch->capacity)
+	{
+		AOCSFileSegInfo *curseginfo;
+		AOTupleId	aoTupleId;
+		int64		rowNum = InvalidAORowNum;
+
+ReadNext:
+		rowNum = InvalidAORowNum;
+		if (scan->cur_seg < 0 || err < 0)
+		{
+			if (scan->columnScanInfo.num_proj_atts == 0)
+				break;
+
+			err = open_next_scan_seg(scan);
+			if (err < 0)
+			{
+				scan->batch_eof = true;
+				scan->cur_seg = -1;
+				break;
+			}
+			scan->segrowsprocessed = 0;
+		}
+
+		Assert(scan->columnScanInfo.num_proj_atts > 0);
+		Assert(scan->cur_seg >= 0);
+		curseginfo = scan->seginfo[scan->cur_seg];
+
+		/*
+		 * End the batch before any pass-by-reference column's block runs
+		 * out, keeping the block buffers those values point into live (see
+		 * aocs_column_block_exhausted).  By-value columns copy their datums
+		 * into the batch arrays, so their blocks may be reused freely.
+		 */
+		if (nrows > 0 && !scan->batch_copies_byref)
+		{
+			bool		block_end = false;
+
+			for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+			{
+				AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+
+				if (!batch->columns[attno].typbyval &&
+					aocs_column_block_exhausted(scan->columnScanInfo.ds[attno]))
+				{
+					block_end = true;
+					break;
+				}
+			}
+			if (block_end)
+				break;
+		}
+
+		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+		{
+			AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+			Datum		value;
+			bool		isnull;
+			int64		nthInBlock;
+
+			if (attno != scan->columnScanInfo.proj_atts[ANCHOR_COL_IN_PROJ])
+			{
+				Assert(rowNum > 0);
+				if (AO_ATTR_VAL_IS_MISSING(rowNum,
+											attno,
+											curseginfo->segno,
+											scan->columnScanInfo.attnum_to_rownum))
+				{
+					value = getmissingattr(scan->columnScanInfo.relationTupleDesc,
+										   attno + 1, &isnull);
+					VectorBatchSetValue(batch, attno, nrows, value, isnull);
+					continue;
+				}
+			}
+
+			err = datumstreamread_advance(scan->columnScanInfo.ds[attno]);
+			Assert(err >= 0);
+			if (err == 0)
+			{
+				err = datumstreamread_block(scan->columnScanInfo.ds[attno],
+											scan->blockDirectory, attno);
+				if (err < 0)
+				{
+					close_cur_scan_seg(scan);
+					goto ReadNext;
+				}
+
+				AOCSScanDesc_UpdateTotalBytesRead(scan, attno);
+				pgstat_count_buffer_read_ao(scan->rs_base.rs_rd,
+											RelationGuessNumberOfBlocksFromSize(scan->totalBytesRead));
+
+				err = datumstreamread_advance(scan->columnScanInfo.ds[attno]);
+				Assert(err > 0);
+			}
+
+			datumstreamread_get(scan->columnScanInfo.ds[attno], &value, &isnull);
+			VectorBatchSetValue(batch, attno, nrows, value, isnull);
+
+			nthInBlock = datumstreamread_nth(scan->columnScanInfo.ds[attno]);
+			if (rowNum == InvalidAORowNum &&
+				scan->columnScanInfo.ds[attno]->blockFirstRowNum != InvalidAORowNum)
+			{
+				Assert(scan->columnScanInfo.ds[attno]->blockFirstRowNum > 0 && nthInBlock >= 0);
+				rowNum = scan->columnScanInfo.ds[attno]->blockFirstRowNum + nthInBlock;
+			}
+#ifdef USE_ASSERT_CHECKING
+			else if (scan->columnScanInfo.ds[attno]->blockFirstRowNum != InvalidAORowNum)
+			{
+				Assert(scan->columnScanInfo.ds[attno]->blockFirstRowNum > 0 && nthInBlock >= 0);
+				Assert(rowNum == scan->columnScanInfo.ds[attno]->blockFirstRowNum + nthInBlock);
+			}
+#endif
+		}
+
+		scan->segrowsprocessed++;
+		if (rowNum == InvalidAORowNum)
+			AOTupleIdInit(&aoTupleId, curseginfo->segno, scan->segrowsprocessed);
+		else
+			AOTupleIdInit(&aoTupleId, curseginfo->segno, rowNum);
+
+		if (!isSnapshotAny && !AppendOnlyVisimap_IsVisible(&scan->visibilityMap, &aoTupleId))
+			goto ReadNext;
+
+		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+		{
+			AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+			VectorColumn *column = &batch->columns[attno];
+
+			if (column->typbyval || VectorBatchIsNull(batch, attno, nrows))
+				continue;
+			/*
+			 * Values in the block buffers live as long as the batch stops
+			 * at block boundaries; only transient-buffer values (oversized
+			 * or format-upgraded datums) and scans with missing-column
+			 * streams need a copy.
+			 */
+			if (scan->batch_copies_byref ||
+				aocs_datum_in_transient_buffer(scan->columnScanInfo.ds[attno],
+											   column->values[nrows]))
+				column->values[nrows] = VectorBatchCopyDatum(batch, attno,
+														 column->values[nrows], false);
+		}
+
+		scan->cdb_fake_ctid = *((ItemPointer) &aoTupleId);
+		pgstat_count_heap_getnext(scan->rs_base.rs_rd);
+		nrows++;
+	}
+
+	VectorBatchSetRowCount(batch, nrows);
+	return nrows > 0;
 }
 
 

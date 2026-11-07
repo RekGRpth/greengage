@@ -765,3 +765,37 @@ extractFuncExprArgs(Expr *clause, List **lclauses, List **rclauses)
 	else
 		elog(ERROR, "unexpected join qual in JOIN_LASJ_NOTIN join");
 }
+
+bool
+VectorNestLoopPlanIsSupported(NestLoop *node)
+{
+	if (node->shared_outer || node->join.plan.initPlan != NIL ||
+		node->join.plan.extParam != NULL || node->join.plan.allParam != NULL)
+		return false;
+	switch (node->join.jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+		case JOIN_LASJ_NOTIN:
+			return true;
+		default:
+			return false;
+	}
+}
+
+TupleTableSlot *
+VectorNestLoopNext(NestLoopState *node, PlanState *outer_proxy,
+				   PlanState *outer_original)
+{
+	TupleTableSlot *result = ExecNestLoop_guts((PlanState *) node);
+
+	if (TupIsNull(result))
+	{
+		outerPlanState(node) = outer_original;
+		ExecSquelchNode((PlanState *) node);
+		outerPlanState(node) = outer_proxy;
+	}
+	return result;
+}

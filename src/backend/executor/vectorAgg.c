@@ -1,0 +1,567 @@
+/*-------------------------------------------------------------------------
+ *
+ * vectorAgg.c
+ *	  Feed column batches into PostgreSQL aggregate transition states.
+ *
+ * Aggregate metadata, grouping hash table, transition functions and output
+ * finalization stay owned by nodeAgg.  This file evaluates aggregate
+ * arguments in vector form and supplies per-row values to those states.
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "catalog/pg_aggregate.h"
+#include "catalog/pg_type_d.h"
+#include "executor/executor.h"
+#include "executor/vectorAgg.h"
+#include "executor/vectorExpr.h"
+#include "miscadmin.h"
+#include "utils/tuplesort.h"
+
+struct VectorAggState
+{
+	MemoryContext context;
+	AggState   *agg;
+	VectorExprVarMap vars;
+	VectorExprState ***args;
+	VectorExprState **filters;
+	int32	   *filtered_selection;
+	Datum	  **values;
+	bool	  **nulls;
+	TupleTableSlot *input_slot;	/* full input row, for spilling */
+	bool		group_open;
+	bool		input_done;
+	bool		output_done;
+};
+
+static bool
+build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
+{
+	Plan	   *outer = outerPlan(agg);
+	SeqScan	   *scan;
+	ListCell   *lc;
+	int			col = 0;
+
+	if (!IsA(outer, SeqScan) && !IsA(outer, Motion) &&
+		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED)
+		return false;
+
+	vars->outer_ncols = list_length(outer->targetlist);
+	vars->outer_attnos = MemoryContextAlloc(context,
+										 sizeof(AttrNumber) * Max(vars->outer_ncols, 1));
+	if (!IsA(outer, SeqScan))
+	{
+		/* A region above a Motion or another row leaf reads its output shape. */
+		vars->scanrelid = 0;
+		foreach(lc, outer->targetlist)
+		{
+			TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+			if (te->resjunk)
+				return false;
+			vars->outer_attnos[col] = col + 1;
+			col++;
+		}
+		return true;
+	}
+
+	scan = (SeqScan *) outer;
+	vars->scanrelid = scan->scanrelid;
+
+	foreach(lc, scan->plan.targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+		Var		   *var;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			return false;
+		var = (Var *) te->expr;
+		if (var->varno != scan->scanrelid || var->varattno <= 0 ||
+			var->varlevelsup != 0)
+			return false;
+		vars->outer_attnos[col++] = var->varattno;
+	}
+	return true;
+}
+
+bool
+VectorAggPlanIsSupported(Agg *agg)
+{
+	VectorExprVarMap vars;
+	ListCell   *lc;
+	int			col;
+	bool		supported = false;
+
+	if ((agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED &&
+		 agg->aggstrategy != AGG_SORTED) ||
+		(agg->aggsplit != AGGSPLIT_SIMPLE &&
+		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
+		agg->groupingSets != NIL || agg->chain != NIL ||
+		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming)
+		return false;
+	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
+		(agg->aggstrategy != AGG_PLAIN && agg->numCols == 0))
+		return false;
+	if (!build_var_map(agg, CurrentMemoryContext, &vars))
+		return false;
+
+	for (col = 0; col < agg->numCols; col++)
+	{
+		if (agg->grpColIdx[col] <= 0 || agg->grpColIdx[col] > vars.outer_ncols)
+			goto done;
+	}
+
+	foreach(lc, agg->plan.targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (te->resjunk)
+			goto done;
+		if (IsA(te->expr, Var))
+		{
+			if (!VectorExprIsSupported((Expr *) te->expr, &vars))
+				goto done;
+			continue;
+		}
+		if (!IsA(te->expr, Aggref))
+			goto done;
+
+		{
+			Aggref	   *aggref = (Aggref *) te->expr;
+			ListCell   *arglc;
+
+			if ((aggref->aggkind != AGGKIND_NORMAL &&
+				 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
+				aggref->agglevelsup != 0 ||
+				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
+				(aggref->aggdirectargs != NIL &&
+				 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
+				aggref->aggtype == INTERNALOID ||
+				((aggref->aggorder != NIL || aggref->aggdistinct != NIL) &&
+				 agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_SORTED) ||
+				(aggref->aggdistinct != NIL && list_length(aggref->args) != 1))
+				goto done;
+			if (aggref->aggfilter != NULL &&
+				!VectorExprIsSupported(aggref->aggfilter, &vars))
+				goto done;
+			foreach(arglc, aggref->args)
+			{
+				TargetEntry *arg = (TargetEntry *) lfirst(arglc);
+
+				if (!VectorExprIsSupported(arg->expr, &vars))
+					goto done;
+			}
+		}
+	}
+	supported = true;
+
+done:
+	pfree(vars.outer_attnos);
+	return supported;
+}
+
+VectorAggState *
+VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
+{
+	VectorAggState *state;
+	MemoryContext oldcontext;
+	int			transno;
+
+	if (!VectorAggPlanIsSupported((Agg *) agg->ss.ps.plan))
+		return NULL;
+
+	state = MemoryContextAllocZero(parent, sizeof(VectorAggState));
+	state->context = AllocSetContextCreate(parent, "Vector Aggregate",
+										 ALLOCSET_DEFAULT_MINSIZE,
+										 ALLOCSET_DEFAULT_INITSIZE,
+										 ALLOCSET_DEFAULT_MAXSIZE);
+	state->agg = agg;
+	oldcontext = MemoryContextSwitchTo(state->context);
+	if (!build_var_map((Agg *) agg->ss.ps.plan, state->context, &state->vars))
+	{
+		MemoryContextSwitchTo(oldcontext);
+		VectorAggDestroy(state);
+		return NULL;
+	}
+	state->vars.estate = agg->ss.ps.state;
+
+	state->args = palloc0(sizeof(VectorExprState **) * agg->numtrans);
+	state->filters = palloc0(sizeof(VectorExprState *) * agg->numtrans);
+	state->filtered_selection = palloc(sizeof(int32) * batch->capacity);
+	state->values = palloc0(sizeof(Datum *) * agg->numtrans);
+	state->nulls = palloc0(sizeof(bool *) * agg->numtrans);
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &agg->pertrans[transno];
+		int			nargs = list_length(pertrans->aggref->args);
+		int			argno = 0;
+		ListCell   *lc;
+
+		state->args[transno] = palloc0(sizeof(VectorExprState *) * Max(nargs, 1));
+		state->values[transno] = palloc(sizeof(Datum) * Max(nargs, 1));
+		state->nulls[transno] = palloc(sizeof(bool) * Max(nargs, 1));
+		foreach(lc, pertrans->aggref->args)
+		{
+			TargetEntry *arg = (TargetEntry *) lfirst(lc);
+
+			state->args[transno][argno] = VectorExprCompile(state->context,
+														 arg->expr, batch,
+														 &state->vars);
+			if (state->args[transno][argno] == NULL)
+			{
+				MemoryContextSwitchTo(oldcontext);
+				VectorAggDestroy(state);
+				return NULL;
+			}
+			argno++;
+		}
+		if (pertrans->aggref->aggfilter != NULL)
+		{
+			state->filters[transno] = VectorExprCompile(state->context,
+											 pertrans->aggref->aggfilter,
+											 batch, &state->vars);
+			if (state->filters[transno] == NULL)
+			{
+				MemoryContextSwitchTo(oldcontext);
+				VectorAggDestroy(state);
+				return NULL;
+			}
+		}
+		Assert(argno == pertrans->numInputs);
+	}
+	if (agg->aggstrategy == AGG_PLAIN)
+	{
+		/* nodeAgg owns its tuplesorts and frees them after the region state. */
+		MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
+		VectorAggInitializePlain(agg);
+		MemoryContextSwitchTo(state->context);
+	}
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Spilled rows are read back by nodeAgg's refill machinery, which reads
+	 * group keys and aggregate arguments alike from the input tuple.  Spill
+	 * therefore needs the full input row, not just the grouping columns.
+	 */
+	state->input_slot = ExecInitExtraTupleSlot(agg->ss.ps.state,
+											   agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+											   &TTSOpsVirtual);
+	return state;
+}
+
+void
+VectorAggDestroy(VectorAggState *state)
+{
+	if (state == NULL)
+		return;
+	MemoryContextDelete(state->context);
+	pfree(state);
+}
+
+static void
+eval_arguments(VectorAggState *state, VectorBatch *batch)
+{
+	AggState   *agg = state->agg;
+	int			transno;
+
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		int			nargs = agg->pertrans[transno].numInputs;
+		int32	   *selection = batch->selection;
+		int			nselected = batch->nselected;
+		int			argno;
+
+		/* A filter runs before the aggregate arguments, as in evaltrans. */
+		if (state->filters[transno] != NULL)
+		{
+			int			pos;
+
+			VectorExprEval(batch, state->filters[transno]);
+			nselected = 0;
+			for (pos = 0; pos < batch->nselected; pos++)
+			{
+				int			row = VectorBatchSelectedRow(batch, pos);
+				bool		isnull;
+				Datum		value = VectorExprGetValue(state->filters[transno], row,
+													 &isnull);
+
+				if (!isnull && DatumGetBool(value))
+					state->filtered_selection[nselected++] = row;
+			}
+			selection = state->filtered_selection;
+		}
+
+		for (argno = 0; argno < nargs; argno++)
+			VectorExprEvalSelection(batch, state->args[transno][argno],
+									selection, nselected);
+	}
+}
+
+/* Build the full input row of a batch position in the input layout. */
+static TupleTableSlot *
+fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
+{
+	TupleTableSlot *slot = state->input_slot;
+	int			col;
+
+	ExecClearTuple(slot);
+	for (col = 0; col < state->vars.outer_ncols; col++)
+	{
+		AttrNumber	attno = state->vars.outer_attnos[col];
+
+		slot->tts_values[col] = batch->columns[attno - 1].values[row];
+		slot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
+	}
+	ExecStoreVirtualTuple(slot);
+	return slot;
+}
+
+static AggStatePerGroup
+lookup_group(VectorAggState *state, VectorBatch *batch, int row)
+{
+	AggState   *agg = state->agg;
+	AggStatePerHash perhash = &agg->perhash[0];
+	TupleTableSlot *hashslot = perhash->hashslot;
+	TupleHashEntry entry;
+	bool		isnew = false;
+	uint32		hash = 0;
+	int			col;
+
+	ExecClearTuple(hashslot);
+	for (col = 0; col < perhash->numhashGrpCols; col++)
+	{
+		int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
+		AttrNumber	attno = state->vars.outer_attnos[inputcol];
+
+		hashslot->tts_values[col] = batch->columns[attno - 1].values[row];
+		hashslot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
+	}
+	ExecStoreVirtualTuple(hashslot);
+
+	if (agg->hash_spill_mode)
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, NULL, &hash);
+	else
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, &isnew, &hash);
+	if (entry != NULL)
+	{
+		if (isnew)
+			VectorAggInitializeEntry(agg, entry);
+		return (AggStatePerGroup) entry->additional;
+	}
+
+	/* A new group that no longer fits is spilled and processed on refill. */
+	if (agg->hash_spill_mode)
+	{
+		VectorAggSpillTuple(agg, fill_input_slot(state, batch, row), hash);
+		return NULL;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("vectorized hash aggregate could not create a group")));
+	return NULL;
+}
+
+static void
+advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
+{
+	AggState   *agg = state->agg;
+	int			transno;
+
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &agg->pertrans[transno];
+		int			nargs = pertrans->numInputs;
+		int			argno;
+
+		if (state->filters[transno] != NULL)
+		{
+			bool		isnull;
+			Datum		value = VectorExprGetValue(state->filters[transno], row,
+												 &isnull);
+
+			if (isnull || !DatumGetBool(value))
+				continue;
+		}
+		for (argno = 0; argno < nargs; argno++)
+			state->values[transno][argno] =
+				VectorExprGetValue(state->args[transno][argno], row,
+								   &state->nulls[transno][argno]);
+		if (pertrans->numSortCols > 0)
+		{
+			Assert(agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_SORTED);
+			if (nargs == 1)
+				tuplesort_putdatum(pertrans->sortstates[0],
+								   state->values[transno][0],
+								   state->nulls[transno][0]);
+			else
+			{
+				TupleTableSlot *sortslot = pertrans->sortslot;
+
+				ExecClearTuple(sortslot);
+				for (argno = 0; argno < nargs; argno++)
+				{
+					sortslot->tts_values[argno] = state->values[transno][argno];
+					sortslot->tts_isnull[argno] = state->nulls[transno][argno];
+				}
+				sortslot->tts_nvalid = nargs;
+				ExecStoreVirtualTuple(sortslot);
+				tuplesort_puttupleslot(pertrans->sortstates[0], sortslot);
+			}
+		}
+		else
+			VectorAggAdvanceTransition(agg, pergroup, transno,
+									   state->values[transno], state->nulls[transno]);
+	}
+}
+
+void
+VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
+{
+	AggState   *agg = state->agg;
+	int			pos;
+
+	if (batch->nselected == 0)
+		return;
+
+	eval_arguments(state, batch);
+	for (pos = 0; pos < batch->nselected; pos++)
+	{
+		int			row = VectorBatchSelectedRow(batch, pos);
+		AggStatePerGroup pergroup;
+
+		if ((pos & 0xff) == 0)
+			CHECK_FOR_INTERRUPTS();
+		if (agg->aggstrategy == AGG_HASHED)
+		{
+			pergroup = lookup_group(state, batch, row);
+			if (pergroup == NULL)
+				continue;
+		}
+		else
+			pergroup = agg->pergroups[0];
+
+		advance_row(state, pergroup, row);
+	}
+	/* Transition garbage is bounded by the batch size; reset once. */
+	ResetExprContext(agg->tmpcontext);
+}
+
+static void
+start_sorted_group(VectorAggState *state, VectorBatch *batch, int row)
+{
+	AggState   *agg = state->agg;
+	TupleTableSlot *input;
+	HeapTuple	first;
+	MemoryContext oldcontext;
+
+	ReScanExprContext(agg->aggcontexts[0]);
+	input = fill_input_slot(state, batch, row);
+	first = ExecCopySlotHeapTuple(input);
+	ExecForceStoreHeapTuple(first, agg->ss.ss_ScanTupleSlot, true);
+	oldcontext = MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
+	VectorAggInitializePlain(agg);
+	MemoryContextSwitchTo(oldcontext);
+	state->group_open = true;
+}
+
+TupleTableSlot *
+VectorAggProcessBatchSorted(VectorAggState *state, VectorBatch *batch,
+							int *position)
+{
+	AggState   *agg = state->agg;
+
+	if (batch->nselected == 0)
+		return NULL;
+
+	eval_arguments(state, batch);
+	while (*position < batch->nselected)
+	{
+		int			row = VectorBatchSelectedRow(batch, *position);
+
+		if ((*position & 0xff) == 0)
+			CHECK_FOR_INTERRUPTS();
+		if (state->group_open &&
+			!VectorAggSameGroup(agg, fill_input_slot(state, batch, row)))
+		{
+			TupleTableSlot *result = VectorAggRetrieveGroup(agg);
+
+			state->group_open = false;
+			ResetExprContext(agg->tmpcontext);
+			if (result != NULL)
+				return result;	/* resume at this row, the next group's first */
+		}
+		if (!state->group_open)
+			start_sorted_group(state, batch, row);
+		advance_row(state, agg->pergroups[0], row);
+		(*position)++;
+	}
+	ResetExprContext(agg->tmpcontext);
+	return NULL;
+}
+
+void
+VectorAggFinish(VectorAggState *state)
+{
+	if (state->input_done)
+		return;
+	VectorAggFinishInput(state->agg);
+	state->input_done = true;
+}
+
+TupleTableSlot *
+VectorAggNext(VectorAggState *state)
+{
+	TupleTableSlot *result;
+
+	Assert(state->input_done);
+	if (state->output_done)
+		return NULL;
+
+	if (state->agg->aggstrategy == AGG_SORTED && state->group_open)
+	{
+		TupleTableSlot *result;
+
+		ResetExprContext(state->agg->tmpcontext);
+		result = VectorAggRetrieveGroup(state->agg);
+		state->group_open = false;
+		if (result != NULL)
+			return result;
+	}
+
+	if (state->agg->aggstrategy == AGG_HASHED)
+	{
+		result = VectorAggRetrieveHashed(state->agg);
+		if (result == NULL)
+			state->output_done = true;
+		return result;
+	}
+
+	if (state->agg->aggstrategy == AGG_SORTED)
+	{
+		state->output_done = true;
+		return NULL;
+	}
+
+	state->output_done = true;
+	return VectorAggRetrievePlain(state->agg);
+}
+
+void
+VectorAggReset(VectorAggState *state)
+{
+	ExecReScanAgg(state->agg);
+	if (state->agg->aggstrategy == AGG_PLAIN)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(
+			state->agg->ss.ps.state->es_query_cxt);
+
+		VectorAggInitializePlain(state->agg);
+		MemoryContextSwitchTo(oldcontext);
+	}
+	/* A reused hash table must be iterated, not populated a second time. */
+	state->input_done = state->agg->aggstrategy == AGG_HASHED &&
+		state->agg->table_filled;
+	state->group_open = false;
+	state->output_done = false;
+}

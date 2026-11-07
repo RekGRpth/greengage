@@ -30,4 +30,11 @@ extern void ExecSortInitializeDSM(SortState *node, ParallelContext *pcxt);
 extern void ExecSortInitializeWorker(SortState *node, ParallelWorkerContext *pwcxt);
 extern void ExecSortRetrieveInstrumentation(SortState *node);
 
+/* Batch input support for vector regions. */
+extern bool VectorSortPlanIsSupported(Sort *sort);
+extern void VectorSortPutTuple(SortState *node, TupleTableSlot *slot);
+extern void VectorSortFinish(SortState *node);
+extern TupleTableSlot *VectorSortNext(SortState *node);
+extern TupleTableSlot *VectorSortExec(PlanState *pstate);
+
 #endif							/* NODESORT_H */

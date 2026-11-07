@@ -1,0 +1,1802 @@
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS vector_aoco_test;
+DROP TABLE IF EXISTS vector_aoco_small;
+DROP TABLE IF EXISTS vector_join_l;
+DROP TABLE IF EXISTS vector_join_r;
+DROP TABLE IF EXISTS vector_aoco_wide;
+DROP TABLE IF EXISTS vector_aoco_spill;
+DROP TABLE IF EXISTS vector_aoco_spill_wide;
+DROP TABLE IF EXISTS vector_heap_test;
+DROP TABLE IF EXISTS vector_aoro_test;
+DROP TABLE IF EXISTS vector_limit_test;
+DROP TABLE IF EXISTS vector_unique_test;
+CREATE TABLE vector_aoco_test
+(id int4, big int8, val text, num numeric(12,2))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_test
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(1, 5000) AS g;
+ALTER TABLE vector_aoco_test ADD COLUMN later int4 DEFAULT 42;
+INSERT INTO vector_aoco_test
+SELECT 5000 + g, (5000 + g)::int8 * 10, 'new' || g, 1.25, g
+FROM generate_series(1, 10) AS g;
+DELETE FROM vector_aoco_test WHERE id % 11 = 0;
+ANALYZE vector_aoco_test;
+CREATE TABLE vector_aoco_small (id int4, val text)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_small
+SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
+ANALYZE vector_aoco_small;
+CREATE TABLE vector_limit_test (id int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
+INSERT INTO vector_limit_test
+SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
+ANALYZE vector_limit_test;
+CREATE TABLE vector_unique_test (id int4, grp int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (grp);
+INSERT INTO vector_unique_test
+SELECT g, g % 100, 'v' || g FROM generate_series(1, 10000) AS g;
+ANALYZE vector_unique_test;
+CREATE TABLE vector_heap_test (id int4, big int8, val text, num numeric(12,2))
+DISTRIBUTED BY (id);
+CREATE TABLE vector_aoro_test (id int4, big int8, val text, num numeric(12,2))
+WITH (appendonly = true, orientation = row) DISTRIBUTED BY (id);
+INSERT INTO vector_heap_test
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(1, 10000) AS g;
+INSERT INTO vector_aoro_test SELECT * FROM vector_heap_test;
+ANALYZE vector_heap_test;
+ANALYZE vector_aoro_test;
+CREATE TABLE vector_join_l (id int4, l text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+CREATE TABLE vector_join_r (id int4, r text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_join_l SELECT g, 'l' || g FROM generate_series(1, 5) AS g;
+INSERT INTO vector_join_r VALUES (3, 'r3a'), (3, 'r3b'), (4, 'r4'), (6, 'r6'), (8, 'r8');
+ANALYZE vector_join_l;
+ANALYZE vector_join_r;
+CREATE TABLE vector_aoco_wide (id int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
+ANALYZE vector_aoco_wide;
+CREATE TABLE vector_aoco_spill (grp int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (grp);
+INSERT INTO vector_aoco_spill SELECT g % 10, repeat('x', 1000) FROM generate_series(1, 5000) AS g;
+ANALYZE vector_aoco_spill;
+CREATE TABLE vector_aoco_spill_wide (id int4, pad text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_aoco_spill_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 50000) AS g;
+ANALYZE vector_aoco_spill_wide;
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
+FROM vector_aoco_test ORDER BY id LIMIT 3;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: gg_vector_region.c1
+         ->  Limit
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Sort
+                           Sort Key: vector_aoco_test.id
+                           ->  Seq Scan on vector_aoco_test
+(9 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, val FROM vector_limit_test LIMIT 3;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)
+   ->  Custom Scan (GGVectorRegion)
+         ->  Limit
+               ->  Seq Scan on vector_limit_test
+(5 rows)
+
+SELECT id, val FROM vector_limit_test LIMIT 3;
+ id | val 
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+(3 rows)
+
+SELECT id FROM vector_limit_test LIMIT 0;
+ id 
+----
+(0 rows)
+
+SELECT id FROM vector_limit_test OFFSET 8;
+ id 
+----
+  9
+ 10
+(2 rows)
+
+SELECT id FROM vector_limit_test LIMIT 3 OFFSET 8;
+ id 
+----
+  9
+ 10
+(2 rows)
+
+SELECT id FROM vector_limit_test LIMIT NULL OFFSET NULL;
+ id 
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+SELECT id FROM vector_limit_test LIMIT 3 OFFSET 100;
+ id 
+----
+(0 rows)
+
+SELECT id FROM vector_limit_test LIMIT -1;
+ERROR:  LIMIT must not be negative
+SELECT id FROM vector_limit_test OFFSET -1;
+ERROR:  OFFSET must not be negative
+SELECT sum(big), sum(id), min(num), max(num), min(later), max(later)
+FROM vector_aoco_test;
+    sum    |   sum    | min  |  max  | min | max 
+-----------+----------+------+-------+-----+-----
+ 114114150 | 11411415 | 0.00 | 33.00 |   1 |  42
+(1 row)
+
+SELECT id, big, val, num, later
+FROM vector_aoco_test
+ORDER BY id OFFSET 2490 LIMIT 3;
+  id  |  big  |  val  |  num  | later 
+------+-------+-------+-------+-------
+ 2740 | 27400 | v2740 | 13.33 |    42
+ 2741 | 27410 | v2741 | 13.67 |    42
+ 2742 | 27420 | v2742 | 14.00 |    42
+(3 rows)
+
+SELECT val, count(*), sum(big)
+FROM vector_aoco_test
+GROUP BY val ORDER BY val LIMIT 3;
+  val  | count |  sum  
+-------+-------+-------
+ new1  |     1 | 50010
+ new10 |     1 | 50100
+ new2  |     1 | 50020
+(3 rows)
+
+SELECT count(*), sum(a.id), sum(b.id),
+       sum(length(a.val)), sum(length(b.val))
+FROM vector_aoco_small a CROSS JOIN vector_aoco_small b;
+ count | sum | sum | sum | sum 
+-------+-----+-----+-----+-----
+   100 | 550 | 550 | 210 | 210
+(1 row)
+
+SELECT id, big, val, num, later
+FROM vector_aoco_test
+WHERE id % 3 = 0 AND big > 25000 AND (val IS NULL OR num < 20.0)
+ORDER BY id LIMIT 5;
+  id  |  big  |  val  | num  | later 
+------+-------+-------+------+-------
+ 2502 | 25020 | v2502 | 0.67 |    42
+ 2505 | 25050 | v2505 | 1.67 |    42
+ 2511 | 25110 | v2511 | 3.67 |    42
+ 2514 | 25140 | v2514 | 4.67 |    42
+ 2517 | 25170 | v2517 | 5.67 |    42
+(5 rows)
+
+SELECT sum(id) FROM vector_aoco_small
+WHERE id < 0 AND 1 / (id - id) = 1;
+ sum 
+-----
+    
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small
+WHERE id >= 0 OR 1 / (id - id) = 1;
+ sum 
+-----
+  55
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small WHERE NOT (id < 5);
+ sum 
+-----
+  45
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small WHERE (val || '') = 'v' || id;
+ sum 
+-----
+  55
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_test WHERE length(val) > 0;
+   sum   
+---------
+ 9784790
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE id IN (1, 2, 3, 5000, 99999);
+ count 
+-------
+     4
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE id NOT IN (4, 5, 6000);
+ count 
+-------
+  4553
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE val IN ('new1', 'new2', 'v10', 'nope');
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE num IN (1.25, 0.33);
+ count 
+-------
+    55
+(1 row)
+
+SELECT id, ARRAY[id, NULL, id + 1] AS a FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ id |     a      
+----+------------
+  1 | {1,NULL,2}
+  2 | {2,NULL,3}
+  3 | {3,NULL,4}
+(3 rows)
+
+SELECT id, id = ANY(ARRAY[id % 5, 2]) AS any_match FROM vector_aoco_small ORDER BY id;
+ id | any_match 
+----+-----------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | f
+  6 | f
+  7 | f
+  8 | f
+  9 | f
+ 10 | f
+(10 rows)
+
+SELECT count(*) FROM vector_aoco_small WHERE id = ANY(ARRAY[]::int[]);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id = ANY(NULL::int[]);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id <> ALL(ARRAY[id % 5, 2]);
+ count 
+-------
+     6
+(1 row)
+
+SELECT id, (ARRAY[id, id + 1, id + 2])[2] AS second FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ id | second 
+----+--------
+  1 |      2
+  2 |      3
+  3 |      4
+(3 rows)
+
+SELECT id, (ARRAY[id, id + 1, id + 2])[id] AS elem FROM vector_aoco_small WHERE id <= 3 ORDER BY id;
+ id | elem 
+----+------
+  1 |    1
+  2 |    3
+  3 |    5
+(3 rows)
+
+SELECT (ARRAY[1, 2, 3])[0] AS below, (ARRAY[1, 2, 3])[NULL] AS null_index,
+       (NULL::int[])[1] AS null_array;
+ below | null_index | null_array 
+-------+------------+------------
+       |            |           
+(1 row)
+
+SELECT (ARRAY[1, 2, 3, 4])[2:3] AS mid, (ARRAY[1, 2, 3, 4])[2:] AS tail,
+       (ARRAY[1, 2, 3, 4])[:2] AS head;
+  mid  |  tail   | head  
+-------+---------+-------
+ {2,3} | {2,3,4} | {1,2}
+(1 row)
+
+SELECT id, (ARRAY[1, 2, 3, 4])[id:3] AS part FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ id |  part   
+----+---------
+  1 | {1,2,3}
+  2 | {2,3}
+  3 | {3}
+(3 rows)
+
+SELECT (ARRAY[1, 2, 3, 4])[NULL:2] AS null_lower, (ARRAY[1, 2, 3, 4])[2:NULL] AS null_upper;
+ null_lower | null_upper 
+------------+------------
+            | 
+(1 row)
+
+SELECT (ARRAY[1, 2, 3, 4])[1:2][1] AS nested;
+ nested 
+--------
+ {}
+(1 row)
+
+SELECT ARRAY[1, 2, NULL]::text[] AS a;
+     a      
+------------
+ {1,2,NULL}
+(1 row)
+
+SELECT ARRAY['1', '2', '3']::int[] AS a;
+    a    
+---------
+ {1,2,3}
+(1 row)
+
+SELECT ARRAY[1.25, 2.5]::int[] AS a;
+   a   
+-------
+ {1,3}
+(1 row)
+
+SELECT ARRAY[1, 2, 3]::oid[] AS a;
+    a    
+---------
+ {1,2,3}
+(1 row)
+
+SELECT NULL::int[]::text[] AS a;
+ a 
+---
+ 
+(1 row)
+
+SELECT (ARRAY[1, 2, 3, 4])[1:2]::text[] AS a;
+   a   
+-------
+ {1,2}
+(1 row)
+
+CREATE TYPE vector_pair AS (a int4, b text);
+SELECT ROW(1, 'x') AS anon_pair, ROW(1, 'x')::vector_pair AS named_pair;
+ anon_pair | named_pair 
+-----------+------------
+ (1,x)     | (1,x)
+(1 row)
+
+SELECT (ROW(id, 'v' || id)::vector_pair).a AS a,
+       (ROW(id, 'v' || id)::vector_pair).b AS b
+FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ a | b  
+---+----
+ 1 | v1
+ 2 | v2
+ 3 | v3
+(3 rows)
+
+SELECT (ROW(1, NULL)::vector_pair).b AS null_field;
+ null_field 
+------------
+ 
+(1 row)
+
+SELECT (NULL::vector_pair).a AS null_record;
+ null_record 
+-------------
+            
+(1 row)
+
+SELECT sum((ROW(id, id + 1)::vector_pair).a) FROM vector_aoco_small;
+ sum 
+-----
+  55
+(1 row)
+
+DROP TYPE vector_pair;
+CREATE TABLE vector_parent (a int4, b text);
+CREATE TABLE vector_child (c int4) INHERITS (vector_parent);
+SELECT (ROW(1, 'x', 5)::vector_child)::vector_parent AS converted;
+ converted 
+-----------
+ (1,x)
+(1 row)
+
+SELECT ((ROW(1, 'x', 5)::vector_child)::vector_parent).a AS a,
+       ((ROW(1, 'x', 5)::vector_child)::vector_parent).b AS b;
+ a | b 
+---+---
+ 1 | x
+(1 row)
+
+SELECT (NULL::vector_child)::vector_parent AS null_conversion;
+ null_conversion 
+-----------------
+ 
+(1 row)
+
+SELECT sum(((ROW(id, 'v' || id, id + 1)::vector_child)::vector_parent).a)
+FROM vector_aoco_small;
+ sum 
+-----
+  55
+(1 row)
+
+DROP TABLE vector_child, vector_parent;
+SELECT vector_aoco_small FROM vector_aoco_small ORDER BY id LIMIT 1;
+ vector_aoco_small 
+-------------------
+ (1,v1)
+(1 row)
+
+SELECT (vector_aoco_small).id AS id, (vector_aoco_small).val AS val
+FROM vector_aoco_small WHERE id < 4 ORDER BY id;
+ id | val 
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+(3 rows)
+
+SELECT (vector_heap_test).id AS id FROM vector_heap_test WHERE id < 4 ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT sum((vector_aoco_small).id) FROM vector_aoco_small;
+ sum 
+-----
+  55
+(1 row)
+
+CREATE TABLE vector_whole_test (id int4, val text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+INSERT INTO vector_whole_test VALUES (1, 'x'), (2, 'y');
+ALTER TABLE vector_whole_test DROP COLUMN val;
+SELECT vector_whole_test FROM vector_whole_test ORDER BY id;
+ vector_whole_test 
+-------------------
+ (1)
+ (2)
+(2 rows)
+
+DROP TABLE vector_whole_test;
+SELECT current_user = session_user AS same_user,
+       current_database() = current_catalog AS same_db,
+       current_schema() = current_schema AS same_schema,
+       current_role = current_user AS same_role;
+ same_user | same_db | same_schema | same_role 
+-----------+---------+-------------+-----------
+ t         | t       | t           | t
+(1 row)
+
+SELECT current_date = current_date AS d, current_time = current_time AS t,
+       current_timestamp = current_timestamp AS ts,
+       localtime = localtime AS lt, localtimestamp = localtimestamp AS lts;
+ d | t | ts | lt | lts 
+---+---+----+----+-----
+ t | t | t  | t  | t
+(1 row)
+
+SELECT current_time(2) = current_time(2) AS t,
+       current_timestamp(2) = current_timestamp(2) AS ts,
+       localtime(2) = localtime(2) AS lt,
+       localtimestamp(2) = localtimestamp(2) AS lts;
+ t | ts | lt | lts 
+---+----+----+-----
+ t | t  | t  | t
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE current_schema IS NOT NULL;
+ count 
+-------
+    10
+(1 row)
+
+CREATE SEQUENCE vector_seq;
+SELECT nextval('vector_seq') FROM vector_limit_test LIMIT 3;
+ nextval 
+---------
+       1
+       2
+       3
+(3 rows)
+
+SELECT nextval('vector_seq') FROM vector_limit_test LIMIT 3;
+ nextval 
+---------
+       4
+       5
+       6
+(3 rows)
+
+DROP SEQUENCE vector_seq;
+SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL))
+FROM vector_aoco_test;
+ sum  | count | count 
+------+-------+-------
+ 4554 |  3904 |  3905
+(1 row)
+
+SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;
+ id | nz 
+----+----
+  1 |  1
+  2 |  2
+  3 |   
+  4 |  1
+  5 |  2
+  6 |   
+(6 rows)
+
+SELECT count(*) FROM vector_aoco_test WHERE nullif(id % 3, 0) IS NULL;
+ count 
+-------
+  1519
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
+ count 
+-------
+     9
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
+ count 
+-------
+  4554
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE val IS NOT DISTINCT FROM NULL;
+ count 
+-------
+   650
+(1 row)
+
+SELECT id, greatest(id % 5, 2) AS g, least(id % 5, 2) AS l
+FROM vector_aoco_small ORDER BY id;
+ id | g | l 
+----+---+---
+  1 | 2 | 1
+  2 | 2 | 2
+  3 | 3 | 2
+  4 | 4 | 2
+  5 | 2 | 0
+  6 | 2 | 1
+  7 | 2 | 2
+  8 | 3 | 2
+  9 | 4 | 2
+ 10 | 2 | 0
+(10 rows)
+
+SELECT sum(greatest(id % 3, 1)), sum(least(id % 3, 1)) FROM vector_aoco_test;
+ sum  | sum  
+------+------
+ 6073 | 3036
+(1 row)
+
+SELECT count(greatest(val, 'fallback')), count(least(val, 'fallback')),
+       count(greatest(val, NULL)), count(least(val, NULL))
+FROM vector_aoco_test;
+ count | count | count | count 
+-------+-------+-------+-------
+  4555 |  4555 |  3905 |  3905
+(1 row)
+
+SELECT sum(greatest(num, 10)), sum(least(num, 10)) FROM vector_aoco_test;
+   sum    |   sum    
+----------+----------
+ 82110.00 | 38406.25
+(1 row)
+
+SELECT coalesce(val, 'MISSING'), count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1 LIMIT 4;
+ coalesce | count 
+----------+-------
+ MISSING  |   650
+ new1     |     1
+ new10    |     1
+ new2     |     1
+(4 rows)
+
+SELECT sum(coalesce(later, 0)), count(coalesce(val, 'x')) FROM vector_aoco_test;
+  sum   | count 
+--------+-------
+ 190982 |  4555
+(1 row)
+
+SELECT sum(CASE WHEN id % 2 = 0 THEN big ELSE -big END) FROM vector_aoco_test;
+  sum  
+-------
+ 50130
+(1 row)
+
+SELECT CASE WHEN num > 20 THEN 'high' WHEN num > 5 THEN 'mid' ELSE 'low' END AS bucket, count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ bucket | count 
+--------+-------
+ high   |  1770
+ low    |   739
+ mid    |  2046
+(3 rows)
+
+SELECT count(*) FROM vector_aoco_test
+WHERE CASE WHEN val IS NULL THEN false ELSE length(val) > 4 END;
+ count 
+-------
+  3118
+(1 row)
+
+SELECT count(*), sum(CASE WHEN val IS NULL THEN 1 ELSE 0 END) FROM vector_aoco_test;
+ count | sum 
+-------+-----
+  4555 | 650
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (id % 2 = 0) IS TRUE;
+ count 
+-------
+  2278
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (id % 11 = 0) IS NOT TRUE;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS UNKNOWN;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE (val IS NULL) IS NOT UNKNOWN;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT sum(CASE WHEN id % 3 = 0 THEN num * 2 WHEN id % 3 = 1 THEN num ELSE NULL END)
+FROM vector_aoco_test;
+   sum    
+----------
+ 74813.60
+(1 row)
+
+SELECT CASE id % 4 WHEN 0 THEN 'zero' WHEN 1 THEN 'one' ELSE 'other' END AS bucket,
+       count(*)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ bucket | count 
+--------+-------
+ one    |  1139
+ other  |  2277
+ zero   |  1139
+(3 rows)
+
+SELECT sum(CASE id % 3 WHEN 0 THEN big WHEN 1 THEN -big ELSE 0 END)
+FROM vector_aoco_test;
+  sum  
+-------
+ 66840
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test
+WHERE CASE val WHEN 'new1' THEN true WHEN NULL THEN true ELSE false END;
+ count 
+-------
+     1
+(1 row)
+
+SELECT sum(CASE id % 2 WHEN 0 THEN CASE WHEN num > 10 THEN 1 ELSE 2 END ELSE 0 END)
+FROM vector_aoco_test;
+ sum  
+------
+ 3011
+(1 row)
+
+SELECT sum(CASE id % 2 WHEN 0 THEN CASE id % 3 WHEN 0 THEN 1 ELSE 2 END ELSE 0 END)
+FROM vector_aoco_test;
+ sum  
+------
+ 3796
+(1 row)
+
+SELECT sum(id) FROM vector_aoco_small
+WHERE CASE id WHEN 0 THEN 1 / (id - id) = 1 ELSE true END;
+ sum 
+-----
+  55
+(1 row)
+
+SELECT count(CASE id % 10 WHEN 0 THEN id END) FROM vector_aoco_test;
+ count 
+-------
+   456
+(1 row)
+
+SELECT id, big + 1 AS b1 FROM vector_aoco_test ORDER BY id LIMIT 5;
+ id | b1 
+----+----
+  1 | 11
+  2 | 21
+  3 | 31
+  4 | 41
+  5 | 51
+(5 rows)
+
+SELECT id, CASE id % 2 WHEN 0 THEN 'even' ELSE 'odd' END AS parity
+FROM vector_aoco_test WHERE id BETWEEN 4998 AND 5010 ORDER BY id;
+  id  | parity 
+------+--------
+ 4998 | even
+ 4999 | odd
+ 5000 | even
+ 5001 | odd
+ 5002 | even
+ 5003 | odd
+ 5004 | even
+ 5006 | even
+ 5007 | odd
+ 5008 | even
+ 5009 | odd
+ 5010 | even
+(12 rows)
+
+SELECT id, coalesce(val, 'NONE') FROM vector_aoco_test WHERE id % 500 = 0 ORDER BY id;
+  id  | coalesce 
+------+----------
+  500 | v500
+ 1000 | v1000
+ 1500 | v1500
+ 2000 | v2000
+ 2500 | v2500
+ 3000 | v3000
+ 3500 | NONE
+ 4000 | v4000
+ 4500 | v4500
+ 5000 | v5000
+(10 rows)
+
+SELECT id FROM vector_aoco_test ORDER BY big DESC LIMIT 3;
+  id  
+------
+ 5010
+ 5009
+ 5008
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: gg_vector_region.id
+         ->  Limit
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Sort
+                           Sort Key: vector_aoco_test.id DESC
+                           ->  Seq Scan on vector_aoco_test
+(9 rows)
+
+SELECT id, big FROM vector_aoco_test ORDER BY id DESC LIMIT 5;
+  id  |  big  
+------+-------
+ 5010 | 50100
+ 5009 | 50090
+ 5008 | 50080
+ 5007 | 50070
+ 5006 | 50060
+(5 rows)
+
+SELECT id, val FROM vector_aoco_test WHERE id % 500 = 0
+ORDER BY val NULLS FIRST, id;
+  id  |  val  
+------+-------
+ 3500 | 
+ 1000 | v1000
+ 1500 | v1500
+ 2000 | v2000
+ 2500 | v2500
+ 3000 | v3000
+ 4000 | v4000
+ 4500 | v4500
+  500 | v500
+ 5000 | v5000
+(10 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT ON (grp) id, val FROM vector_unique_test
+WHERE id <= 20 ORDER BY grp, id;
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.c3, gg_vector_region.id
+   ->  Custom Scan (GGVectorRegion)
+         ->  Unique
+               Group Key: vector_unique_test.grp
+               ->  Sort
+                     Sort Key: vector_unique_test.grp, vector_unique_test.id
+                     ->  Seq Scan on vector_unique_test
+                           Filter: (id <= 20)
+(10 rows)
+
+SELECT DISTINCT ON (grp) id, val FROM vector_unique_test
+WHERE id <= 20 ORDER BY grp, id;
+ id | val 
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+  4 | v4
+  5 | v5
+  6 | v6
+  7 | v7
+  8 | v8
+  9 | v9
+ 10 | v10
+ 11 | v11
+ 12 | v12
+ 13 | v13
+ 14 | v14
+ 15 | v15
+ 16 | v16
+ 17 | v17
+ 18 | v18
+ 19 | v19
+ 20 | v20
+(20 rows)
+
+SELECT DISTINCT ON (grp) id FROM vector_unique_test
+ORDER BY grp, id OFFSET 1 LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+SELECT DISTINCT ON (grp) id FROM vector_unique_test ORDER BY grp, id LIMIT 3;
+ id  
+-----
+ 100
+   1
+   2
+(3 rows)
+
+SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
+FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
+ERROR:  column "t.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s...
+               ^
+SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
+FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
+ id | has_s 
+----+-------
+  1 | f
+  2 | f
+  3 | f
+  4 | f
+  5 | f
+  6 | f
+  7 | f
+(7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.c1
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Custom Scan (GGVectorRegion)
+                       ->  Partial Aggregate
+                             ->  Seq Scan on vector_aoco_small vector_aoco_small_1
+   ->  Sort
+         Sort Key: gg_vector_region.c1
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_aoco_small
+                     Filter: (id > ($0 - 2))
+(14 rows)
+
+SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
+ id 
+----
+  9
+ 10
+(2 rows)
+
+SELECT (SELECT max(id) FROM vector_aoco_small) AS m;
+ m  
+----
+ 10
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE big > (SELECT max(id) FROM vector_aoco_small);
+ count 
+-------
+  4554
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test WHERE id IN (SELECT id FROM vector_aoco_small);
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id NOT IN (SELECT id FROM vector_join_r);
+ count 
+-------
+     6
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vector_aoco_test l
+JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 10 = r.g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Hash Join
+                           Hash Cond: ((l.id % 10) = r.g)
+                           ->  Seq Scan on vector_aoco_test l
+                           ->  Hash
+                                 ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                       ->  Subquery Scan on r
+                                             ->  HashAggregate
+                                                   Group Key: gg_vector_region.c1
+                                                   ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                         Hash Key: gg_vector_region.c1
+                                                         ->  Custom Scan (GGVectorRegion)
+                                                               ->  Seq Scan on vector_aoco_small
+(17 rows)
+
+SELECT count(*) FROM vector_aoco_test l
+JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 10 = r.g;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test l
+LEFT JOIN (SELECT id % 3 AS g FROM vector_aoco_small GROUP BY 1) r
+  ON l.id % 3 = r.g;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*), sum(id) FROM vector_aoco_small WHERE id < 0;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT val, count(*) FROM vector_aoco_small WHERE id < 0 GROUP BY val;
+ val | count 
+-----+-------
+(0 rows)
+
+SELECT later, val, count(*), sum(big), min(num), max(num), min(val), max(val)
+FROM vector_aoco_test
+GROUP BY later, val ORDER BY later, val LIMIT 5;
+ later | val  | count |  sum  | min  | max  | min  | max  
+-------+------+-------+-------+------+------+------+------
+     1 | new1 |     1 | 50010 | 1.25 | 1.25 | new1 | new1
+     2 | new2 |     1 | 50020 | 1.25 | 1.25 | new2 | new2
+     3 | new3 |     1 | 50030 | 1.25 | 1.25 | new3 | new3
+     4 | new4 |     1 | 50040 | 1.25 | 1.25 | new4 | new4
+     6 | new6 |     1 | 50060 | 1.25 | 1.25 | new6 | new6
+(5 rows)
+
+SELECT count(*) FILTER (WHERE id % 2 = 0),
+       sum(id) FILTER (WHERE id % 3 = 0),
+       count(val) FILTER (WHERE num > 10)
+FROM vector_aoco_test;
+ count |   sum   | count 
+-------+---------+-------
+  2278 | 3807147 |  2687
+(1 row)
+
+SELECT sum(1 / (id - id)) FILTER (WHERE id < 0) FROM vector_aoco_small;
+ sum 
+-----
+    
+(1 row)
+
+SELECT id % 3 AS g, count(*) FILTER (WHERE val IS NULL),
+       sum(id) FILTER (WHERE id % 2 = 0)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ g | count |   sum   
+---+-------+---------
+ 0 |   217 | 1906080
+ 1 |   217 | 1902738
+ 2 |   216 | 1899396
+(3 rows)
+
+SELECT count(*) FROM vector_aoco_test HAVING count(*) > 4000;
+ count 
+-------
+  4555
+(1 row)
+
+SELECT count(*) FROM vector_aoco_small WHERE id < 0 HAVING count(*) > 0;
+ count 
+-------
+(0 rows)
+
+SELECT id % 3 AS g, count(*) FROM vector_aoco_test
+GROUP BY 1 HAVING count(*) > 1500 AND sum(id) > 0 ORDER BY 1;
+ g | count 
+---+-------
+ 0 |  1519
+ 1 |  1518
+ 2 |  1518
+(3 rows)
+
+SELECT id % 4 AS g, count(*) FILTER (WHERE val IS NULL) AS nulls
+FROM vector_aoco_test GROUP BY 1 HAVING count(*) FILTER (WHERE val IS NULL) > 100
+ORDER BY 1;
+ g | nulls 
+---+-------
+ 0 |   162
+ 1 |   162
+ 2 |   163
+ 3 |   163
+(4 rows)
+
+SELECT val, count(*) FROM vector_aoco_small GROUP BY val HAVING count(*) = 0;
+ val | count 
+-----+-------
+(0 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM vector_aoco_small;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on vector_aoco_small
+(6 rows)
+
+SELECT count(DISTINCT id), sum(DISTINCT id % 100),
+       count(DISTINCT val), sum(DISTINCT num)
+FROM vector_aoco_test;
+ count | sum  | count |   sum   
+-------+------+-------+---------
+  4555 | 4950 |  3905 | 1651.25
+(1 row)
+
+SELECT count(DISTINCT id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_test;
+ count 
+-------
+  2278
+(1 row)
+
+SELECT count(DISTINCT id) FROM vector_aoco_small WHERE id < 0;
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT string_agg(val, ',' ORDER BY id DESC) FROM vector_aoco_small;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_aoco_small
+(5 rows)
+
+SELECT string_agg(val, ',' ORDER BY id) FROM vector_aoco_small;
+           string_agg           
+--------------------------------
+ v1,v2,v3,v4,v5,v6,v7,v8,v9,v10
+(1 row)
+
+SELECT string_agg(val, ',' ORDER BY id DESC) FROM vector_aoco_small;
+           string_agg           
+--------------------------------
+ v10,v9,v8,v7,v6,v5,v4,v3,v2,v1
+(1 row)
+
+SELECT array_agg(id ORDER BY id DESC) FROM vector_aoco_small WHERE id <= 5;
+  array_agg  
+-------------
+ {5,4,3,2,1}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) FILTER (WHERE id % 2 = 0) FROM vector_aoco_small;
+  array_agg   
+--------------
+ {2,4,6,8,10}
+(1 row)
+
+SELECT array_agg(DISTINCT id % 3 ORDER BY id % 3) FROM vector_aoco_small;
+ array_agg 
+-----------
+ {0,1,2}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) FROM vector_aoco_small WHERE id < 0;
+ array_agg 
+-----------
+ 
+(1 row)
+
+SELECT string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
+FROM vector_aoco_test WHERE id < 10;
+               string_agg                
+-----------------------------------------
+ v9:9|v8:8|v6:6|v5:5|v4:4|v3:3|v2:2|v1:1
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT id % 3 AS g, string_agg(val, ',' ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.g
+   ->  Custom Scan (GGVectorRegion)
+         ->  GroupAggregate
+               Group Key: ((vector_aoco_small.id % 3))
+               ->  Sort
+                     Sort Key: ((vector_aoco_small.id % 3))
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: ((vector_aoco_small.id % 3))
+                           ->  Seq Scan on vector_aoco_small
+(11 rows)
+
+SELECT id % 3 AS g, count(DISTINCT val), sum(DISTINCT id % 10)
+FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
+ g | count | sum 
+---+-------+-----
+ 0 |  1302 |  45
+ 1 |  1301 |  45
+ 2 |  1302 |  45
+(3 rows)
+
+SELECT id % 3 AS g, string_agg(val, ',' ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g |  string_agg  
+---+--------------
+ 0 | v3,v6,v9
+ 1 | v1,v4,v7,v10
+ 2 | v2,v5,v8
+(3 rows)
+
+SELECT id % 2 AS g, string_agg(val || ':' || id, '|' ORDER BY num DESC, id)
+FROM vector_aoco_test WHERE id < 20 GROUP BY 1 ORDER BY 1;
+ g |                   string_agg                    
+---+-------------------------------------------------
+ 0 | v18:18|v16:16|v12:12|v10:10|v8:8|v6:6|v4:4|v2:2
+ 1 | v19:19|v17:17|v15:15|v13:13|v9:9|v5:5|v3:3|v1:1
+(2 rows)
+
+SELECT id % 3 AS g, array_agg(id ORDER BY id) FILTER (WHERE val IS NOT NULL)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g | array_agg  
+---+------------
+ 0 | {3,6,9}
+ 1 | {1,4,7,10}
+ 2 | {2,5,8}
+(3 rows)
+
+SELECT id % 3 AS g, count(DISTINCT id) FROM vector_aoco_small
+GROUP BY 1 HAVING count(DISTINCT id) > 3 ORDER BY 1;
+ g | count 
+---+-------
+ 1 |     4
+(1 row)
+
+SELECT id % 100 AS g, array_agg(DISTINCT id % 10 ORDER BY id % 10)
+FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
+ g | array_agg 
+---+-----------
+ 0 | {0}
+ 1 | {1}
+ 2 | {2}
+(3 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_aoco_small
+(5 rows)
+
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id),
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small;
+ percentile_cont | percentile_disc 
+-----------------+-----------------
+             5.5 |               5
+(1 row)
+
+SELECT id % 3 AS g, percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
+ g | percentile_cont 
+---+-----------------
+ 0 |               6
+ 1 |             5.5
+ 2 |               5
+(3 rows)
+
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY num),
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY num)
+FROM vector_aoco_test;
+ percentile_cont | percentile_cont 
+-----------------+-----------------
+               8 |           24.67
+(1 row)
+
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id)
+FROM vector_aoco_small WHERE id < 0;
+ percentile_cont 
+-----------------
+                
+(1 row)
+
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY val)
+FROM vector_aoco_small WHERE id < 0;
+ percentile_disc 
+-----------------
+ 
+(1 row)
+
+SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
+ percentile_cont 
+-----------------
+                
+(1 row)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+(3 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+(6 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l RIGHT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+    |    |  6 | r6
+    |    |  8 | r8
+(5 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l FULL JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+    |    |  6 | r6
+    |    |  8 | r8
+(8 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  3
+  4
+(2 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  1
+  2
+  5
+(3 rows)
+
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_nljoin = off;
+EXPLAIN (COSTS OFF)
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region_1.c1, gg_vector_region_1.c4
+   ->  Sort
+         Sort Key: gg_vector_region_1.c1, gg_vector_region_1.c4
+         ->  Custom Scan (GGVectorRegion)
+               ->  Merge Join
+                     Merge Cond: (l.id = gg_vector_region.c1)
+                     ->  Sort
+                           Sort Key: l.id
+                           ->  Seq Scan on vector_join_l l
+                     ->  Custom Scan (GGVectorRegion)
+                           ->  Sort
+                                 Sort Key: r.id
+                                 ->  Seq Scan on vector_join_r r
+(15 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+(3 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+(6 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l RIGHT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+    |    |  6 | r6
+    |    |  8 | r8
+(5 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l FULL JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+    |    |  6 | r6
+    |    |  8 | r8
+(8 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  3
+  4
+(2 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  1
+  2
+  5
+(3 rows)
+
+SELECT count(*) FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id;
+ count 
+-------
+ 10000
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_nljoin;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_mergejoin = off;
+SET optimizer_enable_nljoin = on;
+EXPLAIN (COSTS OFF)
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region_1.c1, gg_vector_region_1.c4
+   ->  Sort
+         Sort Key: gg_vector_region_1.c1, gg_vector_region_1.c4
+         ->  Custom Scan (GGVectorRegion)
+               ->  Nested Loop
+                     Join Filter: (l.id = gg_vector_region.c1)
+                     ->  Seq Scan on vector_join_l l
+                     ->  Custom Scan (GGVectorRegion)
+                           ->  Materialize
+                                 ->  Seq Scan on vector_join_r r
+(12 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+(3 rows)
+
+SELECT l.id, l.l, r.id, r.r
+FROM vector_join_l l LEFT JOIN vector_join_r r ON l.id = r.id
+ORDER BY l.id, r.r;
+ id | l  | id |  r  
+----+----+----+-----
+  1 | l1 |    | 
+  2 | l2 |    | 
+  3 | l3 |  3 | r3a
+  3 | l3 |  3 | r3b
+  4 | l4 |  4 | r4
+  5 | l5 |    | 
+(6 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  3
+  4
+(2 rows)
+
+SELECT l.id FROM vector_join_l l
+WHERE NOT EXISTS (SELECT 1 FROM vector_join_r r WHERE r.id = l.id)
+ORDER BY l.id;
+ id 
+----
+  1
+  2
+  5
+(3 rows)
+
+SELECT l.id FROM vector_aoco_small l
+WHERE l.id NOT IN (SELECT r.id FROM vector_join_r r) ORDER BY l.id;
+ id 
+----
+  1
+  2
+  5
+  7
+  9
+ 10
+(6 rows)
+
+SELECT a.id, a.val, b.id, b.val
+FROM vector_aoco_small a CROSS JOIN vector_aoco_small b
+WHERE a.id <= 2 AND b.id <= 3 ORDER BY a.id, b.id;
+ id | val | id | val 
+----+-----+----+-----
+  1 | v1  |  1 | v1
+  1 | v1  |  2 | v2
+  1 | v1  |  3 | v3
+  2 | v2  |  1 | v1
+  2 | v2  |  2 | v2
+  2 | v2  |  3 | v3
+(6 rows)
+
+SELECT h.id, r.id FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id
+ORDER BY h.id LIMIT 5;
+ id | id 
+----+----
+  1 |  1
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+(5 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_mergejoin;
+RESET optimizer_enable_nljoin;
+ALTER DATABASE regression SET statement_mem = '400kB';
+SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
+ count 
+-------
+  5000
+(1 row)
+
+SELECT count(t2.pad) FROM vector_aoco_wide t1 FULL JOIN vector_aoco_wide t2 ON t1.id = t2.id AND t2.id < 1000;
+ count 
+-------
+  5000
+(1 row)
+
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_nljoin = off;
+SELECT count(t2.pad) FROM vector_aoco_wide t1 JOIN vector_aoco_wide t2 ON t1.id = t2.id;
+ count 
+-------
+  5000
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_nljoin;
+SELECT grp, count(*), sum(length(pad)) FROM vector_aoco_spill GROUP BY grp ORDER BY grp;
+ grp | count |  sum   
+-----+-------+--------
+   0 |   500 | 500000
+   1 |   500 | 500000
+   2 |   500 | 500000
+   3 |   500 | 500000
+   4 |   500 | 500000
+   5 |   500 | 500000
+   6 |   500 | 500000
+   7 |   500 | 500000
+   8 |   500 | 500000
+   9 |   500 | 500000
+(10 rows)
+
+SELECT count(*) FROM (SELECT id FROM vector_aoco_spill_wide GROUP BY id) s;
+ count 
+-------
+ 50000
+(1 row)
+
+SELECT count(DISTINCT id), sum(DISTINCT id % 100) FROM vector_aoco_spill_wide;
+ count | sum  
+-------+------
+ 50000 | 4950
+(1 row)
+
+SELECT id FROM vector_aoco_spill_wide ORDER BY pad, id LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT DISTINCT ON (grp) id FROM vector_unique_test ORDER BY grp, id LIMIT 3;
+ id  
+-----
+ 100
+   1
+   2
+(3 rows)
+
+ALTER DATABASE regression RESET statement_mem;
+EXPLAIN (COSTS OFF)
+SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test
+WHERE id % 2000 = 0 ORDER BY id;
+                   QUERY PLAN                   
+------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: gg_vector_region.id
+   ->  Sort
+         Sort Key: gg_vector_region.id
+         ->  Custom Scan (GGVectorRegion)
+               ->  Seq Scan on vector_heap_test
+                     Filter: ((id % 2000) = 0)
+(8 rows)
+
+SELECT id, id * 2 + 1 AS doubled FROM vector_heap_test
+WHERE id % 2000 = 0 ORDER BY id;
+  id   | doubled 
+-------+---------
+  2000 |    4001
+  4000 |    8001
+  6000 |   12001
+  8000 |   16001
+ 10000 |   20001
+(5 rows)
+
+SELECT count(*), sum(big), min(num), max(num), count(val) FROM vector_heap_test;
+ count |    sum    | min  |  max  | count 
+-------+-----------+------+-------+-------
+ 10000 | 500050000 | 0.00 | 33.00 |  8572
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vector_aoro_test
+WHERE val IS NULL OR num < 10;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on vector_aoro_test
+                           Filter: ((val IS NULL) OR (num < '10'::numeric))
+(7 rows)
+
+SELECT count(*) FROM vector_aoro_test WHERE val IS NULL OR num < 10;
+ count 
+-------
+  4000
+(1 row)
+
+SELECT count(*), sum(h.id), sum(r.big)
+FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id;
+ count |   sum    |    sum    
+-------+----------+-----------
+ 10000 | 50005000 | 500050000
+(1 row)
+
+SELECT count(*) FROM vector_heap_test h
+LEFT JOIN vector_aoro_test r ON h.id = r.id AND r.id < 100;
+ count 
+-------
+ 10000
+(1 row)
+
+SET gp_vectorized_execution = auto;
+SET gp_vectorized_min_rows = 1000000;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on vector_aoco_small
+(5 rows)
+
+SET gp_vectorized_min_rows = 1;
+EXPLAIN (COSTS OFF) SELECT sum(big), sum(id) FROM vector_aoco_test;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (GGVectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on vector_aoco_test
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM vector_aoco_test LIMIT 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Limit
+               ->  Seq Scan on vector_aoco_test
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, id * 2 AS d FROM vector_aoco_test LIMIT 3;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Limit
+               ->  Custom Scan (GGVectorRegion)
+                     ->  Seq Scan on vector_aoco_test
+(6 rows)
+
+SELECT sum(id * 2 + 1) FROM vector_aoco_test;
+   sum    
+----------
+ 22827385
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id, val FROM vector_aoco_test LIMIT 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Limit
+               ->  Seq Scan on vector_aoco_test
+(5 rows)
+
+SET statement_mem = '256kB';
+EXPLAIN (COSTS OFF) SELECT val, count(*) FROM vector_aoco_test GROUP BY val;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: val
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: val
+               ->  Seq Scan on vector_aoco_test
+(7 rows)
+
+RESET statement_mem;
+RESET gp_vectorized_min_rows;
+RESET gp_vectorized_execution;
+DROP TABLE vector_aoco_test;
+DROP TABLE vector_aoco_small;
+DROP TABLE vector_join_l;
+DROP TABLE vector_join_r;
+DROP TABLE vector_aoco_wide;
+DROP TABLE vector_aoco_spill;
+DROP TABLE vector_aoco_spill_wide;
+DROP TABLE vector_heap_test;
+DROP TABLE vector_aoro_test;
+DROP TABLE vector_limit_test;
+DROP TABLE vector_unique_test;
