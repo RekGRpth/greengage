@@ -303,6 +303,8 @@ SELECT a + 5, a - 5, a * 5, a / 5, a % 5,
        b + 5, b - 5, b * 5, b / 5, b % 5
 FROM vector_arithmetic_test WHERE id = 3;
 SELECT sum(s), min(s), max(s) FROM vector_arithmetic_test;
+SELECT sum(b), min(b), max(b) FROM vector_arithmetic_test;
+SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT sum(f4), sum(f8) FROM vector_float_test WHERE id = 2;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
 SELECT min(d), max(d), min(ts), max(ts), min(tz), max(tz) FROM vector_time_test;

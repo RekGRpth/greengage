@@ -733,6 +733,18 @@ SELECT sum(s), min(s), max(s) FROM vector_arithmetic_test;
   11 | -32768 | 32767
 (1 row)
 
+SELECT sum(b), min(b), max(b) FROM vector_arithmetic_test;
+ sum |         min          |         max         
+-----+----------------------+---------------------
+  23 | -9223372036854775808 | 9223372036854775807
+(1 row)
+
+SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
+ sum 
+-----
+    
+(1 row)
+
 SELECT sum(f4), sum(f8) FROM vector_float_test WHERE id = 2;
  sum | sum 
 -----+-----

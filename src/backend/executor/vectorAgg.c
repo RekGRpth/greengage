@@ -18,6 +18,7 @@
 #include "executor/vectorExpr.h"
 #include "miscadmin.h"
 #include "utils/float.h"
+#include "utils/numeric.h"
 #include "utils/tuplesort.h"
 
 struct VectorAggState
@@ -423,6 +424,31 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 
 	switch (pertrans->aggref->aggfnoid)
 	{
+		case 2107:				/* sum(int8) */
+#ifdef HAVE_INT128
+		{
+			Int128AggState *aggstate;
+			MemoryContext oldcontext;
+
+			if (pergroupstate->transValueIsNull)
+			{
+				oldcontext = MemoryContextSwitchTo(
+					state->agg->curaggcontext->ecxt_per_tuple_memory);
+				aggstate = makeInt128AggStateCurrentContext(false);
+				MemoryContextSwitchTo(oldcontext);
+				pergroupstate->transValue = PointerGetDatum(aggstate);
+				pergroupstate->transValueIsNull = false;
+				pergroupstate->noTransValue = false;
+			}
+			else
+				aggstate = (Int128AggState *) DatumGetPointer(pergroupstate->transValue);
+			aggstate->sumX += (int128) DatumGetInt64(value);
+			aggstate->N++;
+			return true;
+		}
+#else
+			return false;
+#endif
 		case 2108:				/* sum(int4) */
 			pergroupstate->transValue += DatumGetInt32(value);
 			pergroupstate->noTransValue = false;
