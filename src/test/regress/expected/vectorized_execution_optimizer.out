@@ -786,6 +786,12 @@ SELECT avg(n), sum(n) FROM vector_numeric_test;
  NaN | NaN
 (1 row)
 
+SELECT min(n), max(n) FROM vector_numeric_test;
+  min  | max 
+-------+-----
+ -1.20 | NaN
+(1 row)
+
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
  sum 
 -----
