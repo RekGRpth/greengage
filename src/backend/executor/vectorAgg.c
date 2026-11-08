@@ -24,6 +24,53 @@
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
 
+typedef enum VectorAggBuiltin
+{
+	VEC_AGG_AVG_INT8 = 2100,
+	VEC_AGG_AVG_INT4 = 2101,
+	VEC_AGG_AVG_INT2 = 2102,
+	VEC_AGG_AVG_NUMERIC = 2103,
+	VEC_AGG_SUM_INT8 = 2107,
+	VEC_AGG_SUM_INT4 = 2108,
+	VEC_AGG_SUM_INT2 = 2109,
+	VEC_AGG_SUM_FLOAT4 = 2110,
+	VEC_AGG_SUM_FLOAT8 = 2111,
+	VEC_AGG_SUM_NUMERIC = 2114,
+	VEC_AGG_MAX_INT8 = 2115,
+	VEC_AGG_MAX_INT4 = 2116,
+	VEC_AGG_MAX_INT2 = 2117,
+	VEC_AGG_MAX_FLOAT4 = 2119,
+	VEC_AGG_MAX_FLOAT8 = 2120,
+	VEC_AGG_MAX_DATE = 2122,
+	VEC_AGG_MAX_TIMESTAMP = 2126,
+	VEC_AGG_MAX_TIMESTAMPTZ = 2127,
+	VEC_AGG_MIN_INT8 = 2131,
+	VEC_AGG_MIN_INT4 = 2132,
+	VEC_AGG_MIN_INT2 = 2133,
+	VEC_AGG_MIN_FLOAT4 = 2135,
+	VEC_AGG_MIN_FLOAT8 = 2136,
+	VEC_AGG_MIN_DATE = 2138,
+	VEC_AGG_MIN_TIMESTAMP = 2142,
+	VEC_AGG_MIN_TIMESTAMPTZ = 2143,
+	VEC_AGG_STDDEV_INT8 = 2154,
+	VEC_AGG_STDDEV_INT4 = 2155,
+	VEC_AGG_STDDEV_INT2 = 2156,
+	VEC_AGG_VAR_SAMP_INT8 = 2641,
+	VEC_AGG_VAR_SAMP_INT4 = 2642,
+	VEC_AGG_VAR_SAMP_INT2 = 2643,
+	VEC_AGG_STDDEV_SAMP_INT8 = 2712,
+	VEC_AGG_STDDEV_SAMP_INT4 = 2713,
+	VEC_AGG_STDDEV_SAMP_INT2 = 2714,
+	VEC_AGG_VAR_POP_INT8 = 2718,
+	VEC_AGG_VAR_POP_INT4 = 2719,
+	VEC_AGG_VAR_POP_INT2 = 2720,
+	VEC_AGG_STDDEV_POP_INT8 = 2724,
+	VEC_AGG_STDDEV_POP_INT4 = 2725,
+	VEC_AGG_STDDEV_POP_INT2 = 2726,
+	VEC_AGG_COUNT_ANY = 2802,
+	VEC_AGG_COUNT_STAR = 2803
+} VectorAggBuiltin;
+
 struct VectorAggState
 {
 	MemoryContext context;
@@ -406,7 +453,7 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 
 	if (pertrans->numSortCols > 0)
 		return false;
-	if (pertrans->aggref->aggfnoid == 2803)	/* count(*) */
+	if (pertrans->aggref->aggfnoid == VEC_AGG_COUNT_STAR)
 	{
 		pergroupstate->transValue++;
 		return true;
@@ -416,7 +463,7 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 
 	value = state->values[transno][0];
 	isnull = state->nulls[transno][0];
-	if (pertrans->aggref->aggfnoid == 2802)	/* count(any) */
+	if (pertrans->aggref->aggfnoid == VEC_AGG_COUNT_ANY)	/* count(any) */
 	{
 		if (!isnull)
 			pergroupstate->transValue++;
@@ -427,8 +474,8 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 
 	switch (pertrans->aggref->aggfnoid)
 	{
-		case 2101:				/* avg(int4) */
-		case 2102:				/* avg(int2) */
+		case VEC_AGG_AVG_INT4:
+		case VEC_AGG_AVG_INT2:
 		{
 			Int8TransTypeData *transdata;
 
@@ -437,27 +484,31 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			transdata = (Int8TransTypeData *)
 				ARR_DATA_PTR((ArrayType *) DatumGetPointer(pergroupstate->transValue));
 			transdata->count++;
-			if (pertrans->aggref->aggfnoid == 2102)
+			if (pertrans->aggref->aggfnoid == VEC_AGG_AVG_INT2)
 				transdata->sum += DatumGetInt16(value);
 			else
 				transdata->sum += DatumGetInt32(value);
 			return true;
 		}
-		case 2154:				/* stddev(int8) */
-		case 2641:				/* var_samp(int8) */
-		case 2712:				/* stddev_samp(int8) */
-		case 2718:				/* var_pop(int8) */
-		case 2724:				/* stddev_pop(int8) */
+		case VEC_AGG_AVG_NUMERIC:
+		case VEC_AGG_SUM_NUMERIC:
+		case VEC_AGG_STDDEV_INT8:
+		case VEC_AGG_VAR_SAMP_INT8:
+		case VEC_AGG_STDDEV_SAMP_INT8:
+		case VEC_AGG_VAR_POP_INT8:
+		case VEC_AGG_STDDEV_POP_INT8:
 		{
 			NumericAggState *aggstate;
 			Numeric		newval;
 			MemoryContext oldcontext;
+			bool		calcSumX2 = pertrans->aggref->aggfnoid != VEC_AGG_AVG_NUMERIC &&
+				pertrans->aggref->aggfnoid != VEC_AGG_SUM_NUMERIC;
 
 			if (pergroupstate->transValueIsNull)
 			{
 				oldcontext = MemoryContextSwitchTo(
 					state->agg->curaggcontext->ecxt_per_tuple_memory);
-				aggstate = makeNumericAggStateCurrentContext(true);
+				aggstate = makeNumericAggStateCurrentContext(calcSumX2);
 				MemoryContextSwitchTo(oldcontext);
 				pergroupstate->transValue = PointerGetDatum(aggstate);
 				pergroupstate->transValueIsNull = false;
@@ -467,29 +518,31 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				aggstate = (NumericAggState *) DatumGetPointer(pergroupstate->transValue);
 			oldcontext = MemoryContextSwitchTo(
 				state->agg->tmpcontext->ecxt_per_tuple_memory);
-			newval = DatumGetNumeric(DirectFunctionCall1(int8_numeric, value));
+			newval = calcSumX2 ?
+				DatumGetNumeric(DirectFunctionCall1(int8_numeric, value)) :
+				DatumGetNumeric(value);
 			do_numeric_accum(aggstate, newval);
 			MemoryContextSwitchTo(oldcontext);
 			return true;
 		}
-		case 2155:				/* stddev(int4) */
-		case 2156:				/* stddev(int2) */
-		case 2642:				/* var_samp(int4) */
-		case 2643:				/* var_samp(int2) */
-		case 2713:				/* stddev_samp(int4) */
-		case 2714:				/* stddev_samp(int2) */
-		case 2719:				/* var_pop(int4) */
-		case 2720:				/* var_pop(int2) */
-		case 2725:				/* stddev_pop(int4) */
-		case 2726:				/* stddev_pop(int2) */
-		case 2100:				/* avg(int8) */
-		case 2107:				/* sum(int8) */
+		case VEC_AGG_STDDEV_INT4:
+		case VEC_AGG_STDDEV_INT2:
+		case VEC_AGG_VAR_SAMP_INT4:
+		case VEC_AGG_VAR_SAMP_INT2:
+		case VEC_AGG_STDDEV_SAMP_INT4:
+		case VEC_AGG_STDDEV_SAMP_INT2:
+		case VEC_AGG_VAR_POP_INT4:
+		case VEC_AGG_VAR_POP_INT2:
+		case VEC_AGG_STDDEV_POP_INT4:
+		case VEC_AGG_STDDEV_POP_INT2:
+		case VEC_AGG_AVG_INT8:
+		case VEC_AGG_SUM_INT8:
 #ifdef HAVE_INT128
 		{
 			Int128AggState *aggstate;
 			MemoryContext oldcontext;
-			bool		calcSumX2 = pertrans->aggref->aggfnoid != 2100 &&
-				pertrans->aggref->aggfnoid != 2107;
+			bool		calcSumX2 = pertrans->aggref->aggfnoid != VEC_AGG_AVG_INT8 &&
+				pertrans->aggref->aggfnoid != VEC_AGG_SUM_INT8;
 			int128		newval;
 
 			if (pergroupstate->transValueIsNull)
@@ -506,18 +559,18 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				aggstate = (Int128AggState *) DatumGetPointer(pergroupstate->transValue);
 			switch (pertrans->aggref->aggfnoid)
 			{
-				case 2156:
-				case 2643:
-				case 2714:
-				case 2720:
-				case 2726:
+				case VEC_AGG_STDDEV_INT2:
+				case VEC_AGG_VAR_SAMP_INT2:
+				case VEC_AGG_STDDEV_SAMP_INT2:
+				case VEC_AGG_VAR_POP_INT2:
+				case VEC_AGG_STDDEV_POP_INT2:
 					newval = (int128) DatumGetInt16(value);
 					break;
-				case 2155:
-				case 2642:
-				case 2713:
-				case 2719:
-				case 2725:
+				case VEC_AGG_STDDEV_INT4:
+				case VEC_AGG_VAR_SAMP_INT4:
+				case VEC_AGG_STDDEV_SAMP_INT4:
+				case VEC_AGG_VAR_POP_INT4:
+				case VEC_AGG_STDDEV_POP_INT4:
 					newval = (int128) DatumGetInt32(value);
 					break;
 				default:
@@ -533,51 +586,51 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 #else
 			return false;
 #endif
-		case 2108:				/* sum(int4) */
+		case VEC_AGG_SUM_INT4:
 			pergroupstate->transValue += DatumGetInt32(value);
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2109:				/* sum(int2) */
+		case VEC_AGG_SUM_INT2:
 			pergroupstate->transValue += (int64) DatumGetInt16(value);
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2110:				/* sum(float4) */
-		case 2111:				/* sum(float8) */
+		case VEC_AGG_SUM_FLOAT4:
+		case VEC_AGG_SUM_FLOAT8:
 			if (pergroupstate->noTransValue)
-				pergroupstate->transValue = pertrans->aggref->aggfnoid == 2110 ?
+				pergroupstate->transValue = pertrans->aggref->aggfnoid == VEC_AGG_SUM_FLOAT4 ?
 					Float8GetDatum((float8) DatumGetFloat4(value)) : value;
 			else
 				pergroupstate->transValue = Float8GetDatum(
 					DatumGetFloat8(pergroupstate->transValue) +
-					(pertrans->aggref->aggfnoid == 2110 ?
+					(pertrans->aggref->aggfnoid == VEC_AGG_SUM_FLOAT4 ?
 					 (float8) DatumGetFloat4(value) : DatumGetFloat8(value)));
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2115:				/* max(int8) */
+		case VEC_AGG_MAX_INT8:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt64(pergroupstate->transValue) < DatumGetInt64(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2116:				/* max(int4) */
+		case VEC_AGG_MAX_INT4:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt32(pergroupstate->transValue) < DatumGetInt32(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2117:				/* max(int2) */
+		case VEC_AGG_MAX_INT2:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt16(pergroupstate->transValue) < DatumGetInt16(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2119:				/* max(float4) */
+		case VEC_AGG_MAX_FLOAT4:
 			if (pergroupstate->noTransValue ||
 				float4_cmp_internal(DatumGetFloat4(pergroupstate->transValue),
 									DatumGetFloat4(value)) < 0)
@@ -585,7 +638,7 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2120:				/* max(float8) */
+		case VEC_AGG_MAX_FLOAT8:
 			if (pergroupstate->noTransValue ||
 				float8_cmp_internal(DatumGetFloat8(pergroupstate->transValue),
 									DatumGetFloat8(value)) < 0)
@@ -593,43 +646,43 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2122:				/* max(date) */
+		case VEC_AGG_MAX_DATE:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt32(pergroupstate->transValue) < DatumGetInt32(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2126:				/* max(timestamp) */
-		case 2127:				/* max(timestamptz) */
+		case VEC_AGG_MAX_TIMESTAMP:
+		case VEC_AGG_MAX_TIMESTAMPTZ:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt64(pergroupstate->transValue) < DatumGetInt64(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2131:				/* min(int8) */
+		case VEC_AGG_MIN_INT8:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt64(pergroupstate->transValue) > DatumGetInt64(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2132:				/* min(int4) */
+		case VEC_AGG_MIN_INT4:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt32(pergroupstate->transValue) > DatumGetInt32(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2133:				/* min(int2) */
+		case VEC_AGG_MIN_INT2:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt16(pergroupstate->transValue) > DatumGetInt16(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2135:				/* min(float4) */
+		case VEC_AGG_MIN_FLOAT4:
 			if (pergroupstate->noTransValue ||
 				float4_cmp_internal(DatumGetFloat4(pergroupstate->transValue),
 									DatumGetFloat4(value)) > 0)
@@ -637,7 +690,7 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2136:				/* min(float8) */
+		case VEC_AGG_MIN_FLOAT8:
 			if (pergroupstate->noTransValue ||
 				float8_cmp_internal(DatumGetFloat8(pergroupstate->transValue),
 									DatumGetFloat8(value)) > 0)
@@ -645,15 +698,15 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2138:				/* min(date) */
+		case VEC_AGG_MIN_DATE:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt32(pergroupstate->transValue) > DatumGetInt32(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
-		case 2142:				/* min(timestamp) */
-		case 2143:				/* min(timestamptz) */
+		case VEC_AGG_MIN_TIMESTAMP:
+		case VEC_AGG_MIN_TIMESTAMPTZ:
 			if (pergroupstate->noTransValue ||
 				DatumGetInt64(pergroupstate->transValue) > DatumGetInt64(value))
 				pergroupstate->transValue = value;

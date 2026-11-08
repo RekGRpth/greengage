@@ -773,6 +773,18 @@ FROM vector_aoco_small;
  8.2500000000000000 | 9.1666666666666667 | 3.0276503540974917 | 2.8722813232690143 | 3.0276503540974917
 (1 row)
 
+SELECT avg(num) FROM vector_aoco_test;
+         avg         
+---------------------
+ 16.4580131723380900
+(1 row)
+
+SELECT avg(n), sum(n) FROM vector_numeric_test;
+ avg | sum 
+-----+-----
+ NaN | NaN
+(1 row)
+
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
  sum 
 -----

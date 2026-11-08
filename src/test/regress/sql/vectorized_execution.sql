@@ -314,6 +314,8 @@ FROM vector_aoco_small;
 SELECT var_pop(id::int8), var_samp(id::int8), stddev(id::int8),
        stddev_pop(id::int8), stddev_samp(id::int8)
 FROM vector_aoco_small;
+SELECT avg(num) FROM vector_aoco_test;
+SELECT avg(n), sum(n) FROM vector_numeric_test;
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT sum(f4), sum(f8) FROM vector_float_test WHERE id = 2;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
