@@ -29,6 +29,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
@@ -64,6 +65,23 @@ typedef enum VectorExprKind
 	VEC_SUBPLAN
 } VectorExprKind;
 
+typedef enum VectorCompareOp
+{
+	VEC_COMPARE_NONE,
+	VEC_COMPARE_INT4_EQ,
+	VEC_COMPARE_INT4_NE,
+	VEC_COMPARE_INT4_LT,
+	VEC_COMPARE_INT4_LE,
+	VEC_COMPARE_INT4_GT,
+	VEC_COMPARE_INT4_GE,
+	VEC_COMPARE_INT8_EQ,
+	VEC_COMPARE_INT8_NE,
+	VEC_COMPARE_INT8_LT,
+	VEC_COMPARE_INT8_LE,
+	VEC_COMPARE_INT8_GT,
+	VEC_COMPARE_INT8_GE
+} VectorCompareOp;
+
 typedef struct VectorValue
 {
 	Oid			typid;
@@ -90,6 +108,7 @@ typedef struct VectorExprStep
 			FunctionCallInfo fcinfo;
 			FmgrInfo	fn;
 			bool		strict;
+			VectorCompareOp compare;
 		}			func;
 		NullTestType nulltesttype;
 		BoolTestType booltesttype;
@@ -477,6 +496,40 @@ alloc_step(VectorExprKind kind, int nargs, int capacity)
 	return step;
 }
 
+static VectorCompareOp
+vector_compare_op(Oid functionid)
+{
+	switch (functionid)
+	{
+		case F_INT4EQ:
+			return VEC_COMPARE_INT4_EQ;
+		case F_INT4NE:
+			return VEC_COMPARE_INT4_NE;
+		case F_INT4LT:
+			return VEC_COMPARE_INT4_LT;
+		case F_INT4LE:
+			return VEC_COMPARE_INT4_LE;
+		case F_INT4GT:
+			return VEC_COMPARE_INT4_GT;
+		case F_INT4GE:
+			return VEC_COMPARE_INT4_GE;
+		case F_INT8EQ:
+			return VEC_COMPARE_INT8_EQ;
+		case F_INT8NE:
+			return VEC_COMPARE_INT8_NE;
+		case F_INT8LT:
+			return VEC_COMPARE_INT8_LT;
+		case F_INT8LE:
+			return VEC_COMPARE_INT8_LE;
+		case F_INT8GT:
+			return VEC_COMPARE_INT8_GT;
+		case F_INT8GE:
+			return VEC_COMPARE_INT8_GE;
+		default:
+			return VEC_COMPARE_NONE;
+	}
+}
+
 static VectorExprStep *
 build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 				Oid collation, List *args, VectorBatch *batch,
@@ -493,6 +546,7 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 	InitFunctionCallInfoData(*step->u.func.fcinfo, &step->u.func.fn,
 							 list_length(args), collation, NULL, NULL);
 	step->u.func.strict = step->u.func.fn.fn_strict;
+	step->u.func.compare = vector_compare_op(functionid);
 
 	foreach(lc, args)
 	{
@@ -1133,6 +1187,69 @@ VectorExprDestroy(VectorExprState *state)
 }
 
 static void
+eval_compare(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		bool		result;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set(&step->value, row, (Datum) 0, true);
+			continue;
+		}
+
+		switch (step->u.func.compare)
+		{
+			case VEC_COMPARE_INT4_EQ:
+				result = DatumGetInt32(left->values[row]) == DatumGetInt32(right->values[row]);
+				break;
+			case VEC_COMPARE_INT4_NE:
+				result = DatumGetInt32(left->values[row]) != DatumGetInt32(right->values[row]);
+				break;
+			case VEC_COMPARE_INT4_LT:
+				result = DatumGetInt32(left->values[row]) < DatumGetInt32(right->values[row]);
+				break;
+			case VEC_COMPARE_INT4_LE:
+				result = DatumGetInt32(left->values[row]) <= DatumGetInt32(right->values[row]);
+				break;
+			case VEC_COMPARE_INT4_GT:
+				result = DatumGetInt32(left->values[row]) > DatumGetInt32(right->values[row]);
+				break;
+			case VEC_COMPARE_INT4_GE:
+				result = DatumGetInt32(left->values[row]) >= DatumGetInt32(right->values[row]);
+				break;
+			case VEC_COMPARE_INT8_EQ:
+				result = DatumGetInt64(left->values[row]) == DatumGetInt64(right->values[row]);
+				break;
+			case VEC_COMPARE_INT8_NE:
+				result = DatumGetInt64(left->values[row]) != DatumGetInt64(right->values[row]);
+				break;
+			case VEC_COMPARE_INT8_LT:
+				result = DatumGetInt64(left->values[row]) < DatumGetInt64(right->values[row]);
+				break;
+			case VEC_COMPARE_INT8_LE:
+				result = DatumGetInt64(left->values[row]) <= DatumGetInt64(right->values[row]);
+				break;
+			case VEC_COMPARE_INT8_GT:
+				result = DatumGetInt64(left->values[row]) > DatumGetInt64(right->values[row]);
+				break;
+			case VEC_COMPARE_INT8_GE:
+				result = DatumGetInt64(left->values[row]) >= DatumGetInt64(right->values[row]);
+				break;
+			default:
+				pg_unreachable();
+		}
+		value_set(&step->value, row, BoolGetDatum(result), false);
+	}
+}
+
+static void
 eval_func(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselected)
 {
 	int			argno;
@@ -1140,6 +1257,12 @@ eval_func(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 
 	for (argno = 0; argno < step->nargs; argno++)
 		eval_step(step->args[argno], batch, selection, nselected);
+
+	if (step->u.func.compare != VEC_COMPARE_NONE)
+	{
+		eval_compare(step, selection, nselected);
+		return;
+	}
 
 	for (pos = 0; pos < nselected; pos++)
 	{

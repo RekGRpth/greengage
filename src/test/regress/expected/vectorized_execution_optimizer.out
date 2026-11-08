@@ -561,6 +561,39 @@ SELECT count(*) FROM vector_aoco_test WHERE nullif(id % 3, 0) IS NULL;
   1519
 (1 row)
 
+SELECT count(*) FILTER (WHERE id = 2500) AS eq,
+       count(*) FILTER (WHERE id <> 2500) AS ne,
+       count(*) FILTER (WHERE id < 2500) AS lt,
+       count(*) FILTER (WHERE id <= 2500) AS le,
+       count(*) FILTER (WHERE id > 2500) AS gt,
+       count(*) FILTER (WHERE id >= 2500) AS ge
+FROM vector_aoco_test;
+ eq |  ne  |  lt  |  le  |  gt  |  ge  
+----+------+------+------+------+------
+  1 | 4554 | 2272 | 2273 | 2282 | 2283
+(1 row)
+
+SELECT count(*) FILTER (WHERE big = 25000) AS eq,
+       count(*) FILTER (WHERE big <> 25000) AS ne,
+       count(*) FILTER (WHERE big < 25000) AS lt,
+       count(*) FILTER (WHERE big <= 25000) AS le,
+       count(*) FILTER (WHERE big > 25000) AS gt,
+       count(*) FILTER (WHERE big >= 25000) AS ge
+FROM vector_aoco_test;
+ eq |  ne  |  lt  |  le  |  gt  |  ge  
+----+------+------+------+------+------
+  1 | 4554 | 2272 | 2273 | 2282 | 2283
+(1 row)
+
+SELECT count(*) FILTER (WHERE (CASE WHEN id % 10 = 0 THEN NULL ELSE id END) = 2500)
+       AS matching,
+       count((CASE WHEN id % 10 = 0 THEN NULL ELSE id END) = 2500) AS nonnull
+FROM vector_aoco_test;
+ matching | nonnull 
+----------+---------
+        0 |    4099
+(1 row)
+
 SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
  count 
 -------

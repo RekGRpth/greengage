@@ -181,6 +181,24 @@ SELECT sum(nullif(id % 3, 0)), count(nullif(val, 'v1')), count(nullif(val, NULL)
 FROM vector_aoco_test;
 SELECT id, nullif(id % 3, 0) AS nz FROM vector_aoco_small WHERE id < 7 ORDER BY id;
 SELECT count(*) FROM vector_aoco_test WHERE nullif(id % 3, 0) IS NULL;
+SELECT count(*) FILTER (WHERE id = 2500) AS eq,
+       count(*) FILTER (WHERE id <> 2500) AS ne,
+       count(*) FILTER (WHERE id < 2500) AS lt,
+       count(*) FILTER (WHERE id <= 2500) AS le,
+       count(*) FILTER (WHERE id > 2500) AS gt,
+       count(*) FILTER (WHERE id >= 2500) AS ge
+FROM vector_aoco_test;
+SELECT count(*) FILTER (WHERE big = 25000) AS eq,
+       count(*) FILTER (WHERE big <> 25000) AS ne,
+       count(*) FILTER (WHERE big < 25000) AS lt,
+       count(*) FILTER (WHERE big <= 25000) AS le,
+       count(*) FILTER (WHERE big > 25000) AS gt,
+       count(*) FILTER (WHERE big >= 25000) AS ge
+FROM vector_aoco_test;
+SELECT count(*) FILTER (WHERE (CASE WHEN id % 10 = 0 THEN NULL ELSE id END) = 2500)
+       AS matching,
+       count((CASE WHEN id % 10 = 0 THEN NULL ELSE id END) = 2500) AS nonnull
+FROM vector_aoco_test;
 SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
