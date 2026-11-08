@@ -750,6 +750,29 @@ SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
     
 (1 row)
 
+SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
+       stddev_pop(id::int2), stddev_samp(id::int2)
+FROM vector_aoco_small;
+      var_pop       |      var_samp      |       stddev       |     stddev_pop     |    stddev_samp     
+--------------------+--------------------+--------------------+--------------------+--------------------
+ 8.2500000000000000 | 9.1666666666666667 | 3.0276503540974917 | 2.8722813232690143 | 3.0276503540974917
+(1 row)
+
+SELECT var_pop(id), var_samp(id), stddev(id), stddev_pop(id), stddev_samp(id)
+FROM vector_aoco_small;
+      var_pop       |      var_samp      |       stddev       |     stddev_pop     |    stddev_samp     
+--------------------+--------------------+--------------------+--------------------+--------------------
+ 8.2500000000000000 | 9.1666666666666667 | 3.0276503540974917 | 2.8722813232690143 | 3.0276503540974917
+(1 row)
+
+SELECT var_pop(id::int8), var_samp(id::int8), stddev(id::int8),
+       stddev_pop(id::int8), stddev_samp(id::int8)
+FROM vector_aoco_small;
+      var_pop       |      var_samp      |       stddev       |     stddev_pop     |    stddev_samp     
+--------------------+--------------------+--------------------+--------------------+--------------------
+ 8.2500000000000000 | 9.1666666666666667 | 3.0276503540974917 | 2.8722813232690143 | 3.0276503540974917
+(1 row)
+
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
  sum 
 -----

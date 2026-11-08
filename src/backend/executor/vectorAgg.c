@@ -22,6 +22,8 @@
 #include "utils/numeric.h"
 #include "utils/tuplesort.h"
 
+extern Datum int8_numeric(PG_FUNCTION_ARGS);
+
 struct VectorAggState
 {
 	MemoryContext context;
@@ -441,18 +443,60 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				transdata->sum += DatumGetInt32(value);
 			return true;
 		}
-		case 2100:				/* avg(int8) */
-		case 2107:				/* sum(int8) */
-#ifdef HAVE_INT128
+		case 2154:				/* stddev(int8) */
+		case 2641:				/* var_samp(int8) */
+		case 2712:				/* stddev_samp(int8) */
+		case 2718:				/* var_pop(int8) */
+		case 2724:				/* stddev_pop(int8) */
 		{
-			Int128AggState *aggstate;
+			NumericAggState *aggstate;
+			Numeric		newval;
 			MemoryContext oldcontext;
 
 			if (pergroupstate->transValueIsNull)
 			{
 				oldcontext = MemoryContextSwitchTo(
 					state->agg->curaggcontext->ecxt_per_tuple_memory);
-				aggstate = makeInt128AggStateCurrentContext(false);
+				aggstate = makeNumericAggStateCurrentContext(true);
+				MemoryContextSwitchTo(oldcontext);
+				pergroupstate->transValue = PointerGetDatum(aggstate);
+				pergroupstate->transValueIsNull = false;
+				pergroupstate->noTransValue = false;
+			}
+			else
+				aggstate = (NumericAggState *) DatumGetPointer(pergroupstate->transValue);
+			oldcontext = MemoryContextSwitchTo(
+				state->agg->tmpcontext->ecxt_per_tuple_memory);
+			newval = DatumGetNumeric(DirectFunctionCall1(int8_numeric, value));
+			do_numeric_accum(aggstate, newval);
+			MemoryContextSwitchTo(oldcontext);
+			return true;
+		}
+		case 2155:				/* stddev(int4) */
+		case 2156:				/* stddev(int2) */
+		case 2642:				/* var_samp(int4) */
+		case 2643:				/* var_samp(int2) */
+		case 2713:				/* stddev_samp(int4) */
+		case 2714:				/* stddev_samp(int2) */
+		case 2719:				/* var_pop(int4) */
+		case 2720:				/* var_pop(int2) */
+		case 2725:				/* stddev_pop(int4) */
+		case 2726:				/* stddev_pop(int2) */
+		case 2100:				/* avg(int8) */
+		case 2107:				/* sum(int8) */
+#ifdef HAVE_INT128
+		{
+			Int128AggState *aggstate;
+			MemoryContext oldcontext;
+			bool		calcSumX2 = pertrans->aggref->aggfnoid != 2100 &&
+				pertrans->aggref->aggfnoid != 2107;
+			int128		newval;
+
+			if (pergroupstate->transValueIsNull)
+			{
+				oldcontext = MemoryContextSwitchTo(
+					state->agg->curaggcontext->ecxt_per_tuple_memory);
+				aggstate = makeInt128AggStateCurrentContext(calcSumX2);
 				MemoryContextSwitchTo(oldcontext);
 				pergroupstate->transValue = PointerGetDatum(aggstate);
 				pergroupstate->transValueIsNull = false;
@@ -460,7 +504,29 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			}
 			else
 				aggstate = (Int128AggState *) DatumGetPointer(pergroupstate->transValue);
-			aggstate->sumX += (int128) DatumGetInt64(value);
+			switch (pertrans->aggref->aggfnoid)
+			{
+				case 2156:
+				case 2643:
+				case 2714:
+				case 2720:
+				case 2726:
+					newval = (int128) DatumGetInt16(value);
+					break;
+				case 2155:
+				case 2642:
+				case 2713:
+				case 2719:
+				case 2725:
+					newval = (int128) DatumGetInt32(value);
+					break;
+				default:
+					newval = (int128) DatumGetInt64(value);
+					break;
+			}
+			aggstate->sumX += newval;
+			if (calcSumX2)
+				aggstate->sumX2 += newval * newval;
 			aggstate->N++;
 			return true;
 		}
