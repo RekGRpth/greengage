@@ -739,6 +739,18 @@ SELECT sum(b), min(b), max(b) FROM vector_arithmetic_test;
   23 | -9223372036854775808 | 9223372036854775807
 (1 row)
 
+SELECT avg(s), avg(a), avg(b) FROM vector_arithmetic_test;
+        avg         |        avg         |        avg         
+--------------------+--------------------+--------------------
+ 3.6666666666666667 | 3.6666666666666667 | 7.6666666666666667
+(1 row)
+
+SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
+ avg 
+-----
+    
+(1 row)
+
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
  sum 
 -----

@@ -17,6 +17,7 @@
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "miscadmin.h"
+#include "utils/array.h"
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/tuplesort.h"
@@ -424,6 +425,23 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 
 	switch (pertrans->aggref->aggfnoid)
 	{
+		case 2101:				/* avg(int4) */
+		case 2102:				/* avg(int2) */
+		{
+			Int8TransTypeData *transdata;
+
+			if (pergroupstate->transValueIsNull)
+				return false;
+			transdata = (Int8TransTypeData *)
+				ARR_DATA_PTR((ArrayType *) DatumGetPointer(pergroupstate->transValue));
+			transdata->count++;
+			if (pertrans->aggref->aggfnoid == 2102)
+				transdata->sum += DatumGetInt16(value);
+			else
+				transdata->sum += DatumGetInt32(value);
+			return true;
+		}
+		case 2100:				/* avg(int8) */
 		case 2107:				/* sum(int8) */
 #ifdef HAVE_INT128
 		{
