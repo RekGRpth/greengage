@@ -10,6 +10,7 @@ DROP TABLE IF EXISTS vector_heap_test;
 DROP TABLE IF EXISTS vector_aoro_test;
 DROP TABLE IF EXISTS vector_limit_test;
 DROP TABLE IF EXISTS vector_unique_test;
+DROP TABLE IF EXISTS vector_time_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -31,6 +32,18 @@ DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_small
 SELECT g, 'v' || g FROM generate_series(1, 10) AS g;
 ANALYZE vector_aoco_small;
+CREATE TABLE vector_time_test (id int4, d date, ts timestamp, tz timestamptz)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_time_test
+SELECT g,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE DATE '2001-01-01' + g END,
+       CASE WHEN g % 5 = 0 THEN NULL ELSE
+            TIMESTAMP '2001-01-01 00:00:00' + g * INTERVAL '1 hour' END,
+       CASE WHEN g % 3 = 0 THEN NULL ELSE
+            TIMESTAMPTZ '2001-01-01 00:00:00+00' + g * INTERVAL '1 hour' END
+FROM generate_series(1, 10) AS g;
+ANALYZE vector_time_test;
 CREATE TABLE vector_limit_test (id int4, val text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
@@ -199,6 +212,27 @@ SELECT count(*) FILTER (WHERE (CASE WHEN id % 10 = 0 THEN NULL ELSE id END) = 25
        AS matching,
        count((CASE WHEN id % 10 = 0 THEN NULL ELSE id END) = 2500) AS nonnull
 FROM vector_aoco_test;
+SELECT count(*) FILTER (WHERE d = DATE '2001-01-06') AS eq,
+       count(*) FILTER (WHERE d <> DATE '2001-01-06') AS ne,
+       count(*) FILTER (WHERE d < DATE '2001-01-06') AS lt,
+       count(*) FILTER (WHERE d <= DATE '2001-01-06') AS le,
+       count(*) FILTER (WHERE d > DATE '2001-01-06') AS gt,
+       count(*) FILTER (WHERE d >= DATE '2001-01-06') AS ge
+FROM vector_time_test;
+SELECT count(*) FILTER (WHERE ts = TIMESTAMP '2001-01-01 05:00:00') AS eq,
+       count(*) FILTER (WHERE ts <> TIMESTAMP '2001-01-01 05:00:00') AS ne,
+       count(*) FILTER (WHERE ts < TIMESTAMP '2001-01-01 05:00:00') AS lt,
+       count(*) FILTER (WHERE ts <= TIMESTAMP '2001-01-01 05:00:00') AS le,
+       count(*) FILTER (WHERE ts > TIMESTAMP '2001-01-01 05:00:00') AS gt,
+       count(*) FILTER (WHERE ts >= TIMESTAMP '2001-01-01 05:00:00') AS ge
+FROM vector_time_test;
+SELECT count(*) FILTER (WHERE tz = TIMESTAMPTZ '2001-01-01 05:00:00+00') AS eq,
+       count(*) FILTER (WHERE tz <> TIMESTAMPTZ '2001-01-01 05:00:00+00') AS ne,
+       count(*) FILTER (WHERE tz < TIMESTAMPTZ '2001-01-01 05:00:00+00') AS lt,
+       count(*) FILTER (WHERE tz <= TIMESTAMPTZ '2001-01-01 05:00:00+00') AS le,
+       count(*) FILTER (WHERE tz > TIMESTAMPTZ '2001-01-01 05:00:00+00') AS gt,
+       count(*) FILTER (WHERE tz >= TIMESTAMPTZ '2001-01-01 05:00:00+00') AS ge
+FROM vector_time_test;
 SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
@@ -508,3 +542,4 @@ DROP TABLE vector_heap_test;
 DROP TABLE vector_aoro_test;
 DROP TABLE vector_limit_test;
 DROP TABLE vector_unique_test;
+DROP TABLE vector_time_test;

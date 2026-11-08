@@ -79,7 +79,19 @@ typedef enum VectorCompareOp
 	VEC_COMPARE_INT8_LT,
 	VEC_COMPARE_INT8_LE,
 	VEC_COMPARE_INT8_GT,
-	VEC_COMPARE_INT8_GE
+	VEC_COMPARE_INT8_GE,
+	VEC_COMPARE_DATE_EQ,
+	VEC_COMPARE_DATE_NE,
+	VEC_COMPARE_DATE_LT,
+	VEC_COMPARE_DATE_LE,
+	VEC_COMPARE_DATE_GT,
+	VEC_COMPARE_DATE_GE,
+	VEC_COMPARE_TIMESTAMP_EQ,
+	VEC_COMPARE_TIMESTAMP_NE,
+	VEC_COMPARE_TIMESTAMP_LT,
+	VEC_COMPARE_TIMESTAMP_LE,
+	VEC_COMPARE_TIMESTAMP_GT,
+	VEC_COMPARE_TIMESTAMP_GE
 } VectorCompareOp;
 
 typedef struct VectorValue
@@ -525,6 +537,42 @@ vector_compare_op(Oid functionid)
 			return VEC_COMPARE_INT8_GT;
 		case F_INT8GE:
 			return VEC_COMPARE_INT8_GE;
+		case F_DATE_EQ:
+			return VEC_COMPARE_DATE_EQ;
+		case F_DATE_NE:
+			return VEC_COMPARE_DATE_NE;
+		case F_DATE_LT:
+			return VEC_COMPARE_DATE_LT;
+		case F_DATE_LE:
+			return VEC_COMPARE_DATE_LE;
+		case F_DATE_GT:
+			return VEC_COMPARE_DATE_GT;
+		case F_DATE_GE:
+			return VEC_COMPARE_DATE_GE;
+		case F_TIMESTAMP_EQ:	/* timestamptz_eq */
+			return VEC_COMPARE_TIMESTAMP_EQ;
+		case F_TIMESTAMP_NE:	/* timestamptz_ne */
+			return VEC_COMPARE_TIMESTAMP_NE;
+		case F_TIMESTAMP_LT:	/* timestamptz_lt */
+			return VEC_COMPARE_TIMESTAMP_LT;
+		case F_TIMESTAMP_LE:	/* timestamptz_le */
+			return VEC_COMPARE_TIMESTAMP_LE;
+		case F_TIMESTAMP_GT:	/* timestamptz_gt */
+			return VEC_COMPARE_TIMESTAMP_GT;
+		case F_TIMESTAMP_GE:	/* timestamptz_ge */
+			return VEC_COMPARE_TIMESTAMP_GE;
+		case 2052:				/* timestamp_eq */
+			return VEC_COMPARE_TIMESTAMP_EQ;
+		case 2053:				/* timestamp_ne */
+			return VEC_COMPARE_TIMESTAMP_NE;
+		case 2054:				/* timestamp_lt */
+			return VEC_COMPARE_TIMESTAMP_LT;
+		case 2055:				/* timestamp_le */
+			return VEC_COMPARE_TIMESTAMP_LE;
+		case 2057:				/* timestamp_gt */
+			return VEC_COMPARE_TIMESTAMP_GT;
+		case 2056:				/* timestamp_ge */
+			return VEC_COMPARE_TIMESTAMP_GE;
 		default:
 			return VEC_COMPARE_NONE;
 	}
@@ -1241,6 +1289,42 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 				break;
 			case VEC_COMPARE_INT8_GE:
 				result = DatumGetInt64(left->values[row]) >= DatumGetInt64(right->values[row]);
+				break;
+			case VEC_COMPARE_DATE_EQ:
+				result = DatumGetDateADT(left->values[row]) == DatumGetDateADT(right->values[row]);
+				break;
+			case VEC_COMPARE_DATE_NE:
+				result = DatumGetDateADT(left->values[row]) != DatumGetDateADT(right->values[row]);
+				break;
+			case VEC_COMPARE_DATE_LT:
+				result = DatumGetDateADT(left->values[row]) < DatumGetDateADT(right->values[row]);
+				break;
+			case VEC_COMPARE_DATE_LE:
+				result = DatumGetDateADT(left->values[row]) <= DatumGetDateADT(right->values[row]);
+				break;
+			case VEC_COMPARE_DATE_GT:
+				result = DatumGetDateADT(left->values[row]) > DatumGetDateADT(right->values[row]);
+				break;
+			case VEC_COMPARE_DATE_GE:
+				result = DatumGetDateADT(left->values[row]) >= DatumGetDateADT(right->values[row]);
+				break;
+			case VEC_COMPARE_TIMESTAMP_EQ:
+				result = DatumGetTimestamp(left->values[row]) == DatumGetTimestamp(right->values[row]);
+				break;
+			case VEC_COMPARE_TIMESTAMP_NE:
+				result = DatumGetTimestamp(left->values[row]) != DatumGetTimestamp(right->values[row]);
+				break;
+			case VEC_COMPARE_TIMESTAMP_LT:
+				result = DatumGetTimestamp(left->values[row]) < DatumGetTimestamp(right->values[row]);
+				break;
+			case VEC_COMPARE_TIMESTAMP_LE:
+				result = DatumGetTimestamp(left->values[row]) <= DatumGetTimestamp(right->values[row]);
+				break;
+			case VEC_COMPARE_TIMESTAMP_GT:
+				result = DatumGetTimestamp(left->values[row]) > DatumGetTimestamp(right->values[row]);
+				break;
+			case VEC_COMPARE_TIMESTAMP_GE:
+				result = DatumGetTimestamp(left->values[row]) >= DatumGetTimestamp(right->values[row]);
 				break;
 			default:
 				pg_unreachable();
