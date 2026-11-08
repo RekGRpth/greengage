@@ -31,6 +31,7 @@
 #include "utils/date.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 
@@ -91,7 +92,13 @@ typedef enum VectorCompareOp
 	VEC_COMPARE_TIMESTAMP_LT,
 	VEC_COMPARE_TIMESTAMP_LE,
 	VEC_COMPARE_TIMESTAMP_GT,
-	VEC_COMPARE_TIMESTAMP_GE
+	VEC_COMPARE_TIMESTAMP_GE,
+	VEC_COMPARE_NUMERIC_EQ,
+	VEC_COMPARE_NUMERIC_NE,
+	VEC_COMPARE_NUMERIC_LT,
+	VEC_COMPARE_NUMERIC_LE,
+	VEC_COMPARE_NUMERIC_GT,
+	VEC_COMPARE_NUMERIC_GE
 } VectorCompareOp;
 
 typedef struct VectorValue
@@ -573,6 +580,18 @@ vector_compare_op(Oid functionid)
 			return VEC_COMPARE_TIMESTAMP_GT;
 		case 2056:				/* timestamp_ge */
 			return VEC_COMPARE_TIMESTAMP_GE;
+		case F_NUMERIC_EQ:
+			return VEC_COMPARE_NUMERIC_EQ;
+		case F_NUMERIC_NE:
+			return VEC_COMPARE_NUMERIC_NE;
+		case F_NUMERIC_LT:
+			return VEC_COMPARE_NUMERIC_LT;
+		case F_NUMERIC_LE:
+			return VEC_COMPARE_NUMERIC_LE;
+		case F_NUMERIC_GT:
+			return VEC_COMPARE_NUMERIC_GT;
+		case F_NUMERIC_GE:
+			return VEC_COMPARE_NUMERIC_GE;
 		default:
 			return VEC_COMPARE_NONE;
 	}
@@ -1234,6 +1253,20 @@ VectorExprDestroy(VectorExprState *state)
 	pfree(state);
 }
 
+static int
+numeric_compare_datums(Datum left, Datum right)
+{
+	Numeric		nleft = DatumGetNumeric(left);
+	Numeric		nright = DatumGetNumeric(right);
+	int			result = cmp_numerics(nleft, nright);
+
+	if ((Pointer) nleft != DatumGetPointer(left))
+		pfree(nleft);
+	if ((Pointer) nright != DatumGetPointer(right))
+		pfree(nright);
+	return result;
+}
+
 static void
 eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 {
@@ -1325,6 +1358,24 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 				break;
 			case VEC_COMPARE_TIMESTAMP_GE:
 				result = DatumGetTimestamp(left->values[row]) >= DatumGetTimestamp(right->values[row]);
+				break;
+			case VEC_COMPARE_NUMERIC_EQ:
+				result = numeric_compare_datums(left->values[row], right->values[row]) == 0;
+				break;
+			case VEC_COMPARE_NUMERIC_NE:
+				result = numeric_compare_datums(left->values[row], right->values[row]) != 0;
+				break;
+			case VEC_COMPARE_NUMERIC_LT:
+				result = numeric_compare_datums(left->values[row], right->values[row]) < 0;
+				break;
+			case VEC_COMPARE_NUMERIC_LE:
+				result = numeric_compare_datums(left->values[row], right->values[row]) <= 0;
+				break;
+			case VEC_COMPARE_NUMERIC_GT:
+				result = numeric_compare_datums(left->values[row], right->values[row]) > 0;
+				break;
+			case VEC_COMPARE_NUMERIC_GE:
+				result = numeric_compare_datums(left->values[row], right->values[row]) >= 0;
 				break;
 			default:
 				pg_unreachable();

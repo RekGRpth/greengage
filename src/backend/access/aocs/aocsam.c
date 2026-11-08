@@ -1569,22 +1569,18 @@ aocs_column_block_exhausted(DatumStreamRead *ds)
 }
 
 /*
- * Whether a by-ref value read from this column lives in one of the
- * per-stream buffers that the next read of the same column reuses, and so
- * cannot survive in a batch without a copy even within one block.
+ * Whether a by-ref value lives in the per-value upgrade buffer, which can be
+ * reused before the batch is consumed.  large_object_buffer instead holds the
+ * whole current compressed block (or one large-object block), so its values
+ * remain valid until the block-boundary batch has been consumed.
  */
 static bool
 aocs_datum_in_transient_buffer(DatumStreamRead *ds, Datum value)
 {
 	uint8	   *p = (uint8 *) DatumGetPointer(value);
-	uint8	   *lo = ds->large_object_buffer;
 	uint8	   *up = (uint8 *) ds->datum_upgrade_buffer;
 
-	if (lo && p >= lo && p < lo + ds->large_object_buffer_size)
-		return true;
-	if (up && p >= up && p < up + ds->datum_upgrade_buffer_size)
-		return true;
-	return false;
+	return up && p >= up && p < up + ds->datum_upgrade_buffer_size;
 }
 
 bool

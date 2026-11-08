@@ -17,6 +17,7 @@
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
 #include "cdb/memquota.h"
+#include "catalog/pg_am.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/nodeLimit.h"
 #include "executor/nodeMaterial.h"
@@ -225,14 +226,6 @@ memory_quota_kb(Plan *plan)
 	return plan->operatorMemKB;
 }
 
-/*
- * Measured on TPC-H SF1 (6M-row AOCO lineitem, 3 primaries, -O0 build):
- * regions over pass-by-value columns ran 13-18x faster than the row
- * executor, while every referenced pass-by-reference column pays a
- * datumCopy per row on the way into a batch and made numeric-heavy
- * queries ~15% slower.  Until by-ref columns get cheap handling, auto
- * only accepts leaves whose referenced columns are all by-value.
- */
 static bool
 leaf_has_byref(Plan *leaf)
 {
@@ -251,6 +244,30 @@ leaf_has_byref(Plan *leaf)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * AOCS block buffers remain alive until the batch has been consumed, so their
+ * by-ref values need no per-row copy.  Row scans and row adapters have no such
+ * ownership guarantee and still copy every referenced by-ref value.
+ */
+static bool
+leaf_has_expensive_byref(VectorizeContext *ctx, Plan *leaf)
+{
+	SeqScan	   *scan;
+	RangeTblEntry *rte;
+
+	if (!leaf_has_byref(leaf))
+		return false;
+	if (!IsA(leaf, SeqScan))
+		return true;
+
+	scan = (SeqScan *) leaf;
+	if (scan->scanrelid <= 0 || scan->scanrelid > list_length(ctx->stmt->rtable))
+		return true;
+	rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
+	return rte->rtekind != RTE_RELATION ||
+		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID;
 }
 
 static bool
@@ -300,10 +317,11 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 		decision(ctx, plan, "estimated input rows are below gp_vectorized_min_rows");
 		return false;
 	}
-	if (leaf_has_byref(IsA(plan, SeqScan) ? plan : outerPlan(plan)) ||
-		(IsA(plan, HashJoin) && leaf_has_byref(outerPlan(innerPlan(plan)))))
+	if (leaf_has_expensive_byref(ctx, IsA(plan, SeqScan) ? plan : outerPlan(plan)) ||
+		(IsA(plan, HashJoin) &&
+		 leaf_has_expensive_byref(ctx, outerPlan(innerPlan(plan)))))
 	{
-		decision(ctx, plan, "the leaf reads pass-by-reference columns");
+		decision(ctx, plan, "the leaf copies pass-by-reference columns into batches");
 		return false;
 	}
 

@@ -11,6 +11,7 @@ DROP TABLE IF EXISTS vector_aoro_test;
 DROP TABLE IF EXISTS vector_limit_test;
 DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
+DROP TABLE IF EXISTS vector_numeric_test;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -44,6 +45,13 @@ SELECT g,
             TIMESTAMPTZ '2001-01-01 00:00:00+00' + g * INTERVAL '1 hour' END
 FROM generate_series(1, 10) AS g;
 ANALYZE vector_time_test;
+CREATE TABLE vector_numeric_test (id int4, n numeric)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_numeric_test
+VALUES (1, -1.20), (2, 0), (3, 1.2), (4, 1.200), (5, 2.5),
+       (6, 'NaN'), (7, 'NaN'), (8, NULL);
+ANALYZE vector_numeric_test;
 CREATE TABLE vector_limit_test (id int4, val text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
@@ -233,6 +241,20 @@ SELECT count(*) FILTER (WHERE tz = TIMESTAMPTZ '2001-01-01 05:00:00+00') AS eq,
        count(*) FILTER (WHERE tz > TIMESTAMPTZ '2001-01-01 05:00:00+00') AS gt,
        count(*) FILTER (WHERE tz >= TIMESTAMPTZ '2001-01-01 05:00:00+00') AS ge
 FROM vector_time_test;
+SELECT count(*) FILTER (WHERE n = 1.20) AS eq,
+       count(*) FILTER (WHERE n <> 1.20) AS ne,
+       count(*) FILTER (WHERE n < 1.20) AS lt,
+       count(*) FILTER (WHERE n <= 1.20) AS le,
+       count(*) FILTER (WHERE n > 1.20) AS gt,
+       count(*) FILTER (WHERE n >= 1.20) AS ge
+FROM vector_numeric_test;
+SELECT count(*) FILTER (WHERE n = 'NaN') AS eq,
+       count(*) FILTER (WHERE n <> 'NaN') AS ne,
+       count(*) FILTER (WHERE n < 'NaN') AS lt,
+       count(*) FILTER (WHERE n <= 'NaN') AS le,
+       count(*) FILTER (WHERE n > 'NaN') AS gt,
+       count(*) FILTER (WHERE n >= 'NaN') AS ge
+FROM vector_numeric_test;
 SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
@@ -522,6 +544,8 @@ SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
 SET gp_vectorized_min_rows = 1;
 EXPLAIN (COSTS OFF) SELECT sum(big), sum(id) FROM vector_aoco_test;
+EXPLAIN (COSTS OFF) SELECT sum(num) FROM vector_aoco_test WHERE num > 10;
+EXPLAIN (COSTS OFF) SELECT sum(num) FROM vector_heap_test WHERE num > 10;
 EXPLAIN (COSTS OFF) SELECT id FROM vector_aoco_test LIMIT 3;
 EXPLAIN (COSTS OFF) SELECT id, id * 2 AS d FROM vector_aoco_test LIMIT 3;
 SELECT sum(id * 2 + 1) FROM vector_aoco_test;
@@ -543,3 +567,4 @@ DROP TABLE vector_aoro_test;
 DROP TABLE vector_limit_test;
 DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
+DROP TABLE vector_numeric_test;
