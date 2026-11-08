@@ -55,13 +55,13 @@ INSERT INTO vector_numeric_test
 VALUES (1, -1.20), (2, 0), (3, 1.2), (4, 1.200), (5, 2.5),
        (6, 'NaN'), (7, 'NaN'), (8, NULL);
 ANALYZE vector_numeric_test;
-CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8)
+CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8, s int2)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
 INSERT INTO vector_arithmetic_test
-VALUES (1, 2147483647, 9223372036854775807),
-       (2, -2147483648, -9223372036854775808),
-       (3, 12, 24), (4, NULL, NULL);
+VALUES (1, 2147483647, 9223372036854775807, 32767),
+       (2, -2147483648, -9223372036854775808, -32768),
+       (3, 12, 24, 12), (4, NULL, NULL, NULL);
 ANALYZE vector_arithmetic_test;
 CREATE TABLE vector_float_test (id int4, f4 float4, f8 float8)
 WITH (appendonly = true, orientation = column)
@@ -725,6 +725,37 @@ FROM vector_arithmetic_test WHERE id = 3;
  ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? 
 ----------+----------+----------+----------+----------+----------+----------+----------+----------+----------
        17 |        7 |       60 |        2 |        2 |       29 |       19 |      120 |        4 |        4
+(1 row)
+
+SELECT sum(s), min(s), max(s) FROM vector_arithmetic_test;
+ sum |  min   |  max  
+-----+--------+-------
+  11 | -32768 | 32767
+(1 row)
+
+SELECT sum(f4), sum(f8) FROM vector_float_test WHERE id = 2;
+ sum | sum 
+-----+-----
+  -0 |  -0
+(1 row)
+
+SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
+    min    | max |    min    | max 
+-----------+-----+-----------+-----
+ -Infinity | NaN | -Infinity | NaN
+(1 row)
+
+SELECT min(d), max(d), min(ts), max(ts), min(tz), max(tz) FROM vector_time_test;
+    min     |    max     |           min            |           max            |             min              |             max              
+------------+------------+--------------------------+--------------------------+------------------------------+------------------------------
+ 01-02-2001 | 01-11-2001 | Mon Jan 01 01:00:00 2001 | Mon Jan 01 09:00:00 2001 | Sun Dec 31 17:00:00 2000 PST | Mon Jan 01 02:00:00 2001 PST
+(1 row)
+
+SELECT array_agg(CASE WHEN id = 2 THEN NULL ELSE id END ORDER BY id)
+FROM vector_aoco_small WHERE id <= 3;
+ array_agg  
+------------
+ {1,NULL,3}
 (1 row)
 
 SELECT count(a + 1), count(b + 1) FROM vector_arithmetic_test;

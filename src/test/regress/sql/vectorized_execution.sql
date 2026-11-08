@@ -55,13 +55,13 @@ INSERT INTO vector_numeric_test
 VALUES (1, -1.20), (2, 0), (3, 1.2), (4, 1.200), (5, 2.5),
        (6, 'NaN'), (7, 'NaN'), (8, NULL);
 ANALYZE vector_numeric_test;
-CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8)
+CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8, s int2)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
 INSERT INTO vector_arithmetic_test
-VALUES (1, 2147483647, 9223372036854775807),
-       (2, -2147483648, -9223372036854775808),
-       (3, 12, 24), (4, NULL, NULL);
+VALUES (1, 2147483647, 9223372036854775807, 32767),
+       (2, -2147483648, -9223372036854775808, -32768),
+       (3, 12, 24, 12), (4, NULL, NULL, NULL);
 ANALYZE vector_arithmetic_test;
 CREATE TABLE vector_float_test (id int4, f4 float4, f8 float8)
 WITH (appendonly = true, orientation = column)
@@ -302,6 +302,12 @@ FROM vector_numeric_test;
 SELECT a + 5, a - 5, a * 5, a / 5, a % 5,
        b + 5, b - 5, b * 5, b / 5, b % 5
 FROM vector_arithmetic_test WHERE id = 3;
+SELECT sum(s), min(s), max(s) FROM vector_arithmetic_test;
+SELECT sum(f4), sum(f8) FROM vector_float_test WHERE id = 2;
+SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
+SELECT min(d), max(d), min(ts), max(ts), min(tz), max(tz) FROM vector_time_test;
+SELECT array_agg(CASE WHEN id = 2 THEN NULL ELSE id END ORDER BY id)
+FROM vector_aoco_small WHERE id <= 3;
 SELECT count(a + 1), count(b + 1) FROM vector_arithmetic_test;
 SELECT a + 1 FROM vector_arithmetic_test WHERE id = 1;
 SELECT a - 1 FROM vector_arithmetic_test WHERE id = 2;

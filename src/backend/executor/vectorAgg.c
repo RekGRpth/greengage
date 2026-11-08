@@ -17,6 +17,7 @@
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "miscadmin.h"
+#include "utils/float.h"
 #include "utils/tuplesort.h"
 
 struct VectorAggState
@@ -418,12 +419,30 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 		return true;
 	}
 	if (isnull)
-		return true;
+		return pertrans->transfn.fn_strict;
 
 	switch (pertrans->aggref->aggfnoid)
 	{
 		case 2108:				/* sum(int4) */
 			pergroupstate->transValue += DatumGetInt32(value);
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2109:				/* sum(int2) */
+			pergroupstate->transValue += (int64) DatumGetInt16(value);
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2110:				/* sum(float4) */
+		case 2111:				/* sum(float8) */
+			if (pergroupstate->noTransValue)
+				pergroupstate->transValue = pertrans->aggref->aggfnoid == 2110 ?
+					Float8GetDatum((float8) DatumGetFloat4(value)) : value;
+			else
+				pergroupstate->transValue = Float8GetDatum(
+					DatumGetFloat8(pergroupstate->transValue) +
+					(pertrans->aggref->aggfnoid == 2110 ?
+					 (float8) DatumGetFloat4(value) : DatumGetFloat8(value)));
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
@@ -441,6 +460,44 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
+		case 2117:				/* max(int2) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt16(pergroupstate->transValue) < DatumGetInt16(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2119:				/* max(float4) */
+			if (pergroupstate->noTransValue ||
+				float4_cmp_internal(DatumGetFloat4(pergroupstate->transValue),
+									DatumGetFloat4(value)) < 0)
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2120:				/* max(float8) */
+			if (pergroupstate->noTransValue ||
+				float8_cmp_internal(DatumGetFloat8(pergroupstate->transValue),
+									DatumGetFloat8(value)) < 0)
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2122:				/* max(date) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt32(pergroupstate->transValue) < DatumGetInt32(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2126:				/* max(timestamp) */
+		case 2127:				/* max(timestamptz) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt64(pergroupstate->transValue) < DatumGetInt64(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
 		case 2131:				/* min(int8) */
 			if (pergroupstate->noTransValue ||
 				DatumGetInt64(pergroupstate->transValue) > DatumGetInt64(value))
@@ -451,6 +508,44 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 		case 2132:				/* min(int4) */
 			if (pergroupstate->noTransValue ||
 				DatumGetInt32(pergroupstate->transValue) > DatumGetInt32(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2133:				/* min(int2) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt16(pergroupstate->transValue) > DatumGetInt16(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2135:				/* min(float4) */
+			if (pergroupstate->noTransValue ||
+				float4_cmp_internal(DatumGetFloat4(pergroupstate->transValue),
+									DatumGetFloat4(value)) > 0)
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2136:				/* min(float8) */
+			if (pergroupstate->noTransValue ||
+				float8_cmp_internal(DatumGetFloat8(pergroupstate->transValue),
+									DatumGetFloat8(value)) > 0)
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2138:				/* min(date) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt32(pergroupstate->transValue) > DatumGetInt32(value))
+				pergroupstate->transValue = value;
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
+		case 2142:				/* min(timestamp) */
+		case 2143:				/* min(timestamptz) */
+			if (pergroupstate->noTransValue ||
+				DatumGetInt64(pergroupstate->transValue) > DatumGetInt64(value))
 				pergroupstate->transValue = value;
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
