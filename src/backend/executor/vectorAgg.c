@@ -30,6 +30,7 @@ struct VectorAggState
 	Datum	  **values;
 	bool	  **nulls;
 	TupleTableSlot *input_slot;	/* full input row, for spilling */
+	int			projected_set;
 	bool		group_open;
 	bool		input_done;
 	bool		output_done;
@@ -97,7 +98,7 @@ VectorAggPlanIsSupported(Agg *agg)
 		 agg->aggstrategy != AGG_SORTED) ||
 		(agg->aggsplit != AGGSPLIT_SIMPLE &&
 		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
-		agg->groupingSets != NIL || agg->chain != NIL ||
+		agg->chain != NIL ||
 		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming)
 		return false;
 	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
@@ -118,6 +119,8 @@ VectorAggPlanIsSupported(Agg *agg)
 
 		if (te->resjunk)
 			goto done;
+		if (IsA(te->expr, GroupingSetId))
+			continue;
 		if (IsA(te->expr, Var))
 		{
 			if (!VectorExprIsSupported((Expr *) te->expr, &vars))
@@ -172,6 +175,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 		return NULL;
 
 	state = MemoryContextAllocZero(parent, sizeof(VectorAggState));
+	state->projected_set = -1;
 	state->context = AllocSetContextCreate(parent, "Vector Aggregate",
 										 ALLOCSET_DEFAULT_MINSIZE,
 										 ALLOCSET_DEFAULT_INITSIZE,
@@ -488,6 +492,21 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 	}
 }
 
+static void
+advance_sorted_row(VectorAggState *state, int row)
+{
+	AggState   *agg = state->agg;
+	int			numsets = Max(agg->phase->numsets, 1);
+	int			setno;
+
+	/* Every input row contributes to every grouping set in this phase. */
+	for (setno = 0; setno < numsets; setno++)
+	{
+		VectorAggSelectSet(agg, setno);
+		advance_row(state, agg->pergroups[setno], row);
+	}
+}
+
 void
 VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 {
@@ -528,13 +547,20 @@ start_sorted_group(VectorAggState *state, VectorBatch *batch, int row)
 	HeapTuple	first;
 	MemoryContext oldcontext;
 
-	ReScanExprContext(agg->aggcontexts[0]);
+	int			numsets = Max(agg->phase->numsets, 1);
+	int			numReset = state->projected_set < 0 ? numsets :
+		Min(state->projected_set + 1, numsets);
+	int			i;
+
+	for (i = 0; i < numReset; i++)
+		ReScanExprContext(agg->aggcontexts[i]);
 	input = fill_input_slot(state, batch, row);
 	first = ExecCopySlotHeapTuple(input);
 	ExecForceStoreHeapTuple(first, agg->ss.ss_ScanTupleSlot, true);
 	oldcontext = MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
-	VectorAggInitializePlain(agg);
+	VectorAggInitializeSet(agg, numReset);
 	MemoryContextSwitchTo(oldcontext);
+	state->projected_set = 0;
 	state->group_open = true;
 }
 
@@ -543,6 +569,7 @@ VectorAggProcessBatchSorted(VectorAggState *state, VectorBatch *batch,
 							int *position)
 {
 	AggState   *agg = state->agg;
+	int			numsets = Max(agg->phase->numsets, 1);
 
 	if (batch->nselected == 0)
 		return NULL;
@@ -551,22 +578,48 @@ VectorAggProcessBatchSorted(VectorAggState *state, VectorBatch *batch,
 	while (*position < batch->nselected)
 	{
 		int			row = VectorBatchSelectedRow(batch, *position);
+		TupleTableSlot *input;
+		TupleTableSlot *result;
 
 		if ((*position & 0xff) == 0)
 			CHECK_FOR_INTERRUPTS();
-		if (state->group_open &&
-			!VectorAggSameGroup(agg, fill_input_slot(state, batch, row)))
-		{
-			TupleTableSlot *result = VectorAggRetrieveGroup(agg);
+		input = fill_input_slot(state, batch, row);
 
+		/*
+		 * A pending row can cross boundaries of several enclosing grouping
+		 * sets.  Project one set per call, leaving the row pending until all
+		 * crossed sets have been emitted.
+		 */
+		if (!state->group_open && state->projected_set >= 0 &&
+			state->projected_set + 1 < numsets)
+		{
+			int			nextSetSize = agg->phase->gset_lengths[state->projected_set + 1];
+
+			if (nextSetSize > 0 &&
+				!VectorAggSameGroup(agg, input, nextSetSize))
+			{
+				state->projected_set++;
+				result = VectorAggRetrieveGroup(agg, state->projected_set);
+				ResetExprContext(agg->tmpcontext);
+				if (result != NULL)
+					return result;
+				continue;
+			}
+		}
+
+		if (state->group_open &&
+			!VectorAggSameGroup(agg, input, agg->phase->aggnode->numCols))
+		{
+			result = VectorAggRetrieveGroup(agg, state->projected_set);
 			state->group_open = false;
 			ResetExprContext(agg->tmpcontext);
 			if (result != NULL)
 				return result;	/* resume at this row, the next group's first */
+			continue;
 		}
 		if (!state->group_open)
 			start_sorted_group(state, batch, row);
-		advance_row(state, agg->pergroups[0], row);
+		advance_sorted_row(state, row);
 		(*position)++;
 	}
 	ResetExprContext(agg->tmpcontext);
@@ -582,6 +635,23 @@ VectorAggFinish(VectorAggState *state)
 	state->input_done = true;
 }
 
+static void
+initialize_empty_sorted_set(VectorAggState *state)
+{
+	AggState   *agg = state->agg;
+	int			numsets = Max(agg->phase->numsets, 1);
+	int			numReset = state->projected_set < 0 ? numsets :
+		Min(state->projected_set + 1, numsets);
+	MemoryContext oldcontext;
+	int			i;
+
+	for (i = 0; i < numReset; i++)
+		ReScanExprContext(agg->aggcontexts[i]);
+	oldcontext = MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
+	VectorAggInitializeSet(agg, numReset);
+	MemoryContextSwitchTo(oldcontext);
+}
+
 TupleTableSlot *
 VectorAggNext(VectorAggState *state)
 {
@@ -591,30 +661,42 @@ VectorAggNext(VectorAggState *state)
 	if (state->output_done)
 		return NULL;
 
-	if (state->agg->aggstrategy == AGG_SORTED && state->group_open)
-	{
-		TupleTableSlot *result;
-
-		ResetExprContext(state->agg->tmpcontext);
-		result = VectorAggRetrieveGroup(state->agg);
-		state->group_open = false;
-		if (result != NULL)
-			return result;
-	}
-
-	if (state->agg->aggstrategy == AGG_HASHED)
-	{
-		result = VectorAggRetrieveHashed(state->agg);
-		if (result == NULL)
-			state->output_done = true;
-		return result;
-	}
-
 	if (state->agg->aggstrategy == AGG_SORTED)
 	{
+		int			numsets = Max(state->agg->phase->numsets, 1);
+
+		if (state->group_open)
+		{
+			ResetExprContext(state->agg->tmpcontext);
+			result = VectorAggRetrieveGroup(state->agg, state->projected_set);
+			state->group_open = false;
+			if (result != NULL)
+				return result;
+		}
+		while (state->projected_set + 1 < numsets)
+		{
+			int			nextset = state->projected_set + 1;
+
+			/* Empty input has rows only for grouping sets of size zero. */
+			if (state->projected_set < 0 && state->agg->phase->aggnode->numCols > 0 &&
+				(state->agg->phase->gset_lengths == NULL ||
+				 state->agg->phase->gset_lengths[nextset] > 0))
+			{
+				state->projected_set = nextset;
+				continue;
+			}
+			state->projected_set = nextset;
+			initialize_empty_sorted_set(state);
+			result = VectorAggRetrieveGroup(state->agg, state->projected_set);
+			if (result != NULL)
+				return result;
+		}
 		state->output_done = true;
 		return NULL;
 	}
+
+	if (state->agg->aggstrategy == AGG_HASHED)
+		return VectorAggRetrieveHashed(state->agg);
 
 	state->output_done = true;
 	return VectorAggRetrievePlain(state->agg);
@@ -636,5 +718,6 @@ VectorAggReset(VectorAggState *state)
 	state->input_done = state->agg->aggstrategy == AGG_HASHED &&
 		state->agg->table_filled;
 	state->group_open = false;
+	state->projected_set = -1;
 	state->output_done = false;
 }

@@ -335,16 +335,17 @@ display_var_mutator(Node *node, void *context)
 {
 	Plan	   *outer = (Plan *) context;
 	Var		   *var = (Var *) node;
-	TargetEntry *te;
 
 	if (node == NULL)
 		return NULL;
-	if (!IsA(node, Var) || var->varno != OUTER_VAR)
+	if (!IsA(node, Var) || var->varno != OUTER_VAR || !IsA(outer, SeqScan))
 		return expression_tree_mutator(node, display_var_mutator, context);
-	te = get_tle_by_resno(outer->targetlist, var->varattno);
-	if (te == NULL)
-		elog(ERROR, "vector region could not map display variable %d", var->varattno);
-	return (Node *) copyObject(te->expr);
+	{
+		Var		   *copy = copyObject(var);
+
+		copy->varno = ((SeqScan *) outer)->scanrelid;
+		return (Node *) copy;
+	}
 }
 
 static Expr *
@@ -385,16 +386,17 @@ make_region(VectorizeContext *ctx, Plan *root)
 									exprCollation(expr), 0);
 		Var		   *outvar = makeVar(INDEX_VAR, k, exprType(expr), exprTypmod(expr),
 								   exprCollation(expr), 0);
+		Expr	   *scanexpr = (Expr *) scanvar;
+
+		if (IsA(expr, Aggref))
+			scanexpr = display_aggref((Aggref *) expr, outerPlan(root));
 
 		colnames = lappend(colnames, makeString(name));
 		coltypes = lappend_oid(coltypes, exprType(expr));
 		coltypmods = lappend_int(coltypmods, exprTypmod(expr));
 		colcollations = lappend_oid(colcollations, exprCollation(expr));
 		scan_tlist = lappend(scan_tlist,
-							 makeTargetEntry(IsA(expr, Aggref) ?
-											 display_aggref((Aggref *) expr, outerPlan(root)) :
-											 (Expr *) scanvar,
-											 k, name, te->resjunk));
+							 makeTargetEntry(scanexpr, k, name, te->resjunk));
 		out_tlist = lappend(out_tlist,
 							makeTargetEntry((Expr *) outvar, k, name, te->resjunk));
 		k++;
@@ -402,9 +404,9 @@ make_region(VectorizeContext *ctx, Plan *root)
 
 	rte = makeNode(RangeTblEntry);
 	rte->rtekind = RTE_NAMEDTUPLESTORE;
-	rte->enrname = "gg_vector_region";
+	rte->enrname = "vector_region";
 	rte->enrtuples = root->plan_rows;
-	rte->eref = makeAlias("gg_vector_region", colnames);
+	rte->eref = makeAlias("vector_region", colnames);
 	rte->coltypes = coltypes;
 	rte->coltypmods = coltypmods;
 	rte->colcollations = colcollations;
@@ -528,6 +530,7 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 
 	if (IsA(node, Sort) && slice_runs_on_segments(ctx) &&
 		VectorSortPlanIsSupported((Sort *) node) &&
+		IsA(outerPlan(node), SeqScan) &&
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);

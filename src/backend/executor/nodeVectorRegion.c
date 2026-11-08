@@ -34,7 +34,7 @@
 #include "optimizer/optimizer.h"
 #include "utils/rel.h"
 
-#define VECTOR_REGION_NAME "GGVectorRegion"
+#define VECTOR_REGION_NAME "VectorRegion"
 
 typedef struct VectorRegionState
 {

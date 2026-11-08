@@ -31,12 +31,15 @@ extern void VectorAggAdvanceTransition(AggState *aggstate,
 extern void VectorAggInitializeEntry(AggState *aggstate,
 									 TupleHashEntry entry);
 extern void VectorAggInitializePlain(AggState *aggstate);
+extern void VectorAggInitializeSet(AggState *aggstate, int numReset);
+extern void VectorAggSelectSet(AggState *aggstate, int currentSet);
 extern void VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot,
 								uint32 hash);
 extern void VectorAggFinishInput(AggState *aggstate);
 extern TupleTableSlot *VectorAggRetrievePlain(AggState *aggstate);
-extern TupleTableSlot *VectorAggRetrieveGroup(AggState *aggstate);
-extern bool VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot);
+extern TupleTableSlot *VectorAggRetrieveGroup(AggState *aggstate, int currentSet);
+extern bool VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot,
+							   int numCols);
 extern TupleTableSlot *VectorAggRetrieveHashed(AggState *aggstate);
 
 #endif							/* VECTORAGG_H */

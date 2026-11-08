@@ -5405,6 +5405,18 @@ VectorAggInitializePlain(AggState *aggstate)
 }
 
 void
+VectorAggInitializeSet(AggState *aggstate, int numReset)
+{
+	initialize_aggregates(aggstate, aggstate->pergroups, numReset);
+}
+
+void
+VectorAggSelectSet(AggState *aggstate, int currentSet)
+{
+	select_current_set(aggstate, currentSet, false);
+}
+
+void
 VectorAggFinishInput(AggState *aggstate)
 {
 	aggstate->input_done = true;
@@ -5424,7 +5436,7 @@ VectorAggRetrievePlain(AggState *aggstate)
 	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
 	TupleTableSlot *result;
 
-	ResetExprContext(econtext);
+	ReScanExprContext(econtext);
 	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
 	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, 0);
 	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[0]);
@@ -5434,27 +5446,26 @@ VectorAggRetrievePlain(AggState *aggstate)
 }
 
 bool
-VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot)
+VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot, int numCols)
 {
-	Agg		   *node = aggstate->phase->aggnode;
 	ExprContext *tmpcontext = aggstate->tmpcontext;
 
 	tmpcontext->ecxt_outertuple = slot;
 	tmpcontext->ecxt_innertuple = aggstate->ss.ss_ScanTupleSlot;
-	return ExecQualAndReset(aggstate->phase->eqfunctions[node->numCols - 1],
+	return ExecQualAndReset(aggstate->phase->eqfunctions[numCols - 1],
 							tmpcontext);
 }
 
 TupleTableSlot *
-VectorAggRetrieveGroup(AggState *aggstate)
+VectorAggRetrieveGroup(AggState *aggstate, int currentSet)
 {
 	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
 
 	ReScanExprContext(econtext);
 	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
-	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, 0);
-	select_current_set(aggstate, 0, false);
-	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[0]);
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, currentSet);
+	select_current_set(aggstate, currentSet, false);
+	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[currentSet]);
 	return project_aggregates(aggstate);
 }
 

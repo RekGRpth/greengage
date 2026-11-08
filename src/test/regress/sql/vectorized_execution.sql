@@ -312,6 +312,25 @@ SELECT id % 3 AS g, count(DISTINCT id) FROM vector_aoco_small
 GROUP BY 1 HAVING count(DISTINCT id) > 3 ORDER BY 1;
 SELECT id % 100 AS g, array_agg(DISTINCT id % 10 ORDER BY id % 10)
 FROM vector_aoco_spill_wide GROUP BY 1 ORDER BY 1 LIMIT 3;
+SET enable_hashagg = off;
+SELECT id % 2 AS a, id % 3 AS b, GROUPING(id % 2, id % 3) AS g,
+       count(*), sum(id), min(id), max(id)
+FROM vector_aoco_small GROUP BY ROLLUP(a, b) ORDER BY a, b, g;
+SELECT id % 2 AS a, id % 3 AS b, GROUPING(id % 2, id % 3) AS g, count(*)
+FROM vector_aoco_small GROUP BY CUBE(a, b) ORDER BY a, b, g;
+SELECT id % 2 AS a, id % 3 AS b, GROUPING(id % 2, id % 3) AS g, count(*)
+FROM vector_aoco_small GROUP BY GROUPING SETS ((a, b), (a), ()) ORDER BY a, b, g;
+SELECT id % 2 AS a, count(*) FROM vector_aoco_small GROUP BY ROLLUP(a) ORDER BY a;
+SELECT id % 2 AS a, id % 3 AS b, GROUPING(id % 2, id % 3) AS g, count(*)
+FROM vector_aoco_small WHERE id < 0 GROUP BY ROLLUP(a, b) ORDER BY a, b, g;
+SELECT id % 3 AS a, id % 4 AS b, GROUPING(id % 3, id % 4) AS g,
+       count(*), sum(id)
+FROM vector_aoco_test GROUP BY ROLLUP(a, b) HAVING count(*) > 1000
+ORDER BY a, b, g;
+SELECT id % 2 AS a, GROUPING(id % 2) AS g,
+       string_agg(val, ',' ORDER BY id) AS vals
+FROM vector_aoco_small GROUP BY ROLLUP(a) ORDER BY a, g;
+RESET enable_hashagg;
 EXPLAIN (COSTS OFF)
 SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
 SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id),
