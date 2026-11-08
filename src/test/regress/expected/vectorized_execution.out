@@ -12,6 +12,7 @@ DROP TABLE IF EXISTS vector_limit_test;
 DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
 DROP TABLE IF EXISTS vector_numeric_test;
+DROP TABLE IF EXISTS vector_append_parent CASCADE;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -94,6 +95,31 @@ CREATE TABLE vector_aoco_spill_wide (id int4, pad text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
 INSERT INTO vector_aoco_spill_wide SELECT g, repeat('x', 1000) FROM generate_series(1, 50000) AS g;
 ANALYZE vector_aoco_spill_wide;
+CREATE TABLE vector_append_parent (id int4, big int8, val text, num numeric(12,2))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+CREATE TABLE vector_append_child1 () INHERITS (vector_append_parent);
+CREATE TABLE vector_append_child2 () INHERITS (vector_append_parent)
+WITH (appendonly = false);
+CREATE TABLE vector_append_child3 () INHERITS (vector_append_parent);
+INSERT INTO vector_append_child1
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(1, 2500) AS g;
+INSERT INTO vector_append_child2
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(2501, 5000) AS g;
+INSERT INTO vector_append_child3
+SELECT g, g::int8 * 10,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || g END,
+       (g % 100)::numeric / 3
+FROM generate_series(5001, 7500) AS g;
+ANALYZE vector_append_child1;
+ANALYZE vector_append_child2;
+ANALYZE vector_append_child3;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -1920,6 +1946,68 @@ LEFT JOIN vector_aoro_test r ON h.id = r.id AND r.id < 100;
  10000
 (1 row)
 
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vector_append_parent;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Custom Scan (VectorRegion)
+                     ->  Append
+                           ->  Seq Scan on vector_append_parent
+                           ->  Seq Scan on vector_append_child1
+                           ->  Seq Scan on vector_append_child2
+                           ->  Seq Scan on vector_append_child3
+(10 rows)
+
+SELECT count(*), sum(id), min(id), max(id) FROM vector_append_parent;
+ count |   sum    | min | max  
+-------+----------+-----+------
+  7500 | 28128750 |   1 | 7500
+(1 row)
+
+SELECT id % 3 AS g, count(*), sum(num)
+FROM vector_append_parent WHERE id % 5 <> 0 GROUP BY g ORDER BY g;
+ g | count |   sum    
+---+-------+----------
+ 0 |  2000 | 33333.25
+ 1 |  2000 | 33333.25
+ 2 |  2000 | 33333.25
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, big FROM vector_append_parent WHERE id < 10 ORDER BY id;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: vector_region.c1
+   ->  Sort
+         Sort Key: vector_region.c1
+         ->  Custom Scan (VectorRegion)
+               ->  Append
+                     ->  Seq Scan on vector_append_parent
+                           Filter: (id < 10)
+                     ->  Seq Scan on vector_append_child1
+                           Filter: (id < 10)
+                     ->  Seq Scan on vector_append_child2
+                           Filter: (id < 10)
+                     ->  Seq Scan on vector_append_child3
+                           Filter: (id < 10)
+(15 rows)
+
+SELECT id, big FROM vector_append_parent WHERE id < 10 ORDER BY id;
+ id | big 
+----+-----
+  1 |  10
+  2 |  20
+  3 |  30
+  4 |  40
+  5 |  50
+  6 |  60
+  7 |  70
+  8 |  80
+  9 |  90
+(9 rows)
+
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -2025,3 +2113,4 @@ DROP TABLE vector_limit_test;
 DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
+DROP TABLE vector_append_parent CASCADE;

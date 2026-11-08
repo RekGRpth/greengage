@@ -15,8 +15,10 @@
 
 #include "access/sysattr.h"
 #include "access/tableam.h"
+#include "access/tupdesc.h"
 #include "cdb/cdbaocsam.h"
 #include "executor/executor.h"
+#include "executor/nodeAppend.h"
 #include "executor/nodeCustom.h"
 #include "executor/nodeLimit.h"
 #include "executor/nodeMaterial.h"
@@ -40,6 +42,9 @@ typedef struct VectorRegionState
 {
 	CustomScanState css;
 	SeqScanState *scan;
+	AppendState *append;
+	int			append_index;
+	VectorExprState **append_quals;
 	PlanState  *input;
 	AggState   *agg;
 	SortState  *sort;
@@ -140,6 +145,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	PlanState  *child;
 	SeqScan	   *scan = NULL;
 	Relation	relation = NULL;
+	bool		needs_row_reader = false;
 	ListCell   *lc;
 	int			col = 0;
 
@@ -169,6 +175,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		outer = outerPlanState(state->agg);
 		if (IsA(outer, SeqScanState))
 			state->scan = (SeqScanState *) outer;
+		else if (IsA(outer, AppendState))
+			state->append = (AppendState *) outer;
 		else
 			state->input = outer;
 	}
@@ -295,12 +303,44 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		state->hj = (HashJoinState *) child;
 		state->scan = (SeqScanState *) outerPlanState(state->hj);
 	}
+	else if (IsA(child, AppendState))
+		state->append = (AppendState *) child;
 	else if (IsA(child, SeqScanState))
 		state->scan = (SeqScanState *) child;
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("vector region expects a scan, aggregate, sort, limit, unique, merge join, nest loop, material or hash join")));
+				 errmsg("vector region expects a scan, append, aggregate, sort, limit, unique, merge join, nest loop, material or hash join")));
+
+	if (state->append != NULL)
+	{
+		TupleDesc	firstdesc;
+		int			i;
+
+		if (state->append->as_nplans <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("vector append expects at least one input")));
+		state->append_index = 0;
+		state->scan = (SeqScanState *) state->append->appendplans[0];
+		if (!IsA(state->scan, SeqScanState))
+			elog(ERROR, "vector append child is not a SeqScan");
+		firstdesc = RelationGetDescr(state->scan->ss.ss_currentRelation);
+		needs_row_reader = !RelationIsAoCols(state->scan->ss.ss_currentRelation);
+		for (i = 1; i < state->append->as_nplans; i++)
+		{
+			PlanState  *childstate = state->append->appendplans[i];
+
+			if (!IsA(childstate, SeqScanState) ||
+				!equalTupleDescs(firstdesc,
+								 RelationGetDescr(((SeqScanState *) childstate)->ss.ss_currentRelation), false))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("vector append children have incompatible tuple descriptors")));
+			if (!RelationIsAoCols(((SeqScanState *) childstate)->ss.ss_currentRelation))
+				needs_row_reader = true;
+		}
+	}
 
 	if (state->scan != NULL)
 	{
@@ -344,7 +384,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 										 RelationGetDescr(relation) :
 										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
 										 VECTOR_BATCH_DEFAULT_CAPACITY);
-		if (state->scan != NULL && !RelationIsAoCols(relation))
+		if (state->scan != NULL &&
+			(needs_row_reader || !RelationIsAoCols(relation)))
 		{
 			Bitmapset  *attrs = NULL;
 			int			natts = RelationGetNumberOfAttributes(relation);
@@ -354,12 +395,52 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 											 sizeof(bool) * natts);
 			pull_varattnos((Node *) scan->plan.targetlist, scan->scanrelid, &attrs);
 			pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &attrs);
+			if (state->append != NULL)
+			{
+				int			i;
+
+				for (i = 1; i < state->append->as_nplans; i++)
+				{
+					SeqScanState *childscan = (SeqScanState *) state->append->appendplans[i];
+					SeqScan   *childplan = (SeqScan *) childscan->ss.ps.plan;
+
+					pull_varattnos((Node *) childplan->plan.targetlist,
+								   childplan->scanrelid, &attrs);
+					pull_varattnos((Node *) childplan->plan.qual,
+								   childplan->scanrelid, &attrs);
+				}
+			}
 			for (col = 0; col < natts; col++)
 				state->read_attrs[col] =
 					bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
 			bms_free(attrs);
 		}
-		if (state->scan != NULL && scan->plan.qual != NIL)
+		if (state->append != NULL)
+		{
+			int			i;
+
+			state->append_quals = MemoryContextAllocZero(estate->es_query_cxt,
+										   sizeof(VectorExprState *) * state->append->as_nplans);
+			for (i = 0; i < state->append->as_nplans; i++)
+			{
+				SeqScanState *childscan = (SeqScanState *) state->append->appendplans[i];
+				SeqScan   *childplan = (SeqScan *) childscan->ss.ps.plan;
+
+				if (childplan->plan.qual == NIL)
+					continue;
+				{
+					VectorExprVarMap vars = {childplan->scanrelid, NULL, 0, estate};
+
+					state->append_quals[i] = VectorExprCompile(estate->es_query_cxt,
+															(Expr *) childplan->plan.qual,
+															state->batch, &vars);
+					if (state->append_quals[i] == NULL)
+						elog(ERROR, "vector region could not compile its append qual");
+				}
+			}
+			state->qual = state->append_quals[0];
+		}
+		else if (state->scan != NULL && scan->plan.qual != NIL)
 		{
 			VectorExprVarMap vars = {scan->scanrelid, NULL, 0, estate};
 
@@ -508,41 +589,52 @@ VectorRegionNextBatch(VectorRegionState *state)
 	if (state->position < state->batch->nselected)
 		return true;
 
-	while (!state->eof)
+	for (;;)
 	{
-		TableScanDesc scandesc;
-
-		scandesc = state->scan->ss.ss_currentScanDesc;
-		if (scandesc == NULL)
+		while (!state->eof)
 		{
-			MemoryContext oldcontext = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+			TableScanDesc scandesc;
 
-			scandesc = table_beginscan_es(state->scan->ss.ss_currentRelation,
-										  node->ss.ps.state->es_snapshot,
-										  state->scan->ss.ps.plan->targetlist,
-										  state->scan->ss.ps.plan->qual,
-										  NULL, NULL);
-			state->scan->ss.ss_currentScanDesc = scandesc;
-			MemoryContextSwitchTo(oldcontext);
-		}
-
-		if (RelationIsAoCols(state->scan->ss.ss_currentRelation))
-		{
-			if (!aocs_getnext_batch((AOCSScanDesc) scandesc, state->batch))
+			scandesc = state->scan->ss.ss_currentScanDesc;
+			if (scandesc == NULL)
 			{
-				state->eof = true;
-				break;
+				MemoryContext oldcontext = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+
+				scandesc = table_beginscan_es(state->scan->ss.ss_currentRelation,
+											  node->ss.ps.state->es_snapshot,
+											  state->scan->ss.ps.plan->targetlist,
+											  state->scan->ss.ps.plan->qual,
+											  NULL, NULL);
+				state->scan->ss.ss_currentScanDesc = scandesc;
+				MemoryContextSwitchTo(oldcontext);
 			}
+
+			if (RelationIsAoCols(state->scan->ss.ss_currentRelation))
+			{
+				if (!aocs_getnext_batch((AOCSScanDesc) scandesc, state->batch))
+				{
+					state->eof = true;
+					break;
+				}
+			}
+			else if (!VectorRegionReadRowScan(state, scandesc))
+				break;
+			state->position = 0;
+			VectorExprFilter(state->batch, state->qual);
+			/* A row scan can discover EOF while filling its final partial batch. */
+			if (state->batch->nselected > 0)
+				return true;
 		}
-		else if (!VectorRegionReadRowScan(state, scandesc))
-			break;
+
+		if (state->append == NULL ||
+			state->append_index + 1 >= state->append->as_nplans)
+			return false;
+		state->append_index++;
+		state->scan = (SeqScanState *) state->append->appendplans[state->append_index];
+		state->qual = state->append_quals[state->append_index];
 		state->position = 0;
-		VectorExprFilter(state->batch, state->qual);
-		/* A row scan can discover EOF while filling its final partial batch. */
-		if (state->batch->nselected > 0)
-			return true;
+		state->eof = false;
 	}
-	return false;
 }
 
 static void
@@ -802,7 +894,16 @@ VectorRegionEnd(CustomScanState *node)
 		VectorAggDestroy(state->vagg);
 	if (state->batch != NULL)
 		VectorBatchDestroy(state->batch);
-	if (state->qual != NULL)
+	if (state->append_quals != NULL)
+	{
+		int			i;
+
+		for (i = 0; i < state->append->as_nplans; i++)
+			if (state->append_quals[i] != NULL)
+				VectorExprDestroy(state->append_quals[i]);
+		pfree(state->append_quals);
+	}
+	else if (state->qual != NULL)
 		VectorExprDestroy(state->qual);
 	if (state->output_attnos != NULL)
 		pfree(state->output_attnos);
@@ -836,6 +937,12 @@ VectorRegionRescan(CustomScanState *node)
 	{
 		foreach(lc, node->custom_ps)
 			ExecReScan((PlanState *) lfirst(lc));
+	}
+	if (state->append != NULL)
+	{
+		state->append_index = 0;
+		state->scan = (SeqScanState *) state->append->appendplans[0];
+		state->qual = state->append_quals[0];
 	}
 	if (state->nestloop != NULL)
 		outerPlanState(state->nestloop) = state->nl_proxy;

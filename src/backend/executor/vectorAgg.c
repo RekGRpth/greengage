@@ -51,6 +51,30 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	vars->outer_ncols = list_length(outer->targetlist);
 	vars->outer_attnos = MemoryContextAlloc(context,
 										 sizeof(AttrNumber) * Max(vars->outer_ncols, 1));
+	if (IsA(outer, Append))
+	{
+		Append	   *append = (Append *) outer;
+		SeqScan	   *child;
+
+		if (append->appendplans == NIL ||
+			!IsA(linitial(append->appendplans), SeqScan))
+			return false;
+		child = (SeqScan *) linitial(append->appendplans);
+		vars->scanrelid = 0;
+		foreach(lc, child->plan.targetlist)
+		{
+			TargetEntry *te = (TargetEntry *) lfirst(lc);
+			Var		   *var;
+
+			if (te->resjunk || !IsA(te->expr, Var))
+				return false;
+			var = (Var *) te->expr;
+			if (var->varattno <= 0 || var->varlevelsup != 0)
+				return false;
+			vars->outer_attnos[col++] = var->varattno;
+		}
+		return true;
+	}
 	if (!IsA(outer, SeqScan))
 	{
 		/* A region above a Motion or another row leaf reads its output shape. */

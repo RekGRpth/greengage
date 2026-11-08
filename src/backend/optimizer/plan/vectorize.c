@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
+#include "access/tupdesc.h"
 #include "cdb/cdbllize.h"
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
@@ -36,6 +38,7 @@
 #include "parser/parsetree.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 typedef struct VectorizeContext
 {
@@ -107,6 +110,103 @@ is_simple_scan(VectorizeContext *ctx, SeqScan *scan)
 			return false;
 	}
 	return true;
+}
+
+/*
+ * A static Append can share one batch layout when every child has the same
+ * physical tuple descriptor and the same simple targetlist.  Runtime pruning,
+ * parallel workers and more general input mappings stay with the row executor.
+ */
+static bool
+is_simple_append(VectorizeContext *ctx, Append *append)
+{
+	SeqScan	   *first = NULL;
+	Relation	firstrel = NULL;
+	ListCell   *lc;
+	bool		supported = false;
+
+	if (append->appendplans == NIL || append->part_prune_info != NULL ||
+		append->join_prune_paramids != NIL || append->plan.parallel_aware)
+		return false;
+
+	foreach(lc, append->appendplans)
+	{
+		SeqScan	   *scan;
+		RangeTblEntry *rte;
+		Relation	rel;
+		ListCell   *scanlc;
+
+		if (!IsA(lfirst(lc), SeqScan))
+			goto done;
+		scan = (SeqScan *) lfirst(lc);
+		if (!is_simple_scan(ctx, scan))
+			goto done;
+
+		rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
+		rel = table_open(rte->relid, NoLock);
+		if (firstrel == NULL)
+			firstrel = rel;
+		else
+		{
+			bool		equal = equalTupleDescs(RelationGetDescr(firstrel),
+											RelationGetDescr(rel), false);
+
+			table_close(rel, NoLock);
+			if (!equal)
+				goto done;
+		}
+
+		if (first == NULL)
+		{
+			ListCell   *rootlc;
+
+			first = scan;
+			if (list_length(append->plan.targetlist) !=
+				list_length(scan->plan.targetlist))
+				goto done;
+			forboth(rootlc, append->plan.targetlist,
+					scanlc, scan->plan.targetlist)
+			{
+				TargetEntry *rootte = (TargetEntry *) lfirst(rootlc);
+				TargetEntry *scante = (TargetEntry *) lfirst(scanlc);
+				Var		   *var;
+
+				if (rootte->resjunk || !IsA(rootte->expr, Var))
+					goto done;
+				var = (Var *) rootte->expr;
+				if (var->varattno != rootte->resno || var->varlevelsup != 0 ||
+					exprType((Node *) rootte->expr) != exprType((Node *) scante->expr) ||
+					exprTypmod((Node *) rootte->expr) != exprTypmod((Node *) scante->expr))
+					goto done;
+			}
+		}
+		else
+		{
+			ListCell   *firstlc;
+
+			if (list_length(first->plan.targetlist) != list_length(scan->plan.targetlist))
+				goto done;
+			forboth(firstlc, first->plan.targetlist,
+					scanlc, scan->plan.targetlist)
+			{
+				TargetEntry *firstte = (TargetEntry *) lfirst(firstlc);
+				TargetEntry *scante = (TargetEntry *) lfirst(scanlc);
+				Var		   *firstvar = (Var *) firstte->expr;
+				Var		   *scanvar = (Var *) scante->expr;
+
+				if (firstvar->varattno != scanvar->varattno ||
+					exprType((Node *) firstte->expr) != exprType((Node *) scante->expr) ||
+					exprTypmod((Node *) firstte->expr) != exprTypmod((Node *) scante->expr))
+					goto done;
+			}
+		}
+	}
+	supported = true;
+
+done:
+	if (firstrel != NULL)
+		table_close(firstrel, NoLock);
+	return supported;
 }
 
 /*
@@ -553,8 +653,15 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
+	if (IsA(node, Append) && slice_runs_on_segments(ctx) &&
+		is_simple_append(ctx, (Append *) node) &&
+		auto_allowed(ctx, (Plan *) node))
+		return (Node *) make_region(ctx, (Plan *) node);
+
 	if (IsA(node, Agg) && slice_runs_on_segments(ctx) &&
 		VectorAggPlanIsSupported((Agg *) node) &&
+		(!IsA(outerPlan(node), Append) ||
+		 is_simple_append(ctx, (Append *) outerPlan(node))) &&
 		(!IsA(outerPlan(node), SeqScan) ||
 		 is_simple_scan(ctx, (SeqScan *) outerPlan(node))) &&
 		auto_allowed(ctx, (Plan *) node))
