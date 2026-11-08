@@ -13,6 +13,7 @@ DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
 DROP TABLE IF EXISTS vector_numeric_test;
 DROP TABLE IF EXISTS vector_arithmetic_test;
+DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
@@ -62,6 +63,14 @@ VALUES (1, 2147483647, 9223372036854775807),
        (2, -2147483648, -9223372036854775808),
        (3, 12, 24), (4, NULL, NULL);
 ANALYZE vector_arithmetic_test;
+CREATE TABLE vector_float_test (id int4, f4 float4, f8 float8)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_float_test
+VALUES (1, '-Infinity', '-Infinity'), (2, '-0.0', '-0.0'), (3, 0.0, 0.0),
+       (4, 1.5, 1.5), (5, 'Infinity', 'Infinity'),
+       (6, 'NaN', 'NaN'), (7, 'NaN', 'NaN'), (8, NULL, NULL);
+ANALYZE vector_float_test;
 CREATE TABLE vector_limit_test (id int4, val text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
@@ -308,6 +317,34 @@ SELECT a / 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT a % 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT b / 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT b % 0 FROM vector_arithmetic_test WHERE id = 3;
+SELECT count(*) FILTER (WHERE f4 = 1.5) AS eq,
+       count(*) FILTER (WHERE f4 <> 1.5) AS ne,
+       count(*) FILTER (WHERE f4 < 1.5) AS lt,
+       count(*) FILTER (WHERE f4 <= 1.5) AS le,
+       count(*) FILTER (WHERE f4 > 1.5) AS gt,
+       count(*) FILTER (WHERE f4 >= 1.5) AS ge
+FROM vector_float_test;
+SELECT count(*) FILTER (WHERE f4 = 'NaN') AS eq,
+       count(*) FILTER (WHERE f4 <> 'NaN') AS ne,
+       count(*) FILTER (WHERE f4 < 'NaN') AS lt,
+       count(*) FILTER (WHERE f4 <= 'NaN') AS le,
+       count(*) FILTER (WHERE f4 > 'NaN') AS gt,
+       count(*) FILTER (WHERE f4 >= 'NaN') AS ge
+FROM vector_float_test;
+SELECT count(*) FILTER (WHERE f8 = 1.5) AS eq,
+       count(*) FILTER (WHERE f8 <> 1.5) AS ne,
+       count(*) FILTER (WHERE f8 < 1.5) AS lt,
+       count(*) FILTER (WHERE f8 <= 1.5) AS le,
+       count(*) FILTER (WHERE f8 > 1.5) AS gt,
+       count(*) FILTER (WHERE f8 >= 1.5) AS ge
+FROM vector_float_test;
+SELECT count(*) FILTER (WHERE f8 = 'NaN') AS eq,
+       count(*) FILTER (WHERE f8 <> 'NaN') AS ne,
+       count(*) FILTER (WHERE f8 < 'NaN') AS lt,
+       count(*) FILTER (WHERE f8 <= 'NaN') AS le,
+       count(*) FILTER (WHERE f8 > 'NaN') AS gt,
+       count(*) FILTER (WHERE f8 >= 'NaN') AS ge
+FROM vector_float_test;
 SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
@@ -628,4 +665,5 @@ DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
 DROP TABLE vector_arithmetic_test;
+DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;

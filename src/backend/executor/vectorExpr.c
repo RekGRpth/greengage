@@ -30,6 +30,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/float.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
@@ -99,7 +100,19 @@ typedef enum VectorCompareOp
 	VEC_COMPARE_NUMERIC_LT,
 	VEC_COMPARE_NUMERIC_LE,
 	VEC_COMPARE_NUMERIC_GT,
-	VEC_COMPARE_NUMERIC_GE
+	VEC_COMPARE_NUMERIC_GE,
+	VEC_COMPARE_FLOAT4_EQ,
+	VEC_COMPARE_FLOAT4_NE,
+	VEC_COMPARE_FLOAT4_LT,
+	VEC_COMPARE_FLOAT4_LE,
+	VEC_COMPARE_FLOAT4_GT,
+	VEC_COMPARE_FLOAT4_GE,
+	VEC_COMPARE_FLOAT8_EQ,
+	VEC_COMPARE_FLOAT8_NE,
+	VEC_COMPARE_FLOAT8_LT,
+	VEC_COMPARE_FLOAT8_LE,
+	VEC_COMPARE_FLOAT8_GT,
+	VEC_COMPARE_FLOAT8_GE
 } VectorCompareOp;
 
 typedef enum VectorArithmeticOp
@@ -609,6 +622,30 @@ vector_compare_op(Oid functionid)
 			return VEC_COMPARE_NUMERIC_GT;
 		case F_NUMERIC_GE:
 			return VEC_COMPARE_NUMERIC_GE;
+		case F_FLOAT4EQ:
+			return VEC_COMPARE_FLOAT4_EQ;
+		case F_FLOAT4NE:
+			return VEC_COMPARE_FLOAT4_NE;
+		case F_FLOAT4LT:
+			return VEC_COMPARE_FLOAT4_LT;
+		case F_FLOAT4LE:
+			return VEC_COMPARE_FLOAT4_LE;
+		case F_FLOAT4GT:
+			return VEC_COMPARE_FLOAT4_GT;
+		case F_FLOAT4GE:
+			return VEC_COMPARE_FLOAT4_GE;
+		case F_FLOAT8EQ:
+			return VEC_COMPARE_FLOAT8_EQ;
+		case F_FLOAT8NE:
+			return VEC_COMPARE_FLOAT8_NE;
+		case F_FLOAT8LT:
+			return VEC_COMPARE_FLOAT8_LT;
+		case F_FLOAT8LE:
+			return VEC_COMPARE_FLOAT8_LE;
+		case F_FLOAT8GT:
+			return VEC_COMPARE_FLOAT8_GT;
+		case F_FLOAT8GE:
+			return VEC_COMPARE_FLOAT8_GE;
 		default:
 			return VEC_COMPARE_NONE;
 	}
@@ -1424,6 +1461,54 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 				break;
 			case VEC_COMPARE_NUMERIC_GE:
 				result = numeric_compare_datums(left->values[row], right->values[row]) >= 0;
+				break;
+			case VEC_COMPARE_FLOAT4_EQ:
+				result = float4_cmp_internal(DatumGetFloat4(left->values[row]),
+										 DatumGetFloat4(right->values[row])) == 0;
+				break;
+			case VEC_COMPARE_FLOAT4_NE:
+				result = float4_cmp_internal(DatumGetFloat4(left->values[row]),
+										 DatumGetFloat4(right->values[row])) != 0;
+				break;
+			case VEC_COMPARE_FLOAT4_LT:
+				result = float4_cmp_internal(DatumGetFloat4(left->values[row]),
+										 DatumGetFloat4(right->values[row])) < 0;
+				break;
+			case VEC_COMPARE_FLOAT4_LE:
+				result = float4_cmp_internal(DatumGetFloat4(left->values[row]),
+										 DatumGetFloat4(right->values[row])) <= 0;
+				break;
+			case VEC_COMPARE_FLOAT4_GT:
+				result = float4_cmp_internal(DatumGetFloat4(left->values[row]),
+										 DatumGetFloat4(right->values[row])) > 0;
+				break;
+			case VEC_COMPARE_FLOAT4_GE:
+				result = float4_cmp_internal(DatumGetFloat4(left->values[row]),
+										 DatumGetFloat4(right->values[row])) >= 0;
+				break;
+			case VEC_COMPARE_FLOAT8_EQ:
+				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
+										 DatumGetFloat8(right->values[row])) == 0;
+				break;
+			case VEC_COMPARE_FLOAT8_NE:
+				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
+										 DatumGetFloat8(right->values[row])) != 0;
+				break;
+			case VEC_COMPARE_FLOAT8_LT:
+				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
+										 DatumGetFloat8(right->values[row])) < 0;
+				break;
+			case VEC_COMPARE_FLOAT8_LE:
+				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
+										 DatumGetFloat8(right->values[row])) <= 0;
+				break;
+			case VEC_COMPARE_FLOAT8_GT:
+				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
+										 DatumGetFloat8(right->values[row])) > 0;
+				break;
+			case VEC_COMPARE_FLOAT8_GE:
+				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
+										 DatumGetFloat8(right->values[row])) >= 0;
 				break;
 			default:
 				pg_unreachable();
