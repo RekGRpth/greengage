@@ -18,6 +18,7 @@
 #include "catalog/pg_type_d.h"
 #include "cdb/cdbvars.h"
 #include "commands/sequence.h"
+#include "common/int.h"
 #include "executor/execExpr.h"
 #include "executor/nodeSubplan.h"
 #include "executor/vectorExpr.h"
@@ -101,6 +102,21 @@ typedef enum VectorCompareOp
 	VEC_COMPARE_NUMERIC_GE
 } VectorCompareOp;
 
+typedef enum VectorArithmeticOp
+{
+	VEC_ARITHMETIC_NONE,
+	VEC_ARITHMETIC_INT4_ADD,
+	VEC_ARITHMETIC_INT4_SUB,
+	VEC_ARITHMETIC_INT4_MUL,
+	VEC_ARITHMETIC_INT4_DIV,
+	VEC_ARITHMETIC_INT4_MOD,
+	VEC_ARITHMETIC_INT8_ADD,
+	VEC_ARITHMETIC_INT8_SUB,
+	VEC_ARITHMETIC_INT8_MUL,
+	VEC_ARITHMETIC_INT8_DIV,
+	VEC_ARITHMETIC_INT8_MOD
+} VectorArithmeticOp;
+
 typedef struct VectorValue
 {
 	Oid			typid;
@@ -128,6 +144,7 @@ typedef struct VectorExprStep
 			FmgrInfo	fn;
 			bool		strict;
 			VectorCompareOp compare;
+			VectorArithmeticOp arithmetic;
 		}			func;
 		NullTestType nulltesttype;
 		BoolTestType booltesttype;
@@ -597,6 +614,36 @@ vector_compare_op(Oid functionid)
 	}
 }
 
+static VectorArithmeticOp
+vector_arithmetic_op(Oid functionid)
+{
+	switch (functionid)
+	{
+		case F_INT4PL:
+			return VEC_ARITHMETIC_INT4_ADD;
+		case F_INT4MI:
+			return VEC_ARITHMETIC_INT4_SUB;
+		case F_INT4MUL:
+			return VEC_ARITHMETIC_INT4_MUL;
+		case F_INT4DIV:
+			return VEC_ARITHMETIC_INT4_DIV;
+		case F_INT4MOD:
+			return VEC_ARITHMETIC_INT4_MOD;
+		case F_INT8PL:
+			return VEC_ARITHMETIC_INT8_ADD;
+		case F_INT8MI:
+			return VEC_ARITHMETIC_INT8_SUB;
+		case F_INT8MUL:
+			return VEC_ARITHMETIC_INT8_MUL;
+		case F_INT8DIV:
+			return VEC_ARITHMETIC_INT8_DIV;
+		case F_INT8MOD:
+			return VEC_ARITHMETIC_INT8_MOD;
+		default:
+			return VEC_ARITHMETIC_NONE;
+	}
+}
+
 static VectorExprStep *
 build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 				Oid collation, List *args, VectorBatch *batch,
@@ -614,6 +661,7 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 							 list_length(args), collation, NULL, NULL);
 	step->u.func.strict = step->u.func.fn.fn_strict;
 	step->u.func.compare = vector_compare_op(functionid);
+	step->u.func.arithmetic = vector_arithmetic_op(functionid);
 
 	foreach(lc, args)
 	{
@@ -1385,6 +1433,177 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 }
 
 static void
+eval_arithmetic(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set(&step->value, row, (Datum) 0, true);
+			continue;
+		}
+
+		switch (step->u.func.arithmetic)
+		{
+			case VEC_ARITHMETIC_INT4_ADD:
+				{
+					int32		result;
+
+					if (unlikely(pg_add_s32_overflow(DatumGetInt32(left->values[row]),
+													 DatumGetInt32(right->values[row]), &result)))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("integer out of range")));
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT4_SUB:
+				{
+					int32		result;
+
+					if (unlikely(pg_sub_s32_overflow(DatumGetInt32(left->values[row]),
+													 DatumGetInt32(right->values[row]), &result)))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("integer out of range")));
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT4_MUL:
+				{
+					int32		result;
+
+					if (unlikely(pg_mul_s32_overflow(DatumGetInt32(left->values[row]),
+													 DatumGetInt32(right->values[row]), &result)))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("integer out of range")));
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT4_DIV:
+				{
+					int32		arg1 = DatumGetInt32(left->values[row]);
+					int32		arg2 = DatumGetInt32(right->values[row]);
+					int32		result;
+
+					if (unlikely(arg2 == 0))
+						ereport(ERROR,
+								(errcode(ERRCODE_DIVISION_BY_ZERO),
+								 errmsg("division by zero")));
+					if (arg2 == -1)
+					{
+						if (unlikely(arg1 == PG_INT32_MIN))
+							ereport(ERROR,
+									(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									 errmsg("integer out of range")));
+						result = -arg1;
+					}
+					else
+						result = arg1 / arg2;
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT4_MOD:
+				{
+					int32		arg1 = DatumGetInt32(left->values[row]);
+					int32		arg2 = DatumGetInt32(right->values[row]);
+					int32		result;
+
+					if (unlikely(arg2 == 0))
+						ereport(ERROR,
+								(errcode(ERRCODE_DIVISION_BY_ZERO),
+								 errmsg("division by zero")));
+					result = arg2 == -1 ? 0 : arg1 % arg2;
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT8_ADD:
+				{
+					int64		result;
+
+					if (unlikely(pg_add_s64_overflow(DatumGetInt64(left->values[row]),
+													 DatumGetInt64(right->values[row]), &result)))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("bigint out of range")));
+					value_set(&step->value, row, Int64GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT8_SUB:
+				{
+					int64		result;
+
+					if (unlikely(pg_sub_s64_overflow(DatumGetInt64(left->values[row]),
+													 DatumGetInt64(right->values[row]), &result)))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("bigint out of range")));
+					value_set(&step->value, row, Int64GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT8_MUL:
+				{
+					int64		result;
+
+					if (unlikely(pg_mul_s64_overflow(DatumGetInt64(left->values[row]),
+													 DatumGetInt64(right->values[row]), &result)))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("bigint out of range")));
+					value_set(&step->value, row, Int64GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT8_DIV:
+				{
+					int64		arg1 = DatumGetInt64(left->values[row]);
+					int64		arg2 = DatumGetInt64(right->values[row]);
+					int64		result;
+
+					if (unlikely(arg2 == 0))
+						ereport(ERROR,
+								(errcode(ERRCODE_DIVISION_BY_ZERO),
+								 errmsg("division by zero")));
+					if (arg2 == -1)
+					{
+						if (unlikely(arg1 == PG_INT64_MIN))
+							ereport(ERROR,
+									(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									 errmsg("bigint out of range")));
+						result = -arg1;
+					}
+					else
+						result = arg1 / arg2;
+					value_set(&step->value, row, Int64GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT8_MOD:
+				{
+					int64		arg1 = DatumGetInt64(left->values[row]);
+					int64		arg2 = DatumGetInt64(right->values[row]);
+					int64		result;
+
+					if (unlikely(arg2 == 0))
+						ereport(ERROR,
+								(errcode(ERRCODE_DIVISION_BY_ZERO),
+								 errmsg("division by zero")));
+					result = arg2 == -1 ? 0 : arg1 % arg2;
+					value_set(&step->value, row, Int64GetDatum(result), false);
+					break;
+				}
+			default:
+				pg_unreachable();
+		}
+	}
+}
+
+static void
 eval_func(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselected)
 {
 	int			argno;
@@ -1396,6 +1615,11 @@ eval_func(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 	if (step->u.func.compare != VEC_COMPARE_NONE)
 	{
 		eval_compare(step, selection, nselected);
+		return;
+	}
+	if (step->u.func.arithmetic != VEC_ARITHMETIC_NONE)
+	{
+		eval_arithmetic(step, selection, nselected);
 		return;
 	}
 

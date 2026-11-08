@@ -12,6 +12,7 @@ DROP TABLE IF EXISTS vector_limit_test;
 DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
 DROP TABLE IF EXISTS vector_numeric_test;
+DROP TABLE IF EXISTS vector_arithmetic_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
@@ -53,6 +54,14 @@ INSERT INTO vector_numeric_test
 VALUES (1, -1.20), (2, 0), (3, 1.2), (4, 1.200), (5, 2.5),
        (6, 'NaN'), (7, 'NaN'), (8, NULL);
 ANALYZE vector_numeric_test;
+CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_arithmetic_test
+VALUES (1, 2147483647, 9223372036854775807),
+       (2, -2147483648, -9223372036854775808),
+       (3, 12, 24), (4, NULL, NULL);
+ANALYZE vector_arithmetic_test;
 CREATE TABLE vector_limit_test (id int4, val text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
@@ -281,6 +290,24 @@ SELECT count(*) FILTER (WHERE n = 'NaN') AS eq,
        count(*) FILTER (WHERE n > 'NaN') AS gt,
        count(*) FILTER (WHERE n >= 'NaN') AS ge
 FROM vector_numeric_test;
+SELECT a + 5, a - 5, a * 5, a / 5, a % 5,
+       b + 5, b - 5, b * 5, b / 5, b % 5
+FROM vector_arithmetic_test WHERE id = 3;
+SELECT count(a + 1), count(b + 1) FROM vector_arithmetic_test;
+SELECT a + 1 FROM vector_arithmetic_test WHERE id = 1;
+SELECT a - 1 FROM vector_arithmetic_test WHERE id = 2;
+SELECT a * 2 FROM vector_arithmetic_test WHERE id = 1;
+SELECT a / -1 FROM vector_arithmetic_test WHERE id = 2;
+SELECT a % -1 FROM vector_arithmetic_test WHERE id = 2;
+SELECT b + 1 FROM vector_arithmetic_test WHERE id = 1;
+SELECT b - 1 FROM vector_arithmetic_test WHERE id = 2;
+SELECT b * 2 FROM vector_arithmetic_test WHERE id = 1;
+SELECT b / -1 FROM vector_arithmetic_test WHERE id = 2;
+SELECT b % -1 FROM vector_arithmetic_test WHERE id = 2;
+SELECT a / 0 FROM vector_arithmetic_test WHERE id = 3;
+SELECT a % 0 FROM vector_arithmetic_test WHERE id = 3;
+SELECT b / 0 FROM vector_arithmetic_test WHERE id = 3;
+SELECT b % 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT count(*) FROM vector_aoco_small WHERE id IS DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_small WHERE id IS NOT DISTINCT FROM 3;
 SELECT count(*) FROM vector_aoco_test WHERE val IS DISTINCT FROM 'new1';
@@ -600,4 +627,5 @@ DROP TABLE vector_limit_test;
 DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
+DROP TABLE vector_arithmetic_test;
 DROP TABLE vector_append_parent CASCADE;
