@@ -19,6 +19,8 @@
 #include "access/aocssegfiles.h"
 #include "access/aomd.h"
 #include "access/appendonlytid.h"
+#include "access/appendonly_visimap.h"
+#include "access/appendonly_visimap_entry.h"
 #include "access/appendonlywriter.h"
 #include "access/heapam.h"
 #include "access/hio.h"
@@ -1584,6 +1586,36 @@ aocs_datum_in_transient_buffer(DatumStreamRead *ds, Datum value)
 }
 
 /*
+ * Visibility check that skips the per-row entry seek.  Visimap entries cover
+ * one aligned APPENDONLY_VISIMAP_MAX_RANGE row-number range of one segment,
+ * and AppendOnlyVisimap_IsVisible leaves the scan's entry positioned over the
+ * tuple it was last called with.  Remember that aligned range and, while the
+ * next tuple stays inside it, test the entry's bitmap directly; the bitmap is
+ * still read per row, so visibility answers are unchanged.
+ */
+static inline bool
+aocs_visimap_visible(AppendOnlyVisimap *visiMap, AOTupleId *aoTupleId,
+					 int32 *visSegno, int64 *visFirst)
+{
+	int32		segno = AOTupleIdGet_segmentFileNum(aoTupleId);
+	int64		rowNum = (int64) AOTupleIdGet_rowNum(aoTupleId);
+
+	if (segno == *visSegno &&
+		rowNum >= *visFirst &&
+		rowNum < *visFirst + APPENDONLY_VISIMAP_MAX_RANGE)
+		return AppendOnlyVisimapEntry_IsVisible(&visiMap->visimapEntry,
+												aoTupleId);
+
+	if (!AppendOnlyVisimap_IsVisible(visiMap, aoTupleId))
+		return false;
+
+	/* The entry now covers aoTupleId; remember its aligned range. */
+	*visSegno = segno;
+	*visFirst = rowNum - (rowNum % APPENDONLY_VISIMAP_MAX_RANGE);
+	return true;
+}
+
+/*
  * Bulk-fill the batch straight out of the current AOCS blocks.  Applies when
  * every projected column is pass-by-value in an original-format block with no
  * missing-column streams: copies a run of rows per column in a tight loop
@@ -1594,7 +1626,7 @@ aocs_datum_in_transient_buffer(DatumStreamRead *ds, Datum value)
 static bool
 aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 						AOCSFileSegInfo *curseginfo, bool isSnapshotAny,
-						int *nrows)
+						int *nrows, int32 *visSegno, int64 *visFirst)
 {
 	DatumStreamRead *anchor;
 	int64		firstRowNum;
@@ -1721,7 +1753,8 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 
 		AOTupleIdInit(&aoTupleId, curseginfo->segno, firstRowNum + nthStart + row);
 		if (!isSnapshotAny &&
-			!AppendOnlyVisimap_IsVisible(&scan->visibilityMap, &aoTupleId))
+			!aocs_visimap_visible(&scan->visibilityMap, &aoTupleId,
+								  visSegno, visFirst))
 			continue;
 
 		if (dst != *nrows + row)
@@ -1754,6 +1787,8 @@ aocs_getnext_batch(AOCSScanDesc scan, VectorBatch *batch)
 {
 	int			err = 0;
 	int			nrows = 0;
+	int32		visSegno = -1;
+	int64		visFirst = 0;
 	bool		isSnapshotAny = (scan->rs_base.rs_snapshot == SnapshotAny);
 
 	Assert(scan != NULL && batch != NULL);
@@ -1835,7 +1870,7 @@ ReadNext:
 		 * blocks; declines when any column needs the per-row machinery.
 		 */
 		if (aocs_getnext_batch_bulk(scan, batch, curseginfo, isSnapshotAny,
-									&nrows))
+									&nrows, &visSegno, &visFirst))
 			continue;
 
 		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
@@ -1905,7 +1940,9 @@ ReadNext:
 		else
 			AOTupleIdInit(&aoTupleId, curseginfo->segno, rowNum);
 
-		if (!isSnapshotAny && !AppendOnlyVisimap_IsVisible(&scan->visibilityMap, &aoTupleId))
+		if (!isSnapshotAny &&
+			!aocs_visimap_visible(&scan->visibilityMap, &aoTupleId,
+								  &visSegno, &visFirst))
 			goto ReadNext;
 
 		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
