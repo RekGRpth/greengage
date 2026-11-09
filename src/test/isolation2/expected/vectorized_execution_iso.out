@@ -68,5 +68,47 @@ COMMIT
  50    
 (1 row)
 
+-- An injected fault in the batch scan fails the query cleanly.
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0;
+ERROR:  fault triggered, fault name:'aocs_getnext_batch' fault type:'error'
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+
+-- The same query succeeds after the reset.
+1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0;
+ count 
+-------
+ 10000 
+(1 row)
+
+-- The fault leaves the row executor untouched.
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+1:SET gp_vectorized_execution = off;
+SET
+1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0;
+ count 
+-------
+ 10000 
+(1 row)
+1:SET gp_vectorized_execution = force;
+SET
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+
 1:DROP TABLE vec_iso;
 DROP TABLE

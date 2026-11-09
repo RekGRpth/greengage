@@ -1917,6 +1917,10 @@ aocs_getnext_batch(AOCSScanDesc scan, VectorBatch *batch)
 	}
 
 	Assert(batch->ncols == scan->columnScanInfo.relationTupleDesc->natts);
+
+	/* Fault injection point for the vectorized batch scan. */
+	SIMPLE_FAULT_INJECTOR("aocs_getnext_batch");
+
 	VectorBatchReset(batch);
 
 	while (nrows < batch->capacity)

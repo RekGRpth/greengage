@@ -34,4 +34,19 @@
 -- The region still answers a plain query afterwards.
 1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0 AND id <= 100;
 
+-- An injected fault in the batch scan fails the query cleanly.
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0;
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+
+-- The same query succeeds after the reset.
+1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0;
+
+-- The fault leaves the row executor untouched.
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+1:SET gp_vectorized_execution = off;
+1:SELECT count(*) FROM vec_iso WHERE id % 2 = 0;
+1:SET gp_vectorized_execution = force;
+2:SELECT gp_inject_fault('aocs_getnext_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+
 1:DROP TABLE vec_iso;
