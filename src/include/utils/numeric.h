@@ -150,6 +150,11 @@ extern char *numeric_normalize(Numeric num);
 
 extern Numeric numeric_add_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);
+extern bool numeric_decode_fast(Numeric num, int64 *mantissa, int *scale,
+								int *dscale);
+extern bool numeric_scale_fast(int64 *mantissa, int scale, int target);
+extern bool numeric_round_scale_fast(int64 *mantissa, int scale, int target);
+extern Numeric numeric_build_fast(int64 mantissa, int dscale);
 extern Numeric numeric_sub_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);
 extern Numeric numeric_mul_opt_error(Numeric num1, Numeric num2,

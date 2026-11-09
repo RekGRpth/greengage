@@ -127,7 +127,10 @@ typedef enum VectorArithmeticOp
 	VEC_ARITHMETIC_INT8_SUB,
 	VEC_ARITHMETIC_INT8_MUL,
 	VEC_ARITHMETIC_INT8_DIV,
-	VEC_ARITHMETIC_INT8_MOD
+	VEC_ARITHMETIC_INT8_MOD,
+	VEC_ARITHMETIC_NUMERIC_ADD,
+	VEC_ARITHMETIC_NUMERIC_SUB,
+	VEC_ARITHMETIC_NUMERIC_MUL
 } VectorArithmeticOp;
 
 typedef struct VectorValue
@@ -676,6 +679,12 @@ vector_arithmetic_op(Oid functionid)
 			return VEC_ARITHMETIC_INT8_DIV;
 		case F_INT8MOD:
 			return VEC_ARITHMETIC_INT8_MOD;
+		case F_NUMERIC_ADD:
+			return VEC_ARITHMETIC_NUMERIC_ADD;
+		case F_NUMERIC_SUB:
+			return VEC_ARITHMETIC_NUMERIC_SUB;
+		case F_NUMERIC_MUL:
+			return VEC_ARITHMETIC_NUMERIC_MUL;
 		default:
 			return VEC_ARITHMETIC_NONE;
 	}
@@ -1517,6 +1526,125 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 	}
 }
 
+/*
+ * One numeric fast-path row: compute in int64 when both operands decode
+ * exactly and the result matches what the calculator functions would emit
+ * (same display scale); otherwise fall back to the fmgr call for this row.
+ */
+static void
+eval_numeric_arith_row(VectorExprStep *step, int row)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int64		ma,
+				mb;
+	int			sa,
+				sb,
+				da,
+				db,
+				dres;
+	Datum		ldatum = left->values[row];
+	Datum		rdatum = right->values[row];
+
+	if (numeric_decode_fast((Numeric) DatumGetPointer(ldatum), &ma, &sa, &da) &&
+		numeric_decode_fast((Numeric) DatumGetPointer(rdatum), &mb, &sb, &db))
+	{
+		int64		mant;
+		bool		ok = true;
+
+		switch (step->u.func.arithmetic)
+		{
+			case VEC_ARITHMETIC_NUMERIC_ADD:
+			case VEC_ARITHMETIC_NUMERIC_SUB:
+				{
+					int			smax = Max(sa, sb);
+
+					/* Add exactly at the finer scale, then round once. */
+					dres = Max(da, db);
+					ok = numeric_scale_fast(&ma, sa, smax) &&
+						numeric_scale_fast(&mb, sb, smax);
+					if (ok)
+					{
+						int64		sum;
+
+						if (step->u.func.arithmetic == VEC_ARITHMETIC_NUMERIC_ADD)
+						{
+							if ((mb > 0 && ma > PG_INT64_MAX - mb) ||
+								(mb < 0 && ma < PG_INT64_MIN - mb))
+								ok = false;
+							else
+								sum = ma + mb;
+						}
+						else
+						{
+							if ((mb < 0 && ma > PG_INT64_MAX + mb) ||
+								(mb > 0 && ma < PG_INT64_MIN + mb))
+								ok = false;
+							else
+								sum = ma - mb;
+						}
+						if (ok)
+							ok = numeric_round_scale_fast(&sum, smax, dres);
+						mant = sum;
+					}
+				}
+				break;
+			case VEC_ARITHMETIC_NUMERIC_MUL:
+				{
+					dres = da + db;
+					if (dres > NUMERIC_MAX_DISPLAY_SCALE)
+						ok = false;
+					else
+					{
+#ifdef HAVE_INT128
+						int128		prod = (int128) ma * (int128) mb;
+
+						if (prod > PG_INT64_MAX || prod < PG_INT64_MIN)
+							ok = false;
+						else
+						{
+							mant = (int64) prod;
+							ok = numeric_round_scale_fast(&mant, sa + sb, dres);
+						}
+#else
+						ok = false;
+#endif
+					}
+				}
+				break;
+			default:
+				ok = false;
+				mant = 0;
+				break;
+		}
+
+		if (ok)
+		{
+			Numeric		result = numeric_build_fast(mant, dres);
+
+			if (result != NULL)
+			{
+				value_set(&step->value, row, PointerGetDatum(result), false);
+				return;
+			}
+		}
+	}
+
+	/* Fallback: exactly one fmgr call, as the generic path would do it. */
+	{
+		FunctionCallInfo fcinfo = step->u.func.fcinfo;
+		Datum		result;
+
+		fcinfo->args[0].value = ldatum;
+		fcinfo->args[0].isnull = false;
+		fcinfo->args[1].value = rdatum;
+		fcinfo->args[1].isnull = false;
+		fcinfo->isnull = false;
+		result = step->u.func.fn.fn_addr(fcinfo);
+		value_set(&step->value, row, result, fcinfo->isnull);
+	}
+}
+
 static void
 eval_arithmetic(VectorExprStep *step, int32 *selection, int nselected)
 {
@@ -1536,6 +1664,11 @@ eval_arithmetic(VectorExprStep *step, int32 *selection, int nselected)
 
 		switch (step->u.func.arithmetic)
 		{
+			case VEC_ARITHMETIC_NUMERIC_ADD:
+			case VEC_ARITHMETIC_NUMERIC_SUB:
+			case VEC_ARITHMETIC_NUMERIC_MUL:
+				eval_numeric_arith_row(step, row);
+				continue;
 			case VEC_ARITHMETIC_INT4_ADD:
 				{
 					int32		result;

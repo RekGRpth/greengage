@@ -9916,3 +9916,146 @@ accum_sum_combine(NumericSumAccum *accum, NumericSumAccum *accum2)
 
 	free_var(&tmp_var);
 }
+
+/* ---------------------------------------------------------------------
+ * Fast int64 helpers for the vectorized expression evaluator.
+ *
+ * A datum is decoded into an exact (mantissa, scale) pair, where
+ * value == mantissa * 10^-scale and scale = 4 * (ndigits - weight - 1)
+ * (or 0, when the value has trailing base-10000 zero groups folded in).
+ * The display scale is returned separately: arithmetic must pad results
+ * to the display scale the calculator functions produce so that outputs
+ * are identical to the fmgr path.
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Decode 'num' into (mantissa, scale) with value == mantissa * 10^-scale,
+ * plus its display scale.  Returns false for NaN or values whose mantissa
+ * does not fit in int64.
+ */
+bool
+numeric_decode_fast(Numeric num, int64 *mantissa, int *scale, int *dscale)
+{
+	NumericVar	var;
+	int64		total = 0;
+	int			i;
+
+	if (numeric_is_nan(num))
+		return false;
+
+	init_var_from_num(num, &var);
+
+	for (i = 0; i < var.ndigits; i++)
+	{
+		if (total > (PG_INT64_MAX - (int64) var.digits[i]) / NBASE)
+			return false;
+		total = total * NBASE + var.digits[i];
+	}
+	if (var.sign == NUMERIC_NEG)
+		total = -total;
+
+	*scale = (var.ndigits - var.weight - 1) * DEC_DIGITS;
+	while (*scale < 0)
+	{
+		if (total > PG_INT64_MAX / 10 || total < PG_INT64_MIN / 10)
+			return false;
+		total *= 10;
+		(*scale)++;
+	}
+	if (*scale > NUMERIC_MAX_DISPLAY_SCALE)
+		return false;
+
+	*mantissa = total;
+	*dscale = var.dscale;
+	return true;
+}
+
+/*
+ * Scale 'mantissa' from 'scale' up to 'target' decimal places, rejecting
+ * overflow.  target must not be below scale.
+ */
+bool
+numeric_scale_fast(int64 *mantissa, int scale, int target)
+{
+	while (scale < target)
+	{
+		if (*mantissa > PG_INT64_MAX / 10 || *mantissa < PG_INT64_MIN / 10)
+			return false;
+		*mantissa *= 10;
+		scale++;
+	}
+	return scale == target;
+}
+
+/*
+ * Rescale 'mantissa' from 'scale' to 'target' decimal places.  Scaling up
+ * pads with zeroes; scaling down rounds half away from zero, like round_var.
+ */
+bool
+numeric_round_scale_fast(int64 *mantissa, int scale, int target)
+{
+	int64		div;
+	int64		q,
+				r;
+
+	if (scale < target)
+		return numeric_scale_fast(mantissa, scale, target);
+	if (scale == target)
+		return true;
+
+	div = 1;
+	for (int i = 0; i < scale - target; i++)
+	{
+		if (div > PG_INT64_MAX / 10)
+			return false;
+		div *= 10;
+	}
+	q = *mantissa / div;
+	r = *mantissa % div;
+	if (r < 0)
+	{
+		if (-r >= div + r)
+			q--;
+	}
+	else
+	{
+		if (r >= div - r)
+			q++;
+	}
+	*mantissa = q;
+	return true;
+}
+
+/*
+ * Build a numeric with the given mantissa and display scale:
+ * value == mantissa * 10^-dscale.
+ */
+Numeric
+numeric_build_fast(int64 mantissa, int dscale)
+{
+	NumericVar	var;
+	Numeric		result;
+	int			pad = (4 - dscale % 4) % 4;
+
+	/*
+	 * int64_to_numericvar builds digits for the value 'mantissa'; shifting
+	 * the weight left by (dscale + pad) / 4 digit groups turns that into
+	 * mantissa * 10^-dscale, with dscale as the display scale.
+	 */
+	while (pad > 0)
+	{
+		if (mantissa > PG_INT64_MAX / 10 || mantissa < PG_INT64_MIN / 10)
+			return NULL;
+		mantissa *= 10;
+		pad--;
+	}
+
+	init_var(&var);
+	int64_to_numericvar(mantissa, &var);
+	var.weight -= (dscale + (4 - dscale % 4) % 4) / 4;
+	var.dscale = dscale;
+	result = make_result(&var);
+	free_var(&var);
+	return result;
+}
