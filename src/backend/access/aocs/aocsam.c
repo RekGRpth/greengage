@@ -1583,6 +1583,172 @@ aocs_datum_in_transient_buffer(DatumStreamRead *ds, Datum value)
 	return up && p >= up && p < up + ds->datum_upgrade_buffer_size;
 }
 
+/*
+ * Bulk-fill the batch straight out of the current AOCS blocks.  Applies when
+ * every projected column is pass-by-value in an original-format block with no
+ * missing-column streams: copies a run of rows per column in a tight loop
+ * instead of one advance/get pair per value, then compacts away the rows the
+ * visibility map hides.  Returns false without touching any state when the
+ * current position does not allow it.
+ */
+static bool
+aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
+						AOCSFileSegInfo *curseginfo, bool isSnapshotAny,
+						int *nrows)
+{
+	DatumStreamRead *anchor;
+	int64		firstRowNum;
+	int64		nthStart;
+	int			n;
+	int			i;
+	int			row;
+	int			dst;
+
+	if (scan->batch_copies_byref)
+		return false;
+
+	n = batch->capacity - *nrows;
+	for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+	{
+		AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+		DatumStreamRead *ds = scan->columnScanInfo.ds[attno];
+		DatumStreamBlockRead *dsr = &ds->blockRead;
+		int			datumlen = dsr->typeInfo.datumlen;
+		int			navail;
+
+		if (!batch->columns[attno].typbyval ||
+			dsr->datumStreamVersion != DatumStreamVersion_Original ||
+			ds->largeObjectState != DatumStreamLargeObjectState_None ||
+			(datumlen != 1 && datumlen != 2 && datumlen != 4 && datumlen != 8))
+			return false;
+		navail = dsr->logical_row_count - 1 - dsr->nth;
+		if (navail <= 0)
+			return false;		/* the per-row path switches the block */
+		if (navail < n)
+			n = navail;
+	}
+
+	anchor = scan->columnScanInfo.ds[scan->columnScanInfo.proj_atts[ANCHOR_COL_IN_PROJ]];
+	firstRowNum = anchor->blockFirstRowNum;
+	if (firstRowNum == InvalidAORowNum)
+		return false;			/* row numbers unknown here */
+	nthStart = anchor->blockRead.nth + 1;
+	for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+	{
+		DatumStreamRead *ds = scan->columnScanInfo.ds[scan->columnScanInfo.proj_atts[i]];
+
+		if (ds->blockFirstRowNum != InvalidAORowNum)
+			Assert(ds->blockFirstRowNum == firstRowNum);
+	}
+
+	for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+	{
+		AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+		DatumStreamRead *ds = scan->columnScanInfo.ds[attno];
+		DatumStreamBlockRead *dsr = &ds->blockRead;
+		VectorColumn *column = &batch->columns[attno];
+		int			datumlen = dsr->typeInfo.datumlen;
+		uint8	   *src;
+		int			phys = 0;
+
+		/*
+		 * datump points at the last item consumed; the next item follows it,
+		 * except before the first item, where datump is pre-positioned at it
+		 * (DatumStreamBlockRead_AdvanceOrig).
+		 */
+		src = dsr->datump;
+		if (dsr->physical_datum_index >= 0)
+			src += datumlen;
+
+		for (row = 0; row < n; row++)
+		{
+			int			idx = *nrows + row;
+			uint64		mask = (uint64) 1 << (idx % 64);
+			bool		isnull = false;
+
+			if (dsr->has_null)
+			{
+				DatumStreamBitMapRead_Next(&dsr->null_bitmap);
+				isnull = DatumStreamBitMapRead_CurrentIsOn(&dsr->null_bitmap);
+			}
+
+			if (isnull)
+				column->values[idx] = (Datum) 0;
+			else
+			{
+				switch (datumlen)
+				{
+					case 1:
+						column->values[idx] = (Datum) *(uint8 *) (src + phys);
+						break;
+					case 2:
+						column->values[idx] = Int16GetDatum(
+							*((int16 *) (src + phys * 2)));
+						break;
+					case 4:
+						column->values[idx] = Int32GetDatum(
+							*((int32 *) (src + phys * 4)));
+						break;
+					default:
+						column->values[idx] = Int64GetDatum(
+							*((int64 *) (src + phys * 8)));
+						break;
+				}
+				phys++;
+			}
+			if (isnull)
+				column->nulls[idx / 64] |= mask;
+			else
+				column->nulls[idx / 64] &= ~mask;
+		}
+
+		dsr->nth += n;
+		dsr->physical_datum_index += phys;
+		if (phys > 0)
+			dsr->datump = src + (phys - 1) * datumlen;
+
+		Assert(dsr->nth < dsr->logical_row_count);
+		Assert(dsr->datump >= dsr->datum_beginp &&
+			   dsr->datump < dsr->datum_afterp);
+	}
+
+	scan->segrowsprocessed += n;
+
+	dst = *nrows;
+	for (row = 0; row < n; row++)
+	{
+		AOTupleId	aoTupleId;
+
+		AOTupleIdInit(&aoTupleId, curseginfo->segno, firstRowNum + nthStart + row);
+		if (!isSnapshotAny &&
+			!AppendOnlyVisimap_IsVisible(&scan->visibilityMap, &aoTupleId))
+			continue;
+
+		if (dst != *nrows + row)
+		{
+			for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+			{
+				VectorColumn *column = &batch->columns[scan->columnScanInfo.proj_atts[i]];
+				int			from = *nrows + row;
+				uint64		smask = (uint64) 1 << (from % 64);
+				uint64		dmask = (uint64) 1 << (dst % 64);
+
+				column->values[dst] = column->values[from];
+				if (column->nulls[from / 64] & smask)
+					column->nulls[dst / 64] |= dmask;
+				else
+					column->nulls[dst / 64] &= ~dmask;
+			}
+		}
+		scan->cdb_fake_ctid = *((ItemPointer) &aoTupleId);
+		pgstat_count_heap_getnext(scan->rs_base.rs_rd);
+		dst++;
+	}
+
+	*nrows = dst;
+	return true;
+}
+
 bool
 aocs_getnext_batch(AOCSScanDesc scan, VectorBatch *batch)
 {
@@ -1663,6 +1829,14 @@ ReadNext:
 			if (block_end)
 				break;
 		}
+
+		/*
+		 * Fast path: copy runs of by-value rows straight out of the current
+		 * blocks; declines when any column needs the per-row machinery.
+		 */
+		if (aocs_getnext_batch_bulk(scan, batch, curseginfo, isSnapshotAny,
+									&nrows))
+			continue;
 
 		for (AttrNumber i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
 		{
