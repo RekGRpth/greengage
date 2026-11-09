@@ -1616,12 +1616,12 @@ aocs_visimap_visible(AppendOnlyVisimap *visiMap, AOTupleId *aoTupleId,
 }
 
 /*
- * Bulk-fill the batch straight out of the current AOCS blocks.  Applies when
- * every projected column is pass-by-value in an original-format block with no
- * missing-column streams: copies a run of rows per column in a tight loop
- * instead of one advance/get pair per value, then compacts away the rows the
- * visibility map hides.  Returns false without touching any state when the
- * current position does not allow it.
+ * Bulk-fill the batch straight out of the current AOCS blocks.  Applies to
+ * original-format blocks with no missing-column streams: pass-by-value
+ * columns are copied in tight loops, varlena columns by walking their packed
+ * items in place, instead of one advance/get pair per value.  The batch then
+ * compacts away the rows the visibility map hides.  Returns false without
+ * touching any state when the current position does not allow it.
  */
 static bool
 aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
@@ -1648,10 +1648,10 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 		int			datumlen = dsr->typeInfo.datumlen;
 		int			navail;
 
-		if (!batch->columns[attno].typbyval ||
-			dsr->datumStreamVersion != DatumStreamVersion_Original ||
+		if (dsr->datumStreamVersion != DatumStreamVersion_Original ||
 			ds->largeObjectState != DatumStreamLargeObjectState_None ||
-			(datumlen != 1 && datumlen != 2 && datumlen != 4 && datumlen != 8))
+			(datumlen != -1 && datumlen != 1 && datumlen != 2 &&
+			 datumlen != 4 && datumlen != 8))
 			return false;
 		navail = dsr->logical_row_count - 1 - dsr->nth;
 		if (navail <= 0)
@@ -1669,8 +1669,13 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 	{
 		DatumStreamRead *ds = scan->columnScanInfo.ds[scan->columnScanInfo.proj_atts[i]];
 
+		/*
+		 * Blocks are packed per column, so their first row numbers differ;
+		 * what must agree is the logical row every column is positioned at.
+		 */
 		if (ds->blockFirstRowNum != InvalidAORowNum)
-			Assert(ds->blockFirstRowNum == firstRowNum);
+			Assert(ds->blockFirstRowNum + ds->blockRead.nth ==
+				   firstRowNum + nthStart - 1);
 	}
 
 	for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
@@ -1682,6 +1687,107 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 		int			datumlen = dsr->typeInfo.datumlen;
 		uint8	   *src;
 		int			phys = 0;
+
+		if (datumlen == -1)
+		{
+			/*
+			 * Variable-length items are packed one after another with
+			 * alignment padding.  Walk them in place: the values point into
+			 * the block buffer, which stays alive because the batch never
+			 * crosses a by-ref column's block boundary; only values in the
+			 * per-value upgrade buffer need a copy.
+			 */
+			DatumStreamBitMapRead saved;
+			int			phys_left;
+			uint8	   *cur;
+
+			/*
+			 * datump points at the last item consumed; the next item follows
+			 * its varlena header length, except before the first item, where
+			 * datump is pre-positioned at it.
+			 */
+			cur = dsr->datump;
+			if (dsr->physical_datum_index >= 0)
+			{
+				cur += VARSIZE_ANY((struct varlena *) cur);
+				if (*cur == 0)
+					cur = (uint8 *) att_align_nominal(cur, dsr->typeInfo.align);
+			}
+
+			/*
+			 * Count the stored items first, so the walk below only computes
+			 * a next-item pointer when another item really follows and the
+			 * padding probe stays inside the block.
+			 */
+			if (dsr->has_null)
+			{
+				memcpy(&saved, &dsr->null_bitmap,
+					   sizeof(DatumStreamBitMapRead));
+				for (row = 0; row < n; row++)
+				{
+					DatumStreamBitMapRead_Next(&dsr->null_bitmap);
+					if (!DatumStreamBitMapRead_CurrentIsOn(&dsr->null_bitmap))
+						phys++;
+				}
+				memcpy(&dsr->null_bitmap, &saved,
+					   sizeof(DatumStreamBitMapRead));
+			}
+			else
+				phys = n;
+			phys_left = phys;
+
+			for (row = 0; row < n; row++)
+			{
+				int			idx = *nrows + row;
+				uint64		mask = (uint64) 1 << (idx % 64);
+				bool		isnull = false;
+
+				if (dsr->has_null)
+				{
+					DatumStreamBitMapRead_Next(&dsr->null_bitmap);
+					isnull = DatumStreamBitMapRead_CurrentIsOn(&dsr->null_bitmap);
+				}
+
+				if (isnull)
+				{
+					column->values[idx] = (Datum) 0;
+					column->nulls[idx / 64] |= mask;
+					continue;
+				}
+
+				{
+					Datum		value = PointerGetDatum(cur);
+
+					if (aocs_datum_in_transient_buffer(ds, value))
+						value = VectorBatchCopyDatum(batch, attno, value,
+													 false);
+					column->values[idx] = value;
+					column->nulls[idx / 64] &= ~mask;
+				}
+
+				phys_left--;
+				if (phys_left > 0)
+				{
+					uint8	   *next = cur + VARSIZE_ANY((struct varlena *) cur);
+
+					if (*next == 0)
+						next = (uint8 *) att_align_nominal(next,
+														  dsr->typeInfo.align);
+					cur = next;
+				}
+				else
+					dsr->datump = cur;	/* the item just consumed */
+			}
+
+			dsr->nth += n;
+			dsr->physical_datum_index += phys;
+
+			Assert(dsr->nth < dsr->logical_row_count);
+			Assert(phys == 0 ||
+				   (dsr->datump >= dsr->datum_beginp &&
+					dsr->datump < dsr->datum_afterp));
+			continue;
+		}
 
 		/*
 		 * datump points at the last item consumed; the next item follows it,
