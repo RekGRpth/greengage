@@ -668,7 +668,9 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		return (Node *) make_region(ctx, (Plan *) node);
 
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
-		((SeqScan *) node)->plan.targetlist != NIL &&
+		/* an empty targetlist is worth wrapping while a qual filters rows */
+		(((SeqScan *) node)->plan.targetlist != NIL ||
+		 ((SeqScan *) node)->plan.qual != NIL) &&
 		is_projection_scan(ctx, (SeqScan *) node) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);

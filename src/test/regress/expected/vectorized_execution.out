@@ -17,6 +17,7 @@ DROP TABLE IF EXISTS vector_numeric_wide_test;
 DROP TABLE IF EXISTS vector_arithmetic_test;
 DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
+DROP TABLE IF EXISTS vector_part_test CASCADE;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -182,6 +183,20 @@ FROM generate_series(5001, 7500) AS g;
 ANALYZE vector_append_child1;
 ANALYZE vector_append_child2;
 ANALYZE vector_append_child3;
+-- Partitioned AOCO table: static and runtime pruning over vectorized
+-- scans (the runtime shape scans surviving partitions as regions under
+-- the pruning Append, including the empty-projection count form).
+CREATE TABLE vector_part_test (id int4, grp int4)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id) PARTITION BY RANGE (id);
+CREATE TABLE vector_part_test_1 PARTITION OF vector_part_test
+FOR VALUES FROM (1) TO (2001) WITH (appendonly = true, orientation = column);
+CREATE TABLE vector_part_test_2 PARTITION OF vector_part_test
+FOR VALUES FROM (2001) TO (4001) WITH (appendonly = true, orientation = column);
+CREATE TABLE vector_part_test_3 PARTITION OF vector_part_test
+FOR VALUES FROM (4001) TO (6001) WITH (appendonly = true, orientation = column);
+INSERT INTO vector_part_test SELECT g, g % 10 FROM generate_series(1, 6000) AS g;
+ANALYZE vector_part_test;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -2467,6 +2482,38 @@ SELECT id, big FROM vector_append_parent WHERE id < 10 ORDER BY id;
   9 |  90
 (9 rows)
 
+-- Static pruning keeps the surviving partition's scan inside a region.
+SELECT count(*), sum(grp) FROM vector_part_test WHERE id BETWEEN 2100 AND 3900;
+ count | sum  
+-------+------
+  1801 | 8100
+(1 row)
+
+-- Runtime pruning (param bounds): surviving partitions scan as regions
+-- under the pruning Append, with and without a projection.
+SELECT count(*) FROM vector_part_test
+WHERE id BETWEEN (SELECT min(id) FROM vector_part_test WHERE grp = 3)
+            AND (SELECT max(id) FROM vector_part_test WHERE grp = 3);
+ count 
+-------
+  5991
+(1 row)
+
+SELECT count(*), sum(grp) FROM vector_part_test
+WHERE id BETWEEN (SELECT min(id) FROM vector_part_test WHERE grp = 3)
+            AND (SELECT max(id) FROM vector_part_test WHERE grp = 3);
+ count |  sum  
+-------+-------
+  5991 | 26958
+(1 row)
+
+-- No pruning at all: the whole Append runs inside one region.
+SELECT count(*) FROM vector_part_test WHERE grp = 7;
+ count 
+-------
+   600
+(1 row)
+
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -2578,3 +2625,4 @@ DROP TABLE vector_arithmetic_test;
 DROP TABLE vector_rle_test;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
+DROP TABLE vector_part_test CASCADE;
