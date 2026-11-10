@@ -12,6 +12,7 @@ DROP TABLE IF EXISTS vector_limit_test;
 DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
 DROP TABLE IF EXISTS vector_numeric_test;
+DROP TABLE IF EXISTS vector_numeric_batch_test;
 DROP TABLE IF EXISTS vector_arithmetic_test;
 DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
@@ -55,6 +56,26 @@ INSERT INTO vector_numeric_test
 VALUES (1, -1.20), (2, 0), (3, 1.2), (4, 1.200), (5, 2.5),
        (6, 'NaN'), (7, 'NaN'), (8, NULL);
 ANALYZE vector_numeric_test;
+-- Exercises sum()/avg(numeric) over several batches: mixed folded and
+-- display scales, mantissas beyond int64, NULLs, negatives, and grouping
+-- with more distinct groups than one batch holds.
+CREATE TABLE vector_numeric_batch_test (id int4, grp int4, n numeric)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_numeric_batch_test
+SELECT g, g % 5,
+       CASE g % 8
+         WHEN 0 THEN g::numeric
+         WHEN 1 THEN round((g * 100 + 13) / 100, 2)
+         WHEN 2 THEN g::numeric * 0.000000001
+         WHEN 3 THEN 98765432109876543210987654321.123456789
+         WHEN 4 THEN -round(g / 7.0, 4)
+         WHEN 5 THEN NULL
+         WHEN 6 THEN g::numeric * 1000000000000
+         ELSE g::numeric / 7
+       END
+FROM generate_series(1, 7000) AS g;
+ANALYZE vector_numeric_batch_test;
 CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8, s int2)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
@@ -326,6 +347,14 @@ SELECT var_pop(id::int8), var_samp(id::int8), stddev(id::int8),
 FROM vector_aoco_small;
 SELECT avg(num) FROM vector_aoco_test;
 SELECT avg(n), sum(n) FROM vector_numeric_test;
+SELECT sum(n), avg(n), min(n), max(n), count(n) FROM vector_numeric_batch_test;
+SELECT grp, sum(n), avg(n), count(n)
+FROM vector_numeric_batch_test GROUP BY grp ORDER BY grp;
+SELECT count(*), sum(s) FROM
+(SELECT id, sum(n) AS s FROM vector_numeric_batch_test GROUP BY id) t;
+SELECT sum(n) FILTER (WHERE id % 2 = 0),
+       avg(n) FILTER (WHERE id % 3 = 0)
+FROM vector_numeric_batch_test;
 SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
