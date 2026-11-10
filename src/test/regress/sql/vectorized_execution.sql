@@ -366,6 +366,9 @@ SELECT sum(n), avg(n), min(n), max(n), count(n) FROM vector_numeric_batch_test;
 -- materialization) path into sum/avg, with per-row fallback mixed in.
 SELECT sum(n * 2), avg(n + 1), sum(n - 0.5), sum(n * n)
 FROM vector_numeric_batch_test;
+-- Nested arithmetic: the inner nodes stay decoded for the parent too.
+SELECT id, n * (1 - n) FROM vector_numeric_test ORDER BY id;
+SELECT sum(n * (1 - n)), avg((1 - n) * (1 + n)) FROM vector_numeric_batch_test;
 SELECT grp, sum(n), avg(n), count(n)
 FROM vector_numeric_batch_test GROUP BY grp ORDER BY grp;
 SELECT count(*), sum(s) FROM

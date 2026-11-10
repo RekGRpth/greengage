@@ -281,6 +281,8 @@ struct VectorExprState
 static VectorExprStep *build_step(Expr *expr, VectorBatch *batch,
 								  const VectorExprVarMap *vars,
 								  VectorExprStep *case_test);
+static void defer_arith_children(VectorExprStep *step, int capacity,
+								 MemoryContext context);
 static void eval_step(VectorExprStep *step, VectorBatch *batch,
 					  int32 *selection, int nselected);
 
@@ -1356,6 +1358,8 @@ VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
 	state->capacity = batch->capacity;
 	oldcontext = MemoryContextSwitchTo(state->context);
 	state->root = build_step(expr, batch, vars, NULL);
+	if (state->root != NULL)
+		defer_arith_children(state->root, batch->capacity, state->context);
 	MemoryContextSwitchTo(oldcontext);
 	if (state->root == NULL)
 	{
@@ -1556,6 +1560,19 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
 {
 	VectorColumn *col = arg->column_cache;
 
+	/*
+	 * A deferred arithmetic child left its fast-path result decoded: the
+	 * value is mant * 10^-dscale at its display scale, exactly what the
+	 * parent needs; no Numeric was built and there is nothing to decode.
+	 */
+	if (arg->defer_valid != NULL &&
+		(arg->defer_valid[row / 64] & ((uint64) 1 << (row % 64))) != 0)
+	{
+		*mant = arg->defer_mant[row];
+		*scale = *dscale = arg->defer_dscale[row];
+		return true;
+	}
+
 	if (col != NULL && col->cache_mant != NULL)
 	{
 		if (col->cache_gen != gen)
@@ -1601,6 +1618,21 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
  * exactly and the result matches what the calculator functions would emit
  * (same display scale); otherwise fall back to the fmgr call for this row.
  */
+static Datum
+arith_arg_datum(VectorExprStep *arg, int row, Datum stored)
+{
+	/*
+	 * A deferred arithmetic child has no datum on its fast-path rows;
+	 * materialize it for the parent's fmgr fallback.  The /1000 guard taken
+	 * when the child deferred the value makes numeric_build_fast() succeed.
+	 */
+	if (arg->defer_valid != NULL &&
+		(arg->defer_valid[row / 64] & ((uint64) 1 << (row % 64))) != 0)
+		return PointerGetDatum(numeric_build_fast(arg->defer_mant[row],
+												  arg->defer_dscale[row]));
+	return stored;
+}
+
 static void
 eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 {
@@ -1725,9 +1757,9 @@ eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 		FunctionCallInfo fcinfo = step->u.func.fcinfo;
 		Datum		result;
 
-		fcinfo->args[0].value = ldatum;
+		fcinfo->args[0].value = arith_arg_datum(step->args[0], row, ldatum);
 		fcinfo->args[0].isnull = false;
-		fcinfo->args[1].value = rdatum;
+		fcinfo->args[1].value = arith_arg_datum(step->args[1], row, rdatum);
 		fcinfo->args[1].isnull = false;
 		fcinfo->isnull = false;
 		result = step->u.func.fn.fn_addr(fcinfo);
@@ -2677,33 +2709,65 @@ VectorExprGetValue(VectorExprState *state, int row, bool *isnull)
  * decoded form for an aggregate consumer instead of building Numerics.
  * Only the + - * fast path qualifies; anything else keeps building datums.
  */
-bool
-VectorExprDeferNumericResult(VectorExprState *state)
+static bool
+step_is_numeric_arith(VectorExprStep *step)
 {
-	VectorExprStep *root = state->root;
-	MemoryContext oldcontext;
-
-	if (root->kind != VEC_FUNC)
+	if (step->kind != VEC_FUNC)
 		return false;
-	switch (root->u.func.arithmetic)
+	switch (step->u.func.arithmetic)
 	{
 		case VEC_ARITHMETIC_NUMERIC_ADD:
 		case VEC_ARITHMETIC_NUMERIC_SUB:
 		case VEC_ARITHMETIC_NUMERIC_MUL:
-			break;
+			return true;
 		default:
 			return false;
 	}
-	if (root->defer_mant == NULL)
+}
+
+static void
+defer_step_alloc(VectorExprStep *step, int capacity, MemoryContext context)
+{
+	MemoryContext oldcontext;
+
+	if (step->defer_mant == NULL)
 	{
-		oldcontext = MemoryContextSwitchTo(state->context);
-		root->defer_mant = palloc(sizeof(int64) * state->capacity);
-		root->defer_dscale = palloc(sizeof(int16) * state->capacity);
-		root->defer_valid = palloc0(sizeof(uint64) *
-									((state->capacity + 63) / 64));
+		oldcontext = MemoryContextSwitchTo(context);
+		step->defer_mant = palloc(sizeof(int64) * capacity);
+		step->defer_dscale = palloc(sizeof(int16) * capacity);
+		step->defer_valid = palloc0(sizeof(uint64) * ((capacity + 63) / 64));
 		MemoryContextSwitchTo(oldcontext);
 	}
-	root->defer_build = true;
+	step->defer_build = true;
+}
+
+/*
+ * Arithmetic parents consume their children's decoded fast-path results
+ * directly, so arithmetic children never need to materialize a Numeric
+ * except on the rare fmgr fallback.  Roots themselves are deferred only
+ * when an aggregate consumer asks (VectorExprDeferNumericResult).
+ */
+static void
+defer_arith_children(VectorExprStep *step, int capacity, MemoryContext context)
+{
+	int			i;
+
+	if (step_is_numeric_arith(step))
+	{
+		for (i = 0; i < step->nargs; i++)
+			if (step_is_numeric_arith(step->args[i]))
+				defer_step_alloc(step->args[i], capacity, context);
+	}
+	for (i = 0; i < step->nargs; i++)
+		defer_arith_children(step->args[i], capacity, context);
+}
+
+bool
+VectorExprDeferNumericResult(VectorExprState *state)
+{
+	if (!step_is_numeric_arith(state->root))
+		return false;
+	defer_step_alloc(state->root, state->capacity, state->context);
 	return true;
 }
 
