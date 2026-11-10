@@ -63,6 +63,16 @@ VALUES (1, 2147483647, 9223372036854775807, 32767),
        (2, -2147483648, -9223372036854775808, -32768),
        (3, 12, 24, 12), (4, NULL, NULL, NULL);
 ANALYZE vector_arithmetic_test;
+CREATE TABLE vector_rle_test (id int4, grp int4, val text, num numeric(12,2), d date)
+WITH (appendonly = true, orientation = column, compresstype = rle_type, compresslevel = 5)
+DISTRIBUTED BY (id);
+INSERT INTO vector_rle_test
+SELECT g, (g / 500) * 500,
+       CASE WHEN g % 97 = 0 THEN NULL ELSE 'run' || ((g / 500) * 500) END,
+       CASE WHEN g % 89 = 0 THEN NULL ELSE ((g / 500) * 500)::numeric + 0.50 END,
+       DATE '2001-01-01' + (g / 500)
+FROM generate_series(1, 4000) AS g;
+ANALYZE vector_rle_test;
 CREATE TABLE vector_float_test (id int4, f4 float4, f8 float8)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
@@ -794,12 +804,12 @@ SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
    n   | ?column? | ?column? | ?column? | ?column? | ?column? 
 -------+----------+----------+----------+----------+----------
- -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
      0 |        1 |       -1 |        0 |        0 |        0
    1.2 |      2.2 |      0.2 |      3.6 |      2.4 |     1.44
  1.200 |    2.200 |    0.200 |    3.600 |    2.400 | 1.440000
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
        |          |          |          |          |         
+ -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
    2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
 (8 rows)
@@ -869,6 +879,42 @@ SELECT a / 0 FROM vector_arithmetic_test WHERE id = 3;
 ERROR:  division by zero
 SELECT a % 0 FROM vector_arithmetic_test WHERE id = 3;
 ERROR:  division by zero
+SELECT count(*), count(val), count(num), sum(num), min(d), max(d), min(grp), max(grp)
+FROM vector_rle_test;
+ count | count | count |    sum     |    min     |    max     | min | max  
+-------+-------+-------+------------+------------+------------+-----+------
+  4000 |  3959 |  3956 | 6928978.00 | 01-01-2001 | 01-09-2001 |   0 | 4000
+(1 row)
+
+SELECT grp, count(*), sum(num), min(val), max(d) FROM vector_rle_test GROUP BY grp ORDER BY grp;
+ grp  | count |    sum     |   min   |    max     
+------+-------+------------+---------+------------
+    0 |   499 |     247.00 | run0    | 01-01-2001
+  500 |   500 |  247247.00 | run500  | 01-02-2001
+ 1000 |   500 |  495247.50 | run1000 | 01-03-2001
+ 1500 |   500 |  741247.00 | run1500 | 01-04-2001
+ 2000 |   500 |  988247.00 | run2000 | 01-05-2001
+ 2500 |   500 | 1237747.50 | run2500 | 01-06-2001
+ 3000 |   500 | 1482247.00 | run3000 | 01-07-2001
+ 3500 |   500 | 1732747.50 | run3500 | 01-08-2001
+ 4000 |     1 |    4000.50 | run4000 | 01-09-2001
+(9 rows)
+
+SELECT count(*), sum(num) FROM vector_rle_test WHERE d >= DATE '2001-01-05' AND num > 100;
+ count |    sum     
+-------+------------
+  1979 | 5444989.50
+(1 row)
+
+SELECT id, val, num, d FROM vector_rle_test WHERE id % 997 = 0 ORDER BY id;
+  id  |   val   |   num   |     d      
+------+---------+---------+------------
+  997 | run500  |  500.50 | 01-02-2001
+ 1994 | run1500 | 1500.50 | 01-04-2001
+ 2991 | run2500 | 2500.50 | 01-06-2001
+ 3988 | run3500 | 3500.50 | 01-08-2001
+(4 rows)
+
 SELECT b / 0 FROM vector_arithmetic_test WHERE id = 3;
 ERROR:  division by zero
 SELECT b % 0 FROM vector_arithmetic_test WHERE id = 3;
@@ -2335,5 +2381,6 @@ DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
 DROP TABLE vector_arithmetic_test;
+DROP TABLE vector_rle_test;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;

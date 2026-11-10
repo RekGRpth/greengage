@@ -1616,6 +1616,201 @@ aocs_visimap_visible(AppendOnlyVisimap *visiMap, AOTupleId *aoTupleId,
 }
 
 /*
+ * Fill n rows of one column directly from a dense-format block, advancing the
+ * DatumStreamBlockRead state exactly as n calls to datumstreamread_advance
+ * would: RLE runs re-emit the frozen item value, nulls consume a null-bitmap
+ * bit only, and delta blocks keep the running delta value.  The caller has
+ * checked that n rows remain in the block.
+ */
+static void
+aocs_bulk_fill_dense(DatumStreamBlockRead *dsr, VectorColumn *column,
+					 DatumStreamRead *ds, VectorBatch *batch, int attno,
+					 int start, int n)
+{
+	bool		is_rle = dsr->rle_block_was_compressed;
+	bool		is_delta = dsr->delta_block_was_compressed;
+	int			datumlen = dsr->typeInfo.datumlen;
+	int			row;
+
+	for (row = 0; row < n; row++)
+	{
+		int			idx = start + row;
+		uint64		mask = (uint64) 1 << (idx % 64);
+		Datum		value = 0;
+		bool		isnull = false;
+
+		dsr->nth++;
+
+		if (is_rle && dsr->rle_in_repeated_item)
+		{
+			/* Repeated row: the item's value and null state are frozen. */
+			dsr->rle_repeated_item_count--;
+			dsr->rle_total_repeat_items_read++;
+			if (dsr->rle_repeated_item_count <= 0)
+				dsr->rle_in_repeated_item = false;
+			/* The run value was stored by the run's first row below. */
+			value = dsr->delta_datum_p;	/* valid for byval; see below */
+			if (!dsr->delta_item && datumlen != -1)
+			{
+				/* Re-read the frozen physical item for byval columns. */
+				switch (datumlen)
+				{
+					case 1:
+						value = *(uint8 *) dsr->datump;
+						break;
+					case 2:
+						value = *(uint16 *) dsr->datump;
+						break;
+					case 4:
+						value = *(uint32 *) dsr->datump;
+						break;
+					default:
+						value = *(Datum *) dsr->datump;
+						break;
+				}
+			}
+			else if (!dsr->delta_item && datumlen == -1)
+				value = PointerGetDatum(dsr->datump);
+			/* delta_item keeps delta_datum_p as the value. */
+		}
+		else
+		{
+			bool		consume_item = true;
+
+			if (dsr->has_null)
+			{
+				DatumStreamBitMapRead_Next(&dsr->null_bitmap);
+				if (DatumStreamBitMapRead_CurrentIsOn(&dsr->null_bitmap))
+				{
+					isnull = true;
+					consume_item = false;
+					/* Nulls never join an RLE run. */
+				}
+			}
+
+			if (consume_item && is_rle)
+			{
+				DatumStreamBitMapRead_Next(&dsr->rle_compress_bitmap);
+				if (DatumStreamBitMapRead_CurrentIsOn(&dsr->rle_compress_bitmap))
+				{
+					int32		repeatCount;
+					int32		byteLen;
+
+					dsr->rle_repeatcounts_index++;
+					dsr->rle_total_repeat_items_read++;
+					repeatCount = DatumStreamInt32Compress_Decode(
+						dsr->rle_repeatcountsp, &byteLen);
+					dsr->rle_repeatcountsp += byteLen;
+					dsr->rle_repeated_item_count = repeatCount;
+					dsr->rle_in_repeated_item = true;
+				}
+			}
+
+			if (consume_item)
+			{
+				/* Consume one physical item and load its value. */
+				uint8	   *itemp;
+
+				if (dsr->physical_datum_index == -1)
+					itemp = dsr->datump;
+				else
+					itemp = dsr->datump + (datumlen == -1 ? 0 : datumlen);
+
+				if (datumlen == -1)
+				{
+					itemp = dsr->datump;
+					if (dsr->physical_datum_index >= 0)
+					{
+						struct varlena *v = (struct varlena *) dsr->datump;
+
+						itemp = dsr->datump + VARSIZE_ANY(v);
+						if (*itemp == 0)
+							itemp = (uint8 *) att_align_nominal(itemp,
+														dsr->typeInfo.align);
+					}
+					value = PointerGetDatum(itemp);
+					if (aocs_datum_in_transient_buffer(ds, value))
+						value = VectorBatchCopyDatum(batch, attno, value,
+													 false);
+				}
+				else if (is_delta)
+				{
+					DatumStreamBitMapRead_Next(&dsr->delta_bitmap);
+					if (DatumStreamBitMapRead_CurrentIsOn(&dsr->delta_bitmap))
+					{
+						int64		delta;
+						bool		sign;
+						int32		byteLen;
+
+						dsr->delta_item = true;
+						delta = DatumStreamInt32CompressReserved3_Decode(
+							dsr->delta_deltasp, &byteLen, &sign);
+						dsr->delta_deltasp += byteLen;
+						if (datumlen == 4)
+						{
+							if (sign)
+								*(uint32 *) &dsr->delta_datum_p +=
+									(uint32) delta;
+							else
+								*(uint32 *) &dsr->delta_datum_p -=
+									(uint32) delta;
+						}
+						else
+						{
+							if (sign)
+								dsr->delta_datum_p += delta;
+							else
+								dsr->delta_datum_p -= delta;
+						}
+					}
+					else
+					{
+						dsr->delta_item = false;
+						memcpy(&dsr->delta_datum_p, itemp, datumlen);
+					}
+					value = dsr->delta_datum_p;
+				}
+				else
+				{
+					switch (datumlen)
+					{
+						case 1:
+							value = *(uint8 *) itemp;
+							break;
+						case 2:
+							value = *(uint16 *) itemp;
+							break;
+						case 4:
+							value = *(uint32 *) itemp;
+							break;
+						default:
+							value = *(Datum *) itemp;
+							break;
+					}
+				}
+
+				/*
+				 * Delta items live in the delta stream, not the datum
+				 * area: only non-delta items advance the datum pointer.
+				 */
+				if (!(is_delta && dsr->delta_item))
+				{
+					dsr->physical_datum_index++;
+					if (dsr->physical_datum_index > 0)
+						dsr->datump = itemp;
+				}
+			}
+		}
+
+		column->values[idx] = value;
+		if (isnull)
+			column->nulls[idx / 64] |= mask;
+		else
+			column->nulls[idx / 64] &= ~mask;
+	}
+}
+
+/*
  * Bulk-fill the batch straight out of the current AOCS blocks.  Applies to
  * original-format blocks with no missing-column streams: pass-by-value
  * columns are copied in tight loops, varlena columns by walking their packed
@@ -1648,10 +1843,13 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 		int			datumlen = dsr->typeInfo.datumlen;
 		int			navail;
 
-		if (dsr->datumStreamVersion != DatumStreamVersion_Original ||
+		if ((dsr->datumStreamVersion != DatumStreamVersion_Original &&
+			 dsr->datumStreamVersion != DatumStreamVersion_Dense &&
+			 dsr->datumStreamVersion != DatumStreamVersion_Dense_Enhanced) ||
 			ds->largeObjectState != DatumStreamLargeObjectState_None ||
-			(datumlen != -1 && datumlen != 1 && datumlen != 2 &&
-			 datumlen != 4 && datumlen != 8))
+			datumlen == -2 ||
+			(dsr->delta_block_was_compressed &&
+			 (datumlen != 4 && datumlen != 8)))
 			return false;
 		navail = dsr->logical_row_count - 1 - dsr->nth;
 		if (navail <= 0)
@@ -1687,6 +1885,13 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 		int			datumlen = dsr->typeInfo.datumlen;
 		uint8	   *src;
 		int			phys = 0;
+
+		if (dsr->datumStreamVersion != DatumStreamVersion_Original)
+		{
+			aocs_bulk_fill_dense(dsr, column, ds, batch, attno, *nrows, n);
+			Assert(dsr->nth < dsr->logical_row_count);
+			continue;
+		}
 
 		if (datumlen == -1)
 		{

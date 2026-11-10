@@ -63,6 +63,16 @@ VALUES (1, 2147483647, 9223372036854775807, 32767),
        (2, -2147483648, -9223372036854775808, -32768),
        (3, 12, 24, 12), (4, NULL, NULL, NULL);
 ANALYZE vector_arithmetic_test;
+CREATE TABLE vector_rle_test (id int4, grp int4, val text, num numeric(12,2), d date)
+WITH (appendonly = true, orientation = column, compresstype = rle_type, compresslevel = 5)
+DISTRIBUTED BY (id);
+INSERT INTO vector_rle_test
+SELECT g, (g / 500) * 500,
+       CASE WHEN g % 97 = 0 THEN NULL ELSE 'run' || ((g / 500) * 500) END,
+       CASE WHEN g % 89 = 0 THEN NULL ELSE ((g / 500) * 500)::numeric + 0.50 END,
+       DATE '2001-01-01' + (g / 500)
+FROM generate_series(1, 4000) AS g;
+ANALYZE vector_rle_test;
 CREATE TABLE vector_float_test (id int4, f4 float4, f8 float8)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
@@ -337,6 +347,11 @@ SELECT b / -1 FROM vector_arithmetic_test WHERE id = 2;
 SELECT b % -1 FROM vector_arithmetic_test WHERE id = 2;
 SELECT a / 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT a % 0 FROM vector_arithmetic_test WHERE id = 3;
+SELECT count(*), count(val), count(num), sum(num), min(d), max(d), min(grp), max(grp)
+FROM vector_rle_test;
+SELECT grp, count(*), sum(num), min(val), max(d) FROM vector_rle_test GROUP BY grp ORDER BY grp;
+SELECT count(*), sum(num) FROM vector_rle_test WHERE d >= DATE '2001-01-05' AND num > 100;
+SELECT id, val, num, d FROM vector_rle_test WHERE id % 997 = 0 ORDER BY id;
 SELECT b / 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT b % 0 FROM vector_arithmetic_test WHERE id = 3;
 SELECT count(*) FILTER (WHERE f4 = 1.5) AS eq,
@@ -687,5 +702,6 @@ DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
 DROP TABLE vector_arithmetic_test;
+DROP TABLE vector_rle_test;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
