@@ -371,6 +371,11 @@ SELECT id, n * (1 - n) FROM vector_numeric_test ORDER BY id;
 SELECT sum(n * (1 - n)), avg((1 - n) * (1 + n)) FROM vector_numeric_batch_test;
 SELECT grp, sum(n), avg(n), count(n)
 FROM vector_numeric_batch_test GROUP BY grp ORDER BY grp;
+-- Interleaved keys and NULL keys exercise the per-batch group memo on its
+-- miss path (every other row changes the group, NULL groups with NULL).
+SELECT id % 3 AS k, count(*), sum(n) FROM vector_numeric_batch_test GROUP BY k ORDER BY k;
+SELECT grp, id % 2 AS parity, count(*) FROM vector_numeric_batch_test GROUP BY grp, parity ORDER BY grp, parity;
+SELECT count(*) FROM (SELECT CASE WHEN id % 5 = 0 THEN NULL ELSE id % 5 END AS k, sum(id) FROM vector_numeric_batch_test GROUP BY k) t;
 SELECT count(*), sum(s) FROM
 (SELECT id, sum(n) AS s FROM vector_numeric_batch_test GROUP BY id) t;
 SELECT sum(n) FILTER (WHERE id % 2 = 0),

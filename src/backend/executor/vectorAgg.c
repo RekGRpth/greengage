@@ -21,6 +21,7 @@
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/tuplesort.h"
+#include "utils/datum.h"
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
 
@@ -85,6 +86,11 @@ struct VectorAggState
 	Datum	  **values;
 	bool	  **nulls;
 	TupleTableSlot *input_slot;	/* full input row, for spilling */
+	/* group memo: a row whose keys equal the previous row's skips the hash */
+	bool		group_valid;	/* memo holds this batch's last group */
+	AggStatePerGroup group_pergroup;
+	Datum	   *group_keys;
+	bool	   *group_key_nulls;
 	int			projected_set;
 	bool		group_open;
 	bool		input_done;
@@ -427,6 +433,38 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	uint32		hash = 0;
 	int			col;
 
+	/*
+	 * Grouping keys come in long runs, so a row equal to the previous one
+	 * can reuse its group without the hash lookup.  The memo lives for one
+	 * batch only: its key datums point into this batch's column arrays, and
+	 * resetting it per batch also covers any hash table reset between
+	 * batches.  Byte equality implies key equality; a miss just takes the
+	 * full lookup.
+	 */
+	if (state->group_valid)
+	{
+		bool		hit = true;
+
+		for (col = 0; col < perhash->numhashGrpCols; col++)
+		{
+			int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
+			AttrNumber	attno = state->vars.outer_attnos[inputcol];
+			VectorColumn *column = &batch->columns[attno - 1];
+			bool		isnull = VectorBatchIsNull(batch, attno - 1, row);
+
+			if (isnull != state->group_key_nulls[col] ||
+				(!isnull &&
+				 !datumIsEqual(state->group_keys[col], column->values[row],
+							   column->typbyval, column->typlen)))
+			{
+				hit = false;
+				break;
+			}
+		}
+		if (hit)
+			return state->group_pergroup;
+	}
+
 	ExecClearTuple(hashslot);
 	for (col = 0; col < perhash->numhashGrpCols; col++)
 	{
@@ -446,7 +484,23 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	{
 		if (isnew)
 			VectorAggInitializeEntry(agg, entry);
-		return (AggStatePerGroup) entry->additional;
+
+		/* remember this row's group for its successor */
+		if (state->group_keys == NULL)
+		{
+			state->group_keys = MemoryContextAlloc(state->context,
+												   sizeof(Datum) * Max(perhash->numhashGrpCols, 1));
+			state->group_key_nulls = MemoryContextAlloc(state->context,
+														sizeof(bool) * Max(perhash->numhashGrpCols, 1));
+		}
+		for (col = 0; col < perhash->numhashGrpCols; col++)
+		{
+			state->group_keys[col] = hashslot->tts_values[col];
+			state->group_key_nulls[col] = hashslot->tts_isnull[col];
+		}
+		state->group_pergroup = (AggStatePerGroup) entry->additional;
+		state->group_valid = true;
+		return state->group_pergroup;
 	}
 
 	/* A new group that no longer fits is spilled and processed on refill. */
@@ -833,6 +887,8 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 	if (batch->nselected == 0)
 		return;
 
+	/* the group memo's key datums die with the previous batch */
+	state->group_valid = false;
 	eval_arguments(state, batch);
 	for (pos = 0; pos < batch->nselected; pos++)
 	{
@@ -1023,6 +1079,8 @@ void
 VectorAggReset(VectorAggState *state)
 {
 	ExecReScanAgg(state->agg);
+	/* the rescanned hash table drops the memoized group */
+	state->group_valid = false;
 	if (state->agg->aggstrategy == AGG_PLAIN)
 	{
 		MemoryContext oldcontext = MemoryContextSwitchTo(
