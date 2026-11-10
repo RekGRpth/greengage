@@ -336,7 +336,11 @@ map_var_attno(Var *var, const VectorExprVarMap *vars)
 	if (var->varattno < 0)
 		return 0;
 	if (var->varno == vars->scanrelid)
+	{
+		if (vars->self_remap != NULL)
+			return vars->self_remap[var->varattno - 1];
 		return var->varattno;
+	}
 	if (var->varno == OUTER_VAR && vars->outer_attnos != NULL &&
 		var->varattno <= vars->outer_ncols)
 		return vars->outer_attnos[var->varattno - 1];

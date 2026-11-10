@@ -63,6 +63,8 @@ extern void VectorBatchSetValue(VectorBatch *batch, int col, int row,
 								Datum value, bool isnull);
 extern Datum VectorBatchCopyDatum(VectorBatch *batch, int col, Datum value,
 								  bool isnull);
+extern void VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
+								   const int *dstcol);
 
 static inline bool
 VectorBatchIsNull(const VectorBatch *batch, int col, int row)

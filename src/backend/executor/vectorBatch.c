@@ -158,3 +158,34 @@ VectorBatchCopyDatum(VectorBatch *batch, int col, Datum value, bool isnull)
 	MemoryContextSwitchTo(oldcontext);
 	return result;
 }
+
+/*
+ * Copy every column of src into dst: dstcol[j] names the destination
+ * column of src column j, or -1 to skip it.  By-ref values are stolen
+ * (not copied): they live until src is reset, which the caller may do
+ * only after dst has been consumed.  The row count and selection vector
+ * move with the values; dst must have been reset by the caller.
+ */
+void
+VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
+					   const int *dstcol)
+{
+	int			j;
+
+	for (j = 0; j < src->ncols; j++)
+	{
+		int			d = dstcol[j];
+		const VectorColumn *sc = &src->columns[j];
+		VectorColumn *dc;
+
+		if (d < 0)
+			continue;
+		dc = &dst->columns[d];
+		memcpy(dc->values, sc->values, sizeof(Datum) * src->nrows);
+		memcpy(dc->nulls, sc->nulls,
+			   sizeof(uint64) * VECTOR_BATCH_NULLWORDS(src->capacity));
+	}
+	memcpy(dst->selection, src->selection, sizeof(int32) * src->nrows);
+	dst->nrows = src->nrows;
+	dst->nselected = src->nselected;
+}

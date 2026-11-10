@@ -32,6 +32,7 @@
 #include "executor/vectorHashJoin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "optimizer/tlist.h"
 #include "optimizer/walkers.h"
@@ -121,7 +122,6 @@ static bool
 is_simple_append(VectorizeContext *ctx, Append *append)
 {
 	SeqScan	   *first = NULL;
-	Relation	firstrel = NULL;
 	ListCell   *lc;
 	bool		supported = false;
 
@@ -132,8 +132,6 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 	foreach(lc, append->appendplans)
 	{
 		SeqScan	   *scan;
-		RangeTblEntry *rte;
-		Relation	rel;
 		ListCell   *scanlc;
 
 		if (!IsA(lfirst(lc), SeqScan))
@@ -142,19 +140,6 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 		if (!is_simple_scan(ctx, scan))
 			goto done;
 
-		rte = rt_fetch(scan->scanrelid, ctx->stmt->rtable);
-		rel = table_open(rte->relid, NoLock);
-		if (firstrel == NULL)
-			firstrel = rel;
-		else
-		{
-			bool		equal = equalTupleDescs(RelationGetDescr(firstrel),
-											RelationGetDescr(rel), false);
-
-			table_close(rel, NoLock);
-			if (!equal)
-				goto done;
-		}
 
 		if (first == NULL)
 		{
@@ -191,21 +176,55 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 			{
 				TargetEntry *firstte = (TargetEntry *) lfirst(firstlc);
 				TargetEntry *scante = (TargetEntry *) lfirst(scanlc);
-				Var		   *firstvar = (Var *) firstte->expr;
-				Var		   *scanvar = (Var *) scante->expr;
 
-				if (firstvar->varattno != scanvar->varattno ||
-					exprType((Node *) firstte->expr) != exprType((Node *) scante->expr) ||
+				/*
+				 * The child may number its columns differently than the first
+				 * one (UNION ALL over independently created relations); the
+				 * executor remaps such a child onto the first one's batch
+				 * layout, provided every attribute its qual references is one
+				 * the targetlist maps.
+				 */
+				if (exprType((Node *) firstte->expr) != exprType((Node *) scante->expr) ||
 					exprTypmod((Node *) firstte->expr) != exprTypmod((Node *) scante->expr))
 					goto done;
+				if (scan->plan.qual != NIL)
+				{
+					Bitmapset *mapped = NULL;
+					Bitmapset *qattrs = NULL;
+					int		attno;
+					bool		covered = true;
+
+					{
+						ListCell   *map1lc,
+								   *map2lc;
+
+						forboth(map1lc, first->plan.targetlist,
+								  map2lc, scan->plan.targetlist)
+							mapped = bms_add_member(mapped,
+									((Var *) ((TargetEntry *) lfirst(map2lc))->expr)->varattno -
+									FirstLowInvalidHeapAttributeNumber);
+					}
+					pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &qattrs);
+					while ((attno = bms_first_member(qattrs)) > 0)
+					{
+						attno += FirstLowInvalidHeapAttributeNumber;
+						if (!bms_is_member(attno - FirstLowInvalidHeapAttributeNumber, mapped))
+						{
+							covered = false;
+							break;
+						}
+					}
+					bms_free(mapped);
+					bms_free(qattrs);
+					if (!covered)
+						goto done;
+				}
 			}
 		}
 	}
 	supported = true;
 
 done:
-	if (firstrel != NULL)
-		table_close(firstrel, NoLock);
 	return supported;
 }
 

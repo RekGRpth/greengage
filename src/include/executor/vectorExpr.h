@@ -20,6 +20,12 @@ typedef struct VectorExprVarMap
 	AttrNumber *outer_attnos;
 	int			outer_ncols;
 	EState	   *estate;
+	/*
+	 * Optional remap for a scan whose physical attnos differ from the
+	 * batch layout: self_remap[attno - 1] gives the 1-based batch column,
+	 * or 0 when the attribute has no batch column.
+	 */
+	AttrNumber *self_remap;
 } VectorExprVarMap;
 
 extern bool VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars);

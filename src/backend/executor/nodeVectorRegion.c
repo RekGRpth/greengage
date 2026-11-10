@@ -70,6 +70,12 @@ typedef struct VectorRegionState
 	int			output_ncols;
 	int			position;
 	bool		eof;
+	/* Per-child layout remap for a divergent Append child (NULL arrays
+	 * for children laid out like the first one). */
+	AttrNumber **append_remaps;	/* child attno (1-based) -> batch attno, or 0 */
+	int		   **append_dstcols;	/* child column -> batch column, or -1 */
+	VectorBatch **append_batches;	/* per child: private fill batch */
+	bool	   **append_read_attrs;	/* per child: row-reader deform set */
 } VectorRegionState;
 
 typedef struct VectorNestLoopProxy
@@ -327,18 +333,91 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			elog(ERROR, "vector append child is not a SeqScan");
 		firstdesc = RelationGetDescr(state->scan->ss.ss_currentRelation);
 		needs_row_reader = !RelationIsAoCols(state->scan->ss.ss_currentRelation);
+
+		/*
+		 * Children laid out like the first one fill the shared batch
+		 * directly; a divergent child (UNION ALL over independently
+		 * created relations) fills a private batch of its own shape and
+		 * the columns move over at the batch boundary.  The planner
+		 * verified position-wise type equality and that every referenced
+		 * attribute is covered by the targetlist mapping.
+		 */
+		state->append_remaps = MemoryContextAllocZero(estate->es_query_cxt,
+											  sizeof(AttrNumber *) * state->append->as_nplans);
+		state->append_dstcols = MemoryContextAllocZero(estate->es_query_cxt,
+											  sizeof(int *) * state->append->as_nplans);
+		state->append_batches = MemoryContextAllocZero(estate->es_query_cxt,
+											  sizeof(VectorBatch *) * state->append->as_nplans);
+		state->append_read_attrs = MemoryContextAllocZero(estate->es_query_cxt,
+											  sizeof(bool *) * state->append->as_nplans);
 		for (i = 1; i < state->append->as_nplans; i++)
 		{
-			PlanState  *childstate = state->append->appendplans[i];
+			SeqScanState *childscan = (SeqScanState *) state->append->appendplans[i];
+			Relation	childrel = childscan->ss.ss_currentRelation;
+			Relation	firstrel = state->scan->ss.ss_currentRelation;
+			SeqScan   *childplan = (SeqScan *) childscan->ss.ps.plan;
+			SeqScan   *firstplan = (SeqScan *) state->scan->ss.ps.plan;
+			int			natts = RelationGetNumberOfAttributes(childrel);
+			AttrNumber *remap;
+			int		   *dstcol;
+			ListCell   *firstlc,
+					   *scanlc;
 
-			if (!IsA(childstate, SeqScanState) ||
-				!equalTupleDescs(firstdesc,
-								 RelationGetDescr(((SeqScanState *) childstate)->ss.ss_currentRelation), false))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("vector append children have incompatible tuple descriptors")));
-			if (!RelationIsAoCols(((SeqScanState *) childstate)->ss.ss_currentRelation))
+			if (!IsA(childscan, SeqScanState))
+				elog(ERROR, "vector append child is not a SeqScan");
+			if (!RelationIsAoCols(childrel))
 				needs_row_reader = true;
+			if (equalTupleDescs(RelationGetDescr(firstrel),
+								RelationGetDescr(childrel), false))
+				continue;		/* identical layout: shared batch */
+
+			remap = MemoryContextAllocZero(estate->es_query_cxt,
+										   sizeof(AttrNumber) * natts);
+			dstcol = MemoryContextAlloc(estate->es_query_cxt,
+										sizeof(int) * natts);
+			MemSet(dstcol, -1, sizeof(int) * natts);
+			forboth(firstlc, firstplan->plan.targetlist,
+					scanlc, childplan->plan.targetlist)
+			{
+				TargetEntry *firstte = (TargetEntry *) lfirst(firstlc);
+				TargetEntry *scante = (TargetEntry *) lfirst(scanlc);
+				AttrNumber	a0 = ((Var *) firstte->expr)->varattno;
+				AttrNumber	ai = ((Var *) scante->expr)->varattno;
+
+				if (ai <= 0 || ai > natts)
+					elog(ERROR, "vector append child column is out of range");
+				if (TupleDescAttr(firstdesc, a0 - 1)->atttypid !=
+					TupleDescAttr(RelationGetDescr(childrel), ai - 1)->atttypid)
+					elog(ERROR,
+						 "vector append children have incompatible tuple descriptors");
+				remap[ai - 1] = a0;
+				dstcol[ai - 1] = a0 - 1;
+			}
+			state->append_remaps[i] = remap;
+			state->append_dstcols[i] = dstcol;
+			state->append_batches[i] = VectorBatchCreate(estate->es_query_cxt,
+														 RelationGetDescr(childrel),
+														 VECTOR_BATCH_DEFAULT_CAPACITY);
+			if (!RelationIsAoCols(childrel))
+			{
+				Bitmapset *attrs = NULL;
+				bool	   *read_attrs = MemoryContextAllocZero(estate->es_query_cxt,
+													   sizeof(bool) * natts);
+				int			a;
+
+				pull_varattnos((Node *) childplan->plan.targetlist,
+							   childplan->scanrelid, &attrs);
+				pull_varattnos((Node *) childplan->plan.qual,
+							   childplan->scanrelid, &attrs);
+				while ((a = bms_first_member(attrs)) > 0)
+				{
+					a += FirstLowInvalidHeapAttributeNumber;
+					if (a > 0 && a <= natts && remap[a - 1] != 0)
+						read_attrs[a - 1] = true;
+				}
+				bms_free(attrs);
+				state->append_read_attrs[i] = read_attrs;
+			}
 		}
 	}
 
@@ -429,7 +508,9 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 				if (childplan->plan.qual == NIL)
 					continue;
 				{
-					VectorExprVarMap vars = {childplan->scanrelid, NULL, 0, estate};
+					VectorExprVarMap vars = {childplan->scanrelid, NULL, 0, estate,
+											 state->append_remaps != NULL ?
+											 state->append_remaps[i] : NULL};
 
 					state->append_quals[i] = VectorExprCompile(estate->es_query_cxt,
 															(Expr *) childplan->plan.qual,
@@ -541,11 +622,16 @@ VectorRegionReadAdapter(VectorRegionState *state)
  * deformed into columns and by-ref datums are copied before the slot is reused.
  */
 static bool
-VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc)
+VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc,
+						VectorBatch *batch)
 {
-	VectorBatch *batch = state->batch;
 	TupleTableSlot *slot = state->scan->ss.ss_ScanTupleSlot;
+	bool	   *read_attrs = state->read_attrs;
 	int			nrows = 0;
+
+	/* a divergent append child deforms its own attribute set */
+	if (batch != state->batch && state->append != NULL)
+		read_attrs = state->append_read_attrs[state->append_index];
 
 	VectorBatchReset(batch);
 	while (nrows < batch->capacity)
@@ -564,7 +650,7 @@ VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc)
 			Datum		value;
 			bool		isnull;
 
-			if (!state->read_attrs[col])
+			if (!read_attrs[col])
 				continue;
 			value = slot_getattr(slot, col + 1, &isnull);
 			value = VectorBatchCopyDatum(batch, col, value, isnull);
@@ -594,6 +680,8 @@ VectorRegionNextBatch(VectorRegionState *state)
 		while (!state->eof)
 		{
 			TableScanDesc scandesc;
+			VectorBatch *fill = state->batch;
+			bool		remapped = false;
 
 			scandesc = state->scan->ss.ss_currentScanDesc;
 			if (scandesc == NULL)
@@ -609,16 +697,30 @@ VectorRegionNextBatch(VectorRegionState *state)
 				MemoryContextSwitchTo(oldcontext);
 			}
 
+			if (state->append_dstcols != NULL &&
+				state->append_dstcols[state->append_index] != NULL)
+			{
+				/* a divergent child fills its own batch; columns move over */
+				fill = state->append_batches[state->append_index];
+				remapped = true;
+			}
+
 			if (RelationIsAoCols(state->scan->ss.ss_currentRelation))
 			{
-				if (!aocs_getnext_batch((AOCSScanDesc) scandesc, state->batch))
+				if (!aocs_getnext_batch((AOCSScanDesc) scandesc, fill))
 				{
 					state->eof = true;
 					break;
 				}
 			}
-			else if (!VectorRegionReadRowScan(state, scandesc))
+			else if (!VectorRegionReadRowScan(state, scandesc, fill))
 				break;
+			if (remapped)
+			{
+				VectorBatchReset(state->batch);
+				VectorBatchCopyColumns(state->batch, fill,
+									   state->append_dstcols[state->append_index]);
+			}
 			state->position = 0;
 			VectorExprFilter(state->batch, state->qual);
 			/* A row scan can discover EOF while filling its final partial batch. */

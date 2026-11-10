@@ -19,6 +19,7 @@ DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
 DROP TABLE IF EXISTS vector_part_test CASCADE;
 DROP TABLE IF EXISTS vector_drop_test CASCADE;
+DROP TABLE IF EXISTS vector_union_a, vector_union_b, vector_union_h, vector_union_hj CASCADE;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -210,6 +211,21 @@ SELECT g, g % 10, (g % 50)::numeric / 3 FROM generate_series(1, 2000) AS g;
 INSERT INTO vector_drop_child1
 SELECT g, g % 10, (g % 50)::numeric / 3 FROM generate_series(2001, 4000) AS g;
 ANALYZE vector_drop_test; ANALYZE vector_drop_child1;
+-- UNION ALL over independently created relations whose column positions
+-- differ: the divergent child fills a private batch and its columns move
+-- onto the shared layout at each batch boundary.
+CREATE TABLE vector_union_a (id int4, v numeric(12,2))
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+CREATE TABLE vector_union_b (junk int8, id int4, v numeric(12,2))
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+CREATE TABLE vector_union_h (id int4, v numeric(12,2)) DISTRIBUTED BY (id);
+CREATE TABLE vector_union_hj (junk int8, id int4, v numeric(12,2)) DISTRIBUTED BY (id);
+INSERT INTO vector_union_a SELECT g, (g % 50)::numeric / 3 FROM generate_series(1, 2000) AS g;
+INSERT INTO vector_union_b SELECT g, g, (g % 50)::numeric / 3 FROM generate_series(2001, 4000) AS g;
+INSERT INTO vector_union_h SELECT g, (g % 50)::numeric / 3 FROM generate_series(1, 2000) AS g;
+INSERT INTO vector_union_hj SELECT g, g, (g % 50)::numeric / 3 FROM generate_series(2001, 4000) AS g;
+ANALYZE vector_union_a; ANALYZE vector_union_b;
+ANALYZE vector_union_h; ANALYZE vector_union_hj;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -2569,6 +2585,21 @@ SELECT grp, count(*), sum(num) FROM vector_drop_test GROUP BY grp ORDER BY grp;
    9 |   400 | 3866.40
 (10 rows)
 
+SELECT count(*), sum(v) FROM
+(SELECT id, v FROM vector_union_a UNION ALL SELECT id, v FROM vector_union_b) t;
+ count |   sum    
+-------+----------
+  4000 | 32666.40
+(1 row)
+
+SELECT count(*), sum(v) FROM
+(SELECT id, v FROM vector_union_h WHERE id % 3 = 0
+ UNION ALL SELECT id, v FROM vector_union_hj WHERE id % 3 = 0) t;
+ count |   sum    
+-------+----------
+  1333 | 10894.19
+(1 row)
+
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -2682,3 +2713,4 @@ DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
 DROP TABLE vector_part_test CASCADE;
 DROP TABLE vector_drop_test CASCADE;
+DROP TABLE vector_union_a, vector_union_b, vector_union_h, vector_union_hj CASCADE;
