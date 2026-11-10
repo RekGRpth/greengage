@@ -18,6 +18,7 @@ DROP TABLE IF EXISTS vector_arithmetic_test;
 DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
 DROP TABLE IF EXISTS vector_part_test CASCADE;
+DROP TABLE IF EXISTS vector_drop_test CASCADE;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -197,6 +198,18 @@ CREATE TABLE vector_part_test_3 PARTITION OF vector_part_test
 FOR VALUES FROM (4001) TO (6001) WITH (appendonly = true, orientation = column);
 INSERT INTO vector_part_test SELECT g, g % 10 FROM generate_series(1, 6000) AS g;
 ANALYZE vector_part_test;
+-- Schema evolution: dropping a column on the parent realigns every child
+-- the same way, so the whole Append (parent scan included) still runs
+-- inside one region with the aggregate.
+CREATE TABLE vector_drop_test (id int4, grp int4, pad text, num numeric(12,2))
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (id);
+CREATE TABLE vector_drop_child1 () INHERITS (vector_drop_test);
+ALTER TABLE vector_drop_test DROP COLUMN pad;
+INSERT INTO vector_drop_test
+SELECT g, g % 10, (g % 50)::numeric / 3 FROM generate_series(1, 2000) AS g;
+INSERT INTO vector_drop_child1
+SELECT g, g % 10, (g % 50)::numeric / 3 FROM generate_series(2001, 4000) AS g;
+ANALYZE vector_drop_test; ANALYZE vector_drop_child1;
 SET gp_vectorized_execution = force;
 EXPLAIN (COSTS OFF)
 SELECT id AS c1, big AS c2, val AS c3, num AS c4, later AS c5
@@ -770,6 +783,8 @@ WHERE id BETWEEN (SELECT min(id) FROM vector_part_test WHERE grp = 3)
             AND (SELECT max(id) FROM vector_part_test WHERE grp = 3);
 -- No pruning at all: the whole Append runs inside one region.
 SELECT count(*) FROM vector_part_test WHERE grp = 7;
+SELECT count(*), sum(num) FROM vector_drop_test WHERE id % 3 = 0;
+SELECT grp, count(*), sum(num) FROM vector_drop_test GROUP BY grp ORDER BY grp;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;
@@ -806,3 +821,4 @@ DROP TABLE vector_rle_test;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
 DROP TABLE vector_part_test CASCADE;
+DROP TABLE vector_drop_test CASCADE;
