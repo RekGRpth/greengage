@@ -489,6 +489,10 @@ SELECT id, (SELECT max(big) FROM vector_aoco_small s WHERE s.id = t.id) AS m
 FROM vector_aoco_test t WHERE t.id < 12 ORDER BY id;
 SELECT t.id, EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS has_s
 FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
+SELECT t.id, NOT EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS no_s
+FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
+SELECT t.id, (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id) AS cnt
+FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;

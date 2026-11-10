@@ -254,10 +254,8 @@ typedef struct VectorExprStep
 		}			param;
 		struct
 		{
-			SubPlanState *sstate;
-			ExprContext *econtext;
-			TupleTableSlot *slot;
 			EState	   *estate;
+			int			plan_id;
 			bool		is_initplan;
 		}			subplan;
 	}			u;
@@ -525,7 +523,18 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 		case T_Param:
 			return ((Param *) expr)->paramkind == PARAM_EXEC;
 		case T_SubPlan:
-			return true;
+			{
+				SubPlan    *sp = (SubPlan *) expr;
+
+				/*
+				 * Same restriction as in build_step(): only InitPlans and
+				 * uncorrelated setParam subplans read a materialized exec
+				 * param; correlated subplans must run per row and are left
+				 * to the standard executor.
+				 */
+				return sp->parParam == NIL &&
+					(sp->is_initplan || sp->setParam != NIL);
+			}
 		default:
 			return false;
 	}
@@ -1285,14 +1294,25 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 			{
 				SubPlan    *sp = (SubPlan *) expr;
 
-				if (vars->estate == NULL || sp->plan_id <= 0 ||
-					sp->plan_id > list_length(vars->estate->es_subplanstates))
+				if (vars->estate == NULL || sp->plan_id <= 0)
+					return NULL;
+				/*
+				 * Only subplans whose result is materialized into exec params
+				 * can be read here: InitPlans and uncorrelated setParam
+				 * subplans (EXISTS, NOT IN).  A correlated subplan
+				 * (parParam) must be re-executed per row and a subplan
+				 * without output params has no value to read; both stay on
+				 * the standard executor.
+				 */
+				if (sp->parParam != NIL ||
+					(!sp->is_initplan && sp->setParam == NIL))
 					return NULL;
 				step = alloc_step(VEC_SUBPLAN, 0, batch->capacity);
 				init_value(&step->value, exprType((Node *) sp), -1,
 						   batch->capacity, true);
-				step->u.subplan.sstate = list_nth(vars->estate->es_subplanstates,
-												 sp->plan_id - 1);
+				step->u.subplan.estate = vars->estate;
+				step->u.subplan.plan_id = sp->plan_id;
+				step->u.subplan.is_initplan = true;
 				if (sp->is_initplan)
 				{
 					ParamExecData *prm = &vars->estate->es_param_exec_vals[sp->plan_id];
@@ -1301,11 +1321,6 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					for (row = 0; row < batch->capacity; row++)
 						value_set(&step->value, row, prm->value, prm->isnull);
 				}
-				step->u.subplan.estate = vars->estate;
-				step->u.subplan.is_initplan = step->u.subplan.sstate->subplan->is_initplan ||
-					step->u.subplan.sstate->subplan->setParam != NIL;
-				if (!step->u.subplan.is_initplan)
-					return NULL;
 				return step;
 			}
 		default:
@@ -2558,7 +2573,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 			{
 				int			row = selection[pos];
 				ParamExecData *prm = &step->u.subplan.estate->es_param_exec_vals[
-					step->u.subplan.sstate->subplan->plan_id];
+					step->u.subplan.plan_id];
 
 				value_set(&step->value, row, prm->value, prm->isnull);
 			}
