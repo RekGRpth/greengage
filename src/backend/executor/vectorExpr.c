@@ -150,6 +150,16 @@ typedef struct VectorExprStep
 	struct VectorExprStep **args;
 	int			nargs;
 	VectorColumn *column_cache;	/* VEC_VAR: the aliased batch column */
+
+	/*
+	 * Deferred numeric results (numeric arithmetic fast path): an aggregate
+	 * consumer asks for (mantissa, dscale) instead of a built Numeric, so
+	 * the transition skips make_result() and the decode of the result.
+	 */
+	bool		defer_build;
+	int64	   *defer_mant;
+	int16	   *defer_dscale;
+	uint64	   *defer_valid;
 	int32	   *scratch[2];
 	struct VectorExprStep *case_operand;
 	bool	   *array_nulls;
@@ -1606,6 +1616,9 @@ eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 	Datum		ldatum = left->values[row];
 	Datum		rdatum = right->values[row];
 
+	if (step->defer_valid != NULL)
+		step->defer_valid[row / 64] &= ~((uint64) 1 << (row % 64));
+
 	if (numeric_arg_decode(step->args[0], row, batch->gen, &ma, &sa, &da) &&
 		numeric_arg_decode(step->args[1], row, batch->gen, &mb, &sb, &db))
 	{
@@ -1680,12 +1693,29 @@ eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 
 		if (ok)
 		{
-			Numeric		result = numeric_build_fast(mant, dres);
-
-			if (result != NULL)
+			/*
+			 * An aggregate consumer takes the decoded result directly.
+			 * The |mant|/1000 bound guarantees the display-scale padding
+			 * in do_numeric_accum_fast() cannot overflow, matching the
+			 * cases numeric_build_fast() would accept.
+			 */
+			if (step->defer_build &&
+				mant <= PG_INT64_MAX / 1000 && mant >= PG_INT64_MIN / 1000)
 			{
-				value_set(&step->value, row, PointerGetDatum(result), false);
+				step->defer_mant[row] = mant;
+				step->defer_dscale[row] = (int16) dres;
+				step->defer_valid[row / 64] |= (uint64) 1 << (row % 64);
+				value_set(&step->value, row, (Datum) 0, false);
 				return;
+			}
+			{
+				Numeric		result = numeric_build_fast(mant, dres);
+
+				if (result != NULL)
+				{
+					value_set(&step->value, row, PointerGetDatum(result), false);
+					return;
+				}
 			}
 		}
 	}
@@ -2640,6 +2670,59 @@ VectorExprGetValue(VectorExprState *state, int row, bool *isnull)
 {
 	*isnull = value_is_null(&state->root->value, row);
 	return state->root->value.values[row];
+}
+
+/*
+ * Ask a numeric arithmetic expression to leave its fast-path results in
+ * decoded form for an aggregate consumer instead of building Numerics.
+ * Only the + - * fast path qualifies; anything else keeps building datums.
+ */
+bool
+VectorExprDeferNumericResult(VectorExprState *state)
+{
+	VectorExprStep *root = state->root;
+	MemoryContext oldcontext;
+
+	if (root->kind != VEC_FUNC)
+		return false;
+	switch (root->u.func.arithmetic)
+	{
+		case VEC_ARITHMETIC_NUMERIC_ADD:
+		case VEC_ARITHMETIC_NUMERIC_SUB:
+		case VEC_ARITHMETIC_NUMERIC_MUL:
+			break;
+		default:
+			return false;
+	}
+	if (root->defer_mant == NULL)
+	{
+		oldcontext = MemoryContextSwitchTo(state->context);
+		root->defer_mant = palloc(sizeof(int64) * state->capacity);
+		root->defer_dscale = palloc(sizeof(int16) * state->capacity);
+		root->defer_valid = palloc0(sizeof(uint64) *
+									((state->capacity + 63) / 64));
+		MemoryContextSwitchTo(oldcontext);
+	}
+	root->defer_build = true;
+	return true;
+}
+
+/*
+ * The decoded fast-path result of a deferred expression, or false when the
+ * row went through the generic build/fmgr path and must be read as a datum.
+ */
+bool
+VectorExprGetDeferredNumeric(VectorExprState *state, int row, int64 *mant,
+							 int *dscale)
+{
+	VectorExprStep *root = state->root;
+
+	if (root->defer_valid == NULL ||
+		(root->defer_valid[row / 64] & ((uint64) 1 << (row % 64))) == 0)
+		return false;
+	*mant = root->defer_mant[row];
+	*dscale = root->defer_dscale[row];
+	return true;
 }
 
 void

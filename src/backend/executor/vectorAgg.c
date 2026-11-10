@@ -80,6 +80,7 @@ struct VectorAggState
 	VectorExprVarMap vars;
 	VectorExprState ***args;
 	VectorExprState **filters;
+	bool	   *deferred;		/* transno: arg yields decoded numerics */
 	int32	   *filtered_selection;
 	Datum	  **values;
 	bool	  **nulls;
@@ -312,6 +313,22 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 		}
 		Assert(argno == pertrans->numInputs);
 	}
+	state->deferred = palloc0(sizeof(bool) * agg->numtrans);
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &agg->pertrans[transno];
+
+		/*
+		 * sum()/avg(numeric) over a numeric arithmetic expression consumes
+		 * the decoded fast-path result directly, without the Numeric
+		 * materialization and re-parse per row.
+		 */
+		if (pertrans->numSortCols == 0 && pertrans->numTransInputs == 1 &&
+			(pertrans->aggref->aggfnoid == VEC_AGG_SUM_NUMERIC ||
+			 pertrans->aggref->aggfnoid == VEC_AGG_AVG_NUMERIC))
+			state->deferred[transno] =
+				VectorExprDeferNumericResult(state->args[transno][0]);
+	}
 	if (agg->aggstrategy == AGG_PLAIN)
 	{
 		/* nodeAgg owns its tuplesorts and frees them after the region state. */
@@ -517,6 +534,20 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			}
 			else
 				aggstate = (NumericAggState *) DatumGetPointer(pergroupstate->transValue);
+			if (!calcSumX2 && state->deferred[transno])
+			{
+				int64		mant;
+				int			dscale;
+
+				if (VectorExprGetDeferredNumeric(state->args[transno][0], row,
+												 &mant, &dscale))
+				{
+					/* no tmpcontext allocations on this path */
+					do_numeric_accum_fast(aggstate, mant, dscale);
+					return true;
+				}
+				/* the row used the generic build/fmgr path: read its datum */
+			}
 			oldcontext = MemoryContextSwitchTo(
 				state->agg->tmpcontext->ecxt_per_tuple_memory);
 			if (calcSumX2)

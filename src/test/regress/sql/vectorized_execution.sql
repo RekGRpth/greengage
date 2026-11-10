@@ -360,7 +360,12 @@ SELECT var_pop(id::int8), var_samp(id::int8), stddev(id::int8),
 FROM vector_aoco_small;
 SELECT avg(num) FROM vector_aoco_test;
 SELECT avg(n), sum(n) FROM vector_numeric_test;
+SELECT sum(n * 2), avg(n - 1) FROM vector_numeric_test;
 SELECT sum(n), avg(n), min(n), max(n), count(n) FROM vector_numeric_batch_test;
+-- Numeric arithmetic arguments take the deferred (decoded, no Numeric
+-- materialization) path into sum/avg, with per-row fallback mixed in.
+SELECT sum(n * 2), avg(n + 1), sum(n - 0.5), sum(n * n)
+FROM vector_numeric_batch_test;
 SELECT grp, sum(n), avg(n), count(n)
 FROM vector_numeric_batch_test GROUP BY grp ORDER BY grp;
 SELECT count(*), sum(s) FROM

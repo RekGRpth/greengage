@@ -31,6 +31,9 @@ extern void VectorExprEval(VectorBatch *batch, VectorExprState *state);
 extern void VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
 									int32 *selection, int nselected);
 extern Datum VectorExprGetValue(VectorExprState *state, int row, bool *isnull);
+extern bool VectorExprDeferNumericResult(VectorExprState *state);
+extern bool VectorExprGetDeferredNumeric(VectorExprState *state, int row,
+										 int64 *mant, int *dscale);
 extern void VectorExprFilter(VectorBatch *batch, VectorExprState *state);
 
 #endif							/* VECTOREXPR_H */

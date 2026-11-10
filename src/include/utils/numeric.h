@@ -139,6 +139,8 @@ extern float8 numeric_li_fraction(Numeric x, Numeric x0, Numeric x1,
 extern Numeric numeric_li_value(float8 f, Numeric y0, Numeric y1);
 extern void do_numeric_accum(NumericAggState *state, Numeric newval);
 extern void do_numeric_accum_datum(NumericAggState *state, Datum newval);
+extern void do_numeric_accum_fast(NumericAggState *state, int64 mantissa,
+								  int dscale);
 extern bool numeric_decode_fast_datum(Datum value, int64 *mantissa,
 									  int *scale, int *dscale);
 extern int cmp_numeric_datums(Datum num1, Datum num2);

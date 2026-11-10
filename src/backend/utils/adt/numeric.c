@@ -3969,6 +3969,33 @@ do_numeric_accum_var(NumericAggState *state, NumericVar *X)
 }
 
 /*
+ * Accumulate an exactly decoded value (mantissa * 10^-dscale) without
+ * materializing a Numeric: the same var construction numeric_build_fast()
+ * performs, but skipping make_result() and the subsequent re-parse.  The
+ * caller guarantees the mantissa has room for the display-scale padding
+ * (|mantissa| <= PG_INT64_MAX / 1000).
+ */
+void
+do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
+{
+	NumericVar	X;
+	int			pad = (4 - dscale % 4) % 4;
+
+	while (pad > 0)
+	{
+		mantissa *= 10;
+		pad--;
+	}
+
+	init_var(&X);
+	int64_to_numericvar(mantissa, &X);
+	X.weight -= (dscale + (4 - dscale % 4) % 4) / 4;
+	X.dscale = dscale;
+
+	do_numeric_accum_var(state, &X);
+}
+
+/*
  * Attempt to remove an input value from the aggregated state.
  *
  * If the value cannot be removed then the function will return false; the
