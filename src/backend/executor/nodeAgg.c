@@ -5388,6 +5388,8 @@ VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot, uint32 hash)
 {
 	HashAggSpill *spill = &aggstate->hash_spills[0];
 
+	SIMPLE_FAULT_INJECTOR("vector_agg_spill");
+
 	if (spill->partitions == NULL)
 	{
 		hashagg_spill_init(aggstate, spill, aggstate->hash_tapeinfo, 0,

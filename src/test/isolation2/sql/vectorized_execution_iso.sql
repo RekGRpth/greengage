@@ -49,4 +49,29 @@
 1:SET gp_vectorized_execution = force;
 2:SELECT gp_inject_fault('aocs_getnext_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
 
+-- An injected fault in the vectorized spill path fails the query cleanly:
+-- under ORCA the aggregate runs inside the region (the Postgres planner
+-- leaves it above the region, on the standard executor), so this section
+-- pins the optimizer; under a small statement_mem the vectorized hash
+-- aggregate spills groups and the armed fault fires on the first write.
+1:SET optimizer = on;
+1:SET statement_mem = '512kB';
+2:SELECT gp_inject_fault('vector_agg_spill', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+1:SELECT count(*) FROM (SELECT id % 9999 AS k, count(*) FROM vec_iso GROUP BY 1) t;
+2:SELECT gp_inject_fault('vector_agg_spill', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+
+-- The same spilling query succeeds after the reset.
+1:SELECT count(*) FROM (SELECT id % 9999 AS k, count(*) FROM vec_iso GROUP BY 1) t;
+1:RESET statement_mem;
+
+-- The armed fault leaves the standard executor's spill path untouched.
+2:SELECT gp_inject_fault('vector_agg_spill', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+1:SET gp_vectorized_execution = off;
+1:SET statement_mem = '512kB';
+1:SELECT count(*) FROM (SELECT id % 9999 AS k, count(*) FROM vec_iso GROUP BY 1) t;
+1:RESET statement_mem;
+1:SET gp_vectorized_execution = force;
+2:SELECT gp_inject_fault('vector_agg_spill', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+1:RESET optimizer;
+
 1:DROP TABLE vec_iso;
