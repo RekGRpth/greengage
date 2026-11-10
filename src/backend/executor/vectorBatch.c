@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include "executor/vectorBatch.h"
+#include "catalog/pg_type_d.h"
 #include "utils/datum.h"
 
 VectorBatch *
@@ -46,6 +47,16 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity)
 		column->typbyval = attr->attbyval;
 		column->values = palloc0(sizeof(Datum) * capacity);
 		column->nulls = palloc0(sizeof(uint64) * VECTOR_BATCH_NULLWORDS(capacity));
+		if (column->typid == NUMERICOID)
+		{
+			column->cache_gen = 0;
+			column->cache_nwords = VECTOR_BATCH_NULLWORDS(capacity);
+			column->cache_valid = palloc0(sizeof(uint64) *
+										  VECTOR_BATCH_NULLWORDS(capacity));
+			column->cache_mant = palloc(sizeof(int64) * capacity);
+			column->cache_scale = palloc(sizeof(int16) * capacity);
+			column->cache_dscale = palloc(sizeof(int16) * capacity);
+		}
 	}
 
 	MemoryContextSwitchTo(oldcontext);
@@ -65,6 +76,13 @@ VectorBatchDestroy(VectorBatch *batch)
 	{
 		pfree(batch->columns[col].values);
 		pfree(batch->columns[col].nulls);
+		if (batch->columns[col].cache_mant != NULL)
+		{
+			pfree(batch->columns[col].cache_valid);
+			pfree(batch->columns[col].cache_mant);
+			pfree(batch->columns[col].cache_scale);
+			pfree(batch->columns[col].cache_dscale);
+		}
 	}
 	pfree(batch->columns);
 	pfree(batch->selection);
@@ -78,6 +96,7 @@ VectorBatchReset(VectorBatch *batch)
 
 	batch->nrows = 0;
 	batch->nselected = 0;
+	batch->gen++;
 	MemoryContextReset(batch->varlena_context);
 	for (col = 0; col < batch->ncols; col++)
 		memset(batch->columns[col].nulls, 0,

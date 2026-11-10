@@ -27,6 +27,18 @@ typedef struct VectorColumn
 	bool		typbyval;
 	Datum	   *values;
 	uint64	   *nulls;
+
+	/*
+	 * Decoded numeric cache: every step reading this column decodes each
+	 * row once per batch.  cache_gen is the batch generation the entries
+	 * were decoded in; per-row bits in cache_valid say which rows hold one.
+	 */
+	uint32		cache_gen;
+	int			cache_nwords;
+	uint64    *cache_valid;
+	int64	   *cache_mant;
+	int16	   *cache_scale;
+	int16	   *cache_dscale;
 } VectorColumn;
 
 typedef struct VectorBatch
@@ -35,6 +47,7 @@ typedef struct VectorBatch
 	int			capacity;
 	int			nrows;
 	int			nselected;
+	uint32		gen;		/* batch generation, bumped on every reset */
 	VectorColumn *columns;
 	int32	   *selection;
 	TupleDesc	tupdesc;

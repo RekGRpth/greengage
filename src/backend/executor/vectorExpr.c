@@ -149,6 +149,7 @@ typedef struct VectorExprStep
 	VectorValue value;
 	struct VectorExprStep **args;
 	int			nargs;
+	VectorColumn *column_cache;	/* VEC_VAR: the aliased batch column */
 	int32	   *scratch[2];
 	struct VectorExprStep *case_operand;
 	bool	   *array_nulls;
@@ -749,6 +750,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					return NULL;
 				step = alloc_step(VEC_VAR, 0, batch->capacity);
 				column = &batch->columns[attno - 1];
+				step->column_cache = column;
 				step->value.typid = column->typid;
 				step->value.typmod = column->typmod;
 				step->value.typlen = column->typlen;
@@ -1527,12 +1529,63 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 }
 
 /*
+ * Decode a numeric operand with the column cache: every VEC_VAR step that
+ * reads the same column shares the per-batch decoded entries, so a column
+ * value is decoded once per batch no matter how many expressions use it.
+ */
+static bool
+numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
+				   int64 *mant, int *scale, int *dscale)
+{
+	VectorColumn *col = arg->column_cache;
+
+	if (col != NULL && col->cache_mant != NULL)
+	{
+		if (col->cache_gen != gen)
+		{
+			/*
+			 * A new batch rewrites the column: entries from the previous
+			 * generation are all stale, even rows this batch has not
+			 * decoded yet.
+			 */
+			memset(col->cache_valid, 0,
+				   sizeof(uint64) * col->cache_nwords);
+			col->cache_gen = gen;
+		}
+		if ((col->cache_valid[row / 64] & ((uint64) 1 << (row % 64))) != 0)
+		{
+			*mant = col->cache_mant[row];
+			*scale = col->cache_scale[row];
+			*dscale = col->cache_dscale[row];
+			return true;
+		}
+		/*
+		 * DatumGetNumeric also unpacks 1-byte-header varlenas that AOCS
+		 * blocks store compactly; the copy lands in the batch arena.
+		 */
+		if (numeric_decode_fast(DatumGetNumeric(arg->value.values[row]),
+								mant, scale, dscale))
+		{
+			col->cache_gen = gen;
+			col->cache_mant[row] = *mant;
+			col->cache_scale[row] = *scale;
+			col->cache_dscale[row] = *dscale;
+			col->cache_valid[row / 64] |= (uint64) 1 << (row % 64);
+			return true;
+		}
+		return false;
+	}
+	return numeric_decode_fast(DatumGetNumeric(arg->value.values[row]),
+							   mant, scale, dscale);
+}
+
+/*
  * One numeric fast-path row: compute in int64 when both operands decode
  * exactly and the result matches what the calculator functions would emit
  * (same display scale); otherwise fall back to the fmgr call for this row.
  */
 static void
-eval_numeric_arith_row(VectorExprStep *step, int row)
+eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 {
 	VectorValue *left = &step->args[0]->value;
 	VectorValue *right = &step->args[1]->value;
@@ -1546,8 +1599,8 @@ eval_numeric_arith_row(VectorExprStep *step, int row)
 	Datum		ldatum = left->values[row];
 	Datum		rdatum = right->values[row];
 
-	if (numeric_decode_fast((Numeric) DatumGetPointer(ldatum), &ma, &sa, &da) &&
-		numeric_decode_fast((Numeric) DatumGetPointer(rdatum), &mb, &sb, &db))
+	if (numeric_arg_decode(step->args[0], row, batch->gen, &ma, &sa, &da) &&
+		numeric_arg_decode(step->args[1], row, batch->gen, &mb, &sb, &db))
 	{
 		int64		mant;
 		bool		ok = true;
@@ -1646,7 +1699,7 @@ eval_numeric_arith_row(VectorExprStep *step, int row)
 }
 
 static void
-eval_arithmetic(VectorExprStep *step, int32 *selection, int nselected)
+eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
 	VectorValue *right = &step->args[1]->value;
@@ -1667,7 +1720,7 @@ eval_arithmetic(VectorExprStep *step, int32 *selection, int nselected)
 			case VEC_ARITHMETIC_NUMERIC_ADD:
 			case VEC_ARITHMETIC_NUMERIC_SUB:
 			case VEC_ARITHMETIC_NUMERIC_MUL:
-				eval_numeric_arith_row(step, row);
+				eval_numeric_arith_row(step, batch, row);
 				continue;
 			case VEC_ARITHMETIC_INT4_ADD:
 				{
@@ -1837,7 +1890,7 @@ eval_func(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 	}
 	if (step->u.func.arithmetic != VEC_ARITHMETIC_NONE)
 	{
-		eval_arithmetic(step, selection, nselected);
+		eval_arithmetic(step, batch, selection, nselected);
 		return;
 	}
 
