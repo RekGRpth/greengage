@@ -389,6 +389,14 @@ SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT sum(f4), sum(f8) FROM vector_float_test WHERE id = 2;
+SELECT id, f8 + f8, f8 - f8, f8 * f8, f8 / f8
+FROM vector_float_test WHERE id IN (1, 2, 4, 5, 8) ORDER BY id;
+SELECT id, f4 + f4, f4 - f4, f4 * f4, f4 / f4
+FROM vector_float_test WHERE id IN (1, 2, 4, 5, 8) ORDER BY id;
+SELECT sum(f8 * 2 - f8), avg(f4 + f4)
+FROM vector_float_test WHERE id BETWEEN 2 AND 5;
+SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
+SELECT f4 / 0 FROM vector_float_test WHERE id = 4;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
 SELECT min(d), max(d), min(ts), max(ts), min(tz), max(tz) FROM vector_time_test;
 SELECT array_agg(CASE WHEN id = 2 THEN NULL ELSE id END ORDER BY id)

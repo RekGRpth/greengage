@@ -130,7 +130,15 @@ typedef enum VectorArithmeticOp
 	VEC_ARITHMETIC_INT8_MOD,
 	VEC_ARITHMETIC_NUMERIC_ADD,
 	VEC_ARITHMETIC_NUMERIC_SUB,
-	VEC_ARITHMETIC_NUMERIC_MUL
+	VEC_ARITHMETIC_NUMERIC_MUL,
+	VEC_ARITHMETIC_FLOAT8_ADD,
+	VEC_ARITHMETIC_FLOAT8_SUB,
+	VEC_ARITHMETIC_FLOAT8_MUL,
+	VEC_ARITHMETIC_FLOAT8_DIV,
+	VEC_ARITHMETIC_FLOAT4_ADD,
+	VEC_ARITHMETIC_FLOAT4_SUB,
+	VEC_ARITHMETIC_FLOAT4_MUL,
+	VEC_ARITHMETIC_FLOAT4_DIV
 } VectorArithmeticOp;
 
 typedef struct VectorValue
@@ -707,6 +715,22 @@ vector_arithmetic_op(Oid functionid)
 			return VEC_ARITHMETIC_NUMERIC_SUB;
 		case F_NUMERIC_MUL:
 			return VEC_ARITHMETIC_NUMERIC_MUL;
+		case F_FLOAT8PL:
+			return VEC_ARITHMETIC_FLOAT8_ADD;
+		case F_FLOAT8MI:
+			return VEC_ARITHMETIC_FLOAT8_SUB;
+		case F_FLOAT8MUL:
+			return VEC_ARITHMETIC_FLOAT8_MUL;
+		case F_FLOAT8DIV:
+			return VEC_ARITHMETIC_FLOAT8_DIV;
+		case F_FLOAT4PL:
+			return VEC_ARITHMETIC_FLOAT4_ADD;
+		case F_FLOAT4MI:
+			return VEC_ARITHMETIC_FLOAT4_SUB;
+		case F_FLOAT4MUL:
+			return VEC_ARITHMETIC_FLOAT4_MUL;
+		case F_FLOAT4DIV:
+			return VEC_ARITHMETIC_FLOAT4_DIV;
 		default:
 			return VEC_ARITHMETIC_NONE;
 	}
@@ -1937,6 +1961,59 @@ eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int 
 					value_set(&step->value, row, Int64GetDatum(result), false);
 					break;
 				}
+				/*
+				 * The float helpers are static inline copies of the SQL
+				 * functions' bodies, so error texts and NaN/Inf handling
+				 * match float8pl/float8div and company exactly.
+				 */
+			case VEC_ARITHMETIC_FLOAT8_ADD:
+				value_set(&step->value, row,
+						  Float8GetDatum(float8_pl(DatumGetFloat8(left->values[row]),
+											DatumGetFloat8(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT8_SUB:
+				value_set(&step->value, row,
+						  Float8GetDatum(float8_mi(DatumGetFloat8(left->values[row]),
+											DatumGetFloat8(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT8_MUL:
+				value_set(&step->value, row,
+						  Float8GetDatum(float8_mul(DatumGetFloat8(left->values[row]),
+											DatumGetFloat8(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT8_DIV:
+				value_set(&step->value, row,
+						  Float8GetDatum(float8_div(DatumGetFloat8(left->values[row]),
+											DatumGetFloat8(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT4_ADD:
+				value_set(&step->value, row,
+						  Float4GetDatum(float4_pl(DatumGetFloat4(left->values[row]),
+											DatumGetFloat4(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT4_SUB:
+				value_set(&step->value, row,
+						  Float4GetDatum(float4_mi(DatumGetFloat4(left->values[row]),
+											DatumGetFloat4(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT4_MUL:
+				value_set(&step->value, row,
+						  Float4GetDatum(float4_mul(DatumGetFloat4(left->values[row]),
+											DatumGetFloat4(right->values[row]))),
+						  false);
+				break;
+			case VEC_ARITHMETIC_FLOAT4_DIV:
+				value_set(&step->value, row,
+						  Float4GetDatum(float4_div(DatumGetFloat4(left->values[row]),
+											DatumGetFloat4(right->values[row]))),
+						  false);
+				break;
 			default:
 				pg_unreachable();
 		}
