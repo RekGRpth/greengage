@@ -82,6 +82,10 @@ struct VectorAggState
 	VectorExprState ***args;
 	VectorExprState **filters;
 	bool	   *deferred;		/* transno: arg yields decoded numerics */
+	Datum	  **filter_values;	/* per transno: root arrays of the filter */
+	uint64	 **filter_nulls;
+	Datum	 ***arg_values;		/* per transno/argno: root value arrays */
+	uint64	***arg_nulls;
 	int32	   *filtered_selection;
 	Datum	  **values;
 	bool	  **nulls;
@@ -277,6 +281,10 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 
 	state->args = palloc0(sizeof(VectorExprState **) * agg->numtrans);
 	state->filters = palloc0(sizeof(VectorExprState *) * agg->numtrans);
+	state->filter_values = palloc0(sizeof(Datum *) * agg->numtrans);
+	state->filter_nulls = palloc0(sizeof(uint64 *) * agg->numtrans);
+	state->arg_values = palloc0(sizeof(Datum **) * agg->numtrans);
+	state->arg_nulls = palloc0(sizeof(uint64 **) * agg->numtrans);
 	state->filtered_selection = palloc(sizeof(int32) * batch->capacity);
 	state->values = palloc0(sizeof(Datum *) * agg->numtrans);
 	state->nulls = palloc0(sizeof(bool *) * agg->numtrans);
@@ -288,6 +296,8 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 		ListCell   *lc;
 
 		state->args[transno] = palloc0(sizeof(VectorExprState *) * Max(nargs, 1));
+		state->arg_values[transno] = palloc0(sizeof(Datum *) * Max(nargs, 1));
+		state->arg_nulls[transno] = palloc0(sizeof(uint64 *) * Max(nargs, 1));
 		state->values[transno] = palloc(sizeof(Datum) * Max(nargs, 1));
 		state->nulls[transno] = palloc(sizeof(bool) * Max(nargs, 1));
 		foreach(lc, pertrans->aggref->args)
@@ -383,6 +393,9 @@ eval_arguments(VectorAggState *state, VectorBatch *batch)
 			int			pos;
 
 			VectorExprEval(batch, state->filters[transno]);
+			VectorExprRootValue(state->filters[transno],
+								&state->filter_values[transno],
+								&state->filter_nulls[transno]);
 			nselected = 0;
 			for (pos = 0; pos < batch->nselected; pos++)
 			{
@@ -398,8 +411,13 @@ eval_arguments(VectorAggState *state, VectorBatch *batch)
 		}
 
 		for (argno = 0; argno < nargs; argno++)
+		{
 			VectorExprEvalSelection(batch, state->args[transno][argno],
 									selection, nselected);
+			VectorExprRootValue(state->args[transno][argno],
+								&state->arg_values[transno][argno],
+								&state->arg_nulls[transno][argno]);
+		}
 	}
 }
 
@@ -819,19 +837,20 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 		int			nargs = pertrans->numInputs;
 		int			argno;
 
+		/* eval_arguments() stashed the root arrays: read rows inline */
 		if (state->filters[transno] != NULL)
 		{
-			bool		isnull;
-			Datum		value = VectorExprGetValue(state->filters[transno], row,
-												 &isnull);
-
-			if (isnull || !DatumGetBool(value))
+			if ((state->filter_nulls[transno][row / 64] >> (row % 64)) & 1 ||
+				!DatumGetBool(state->filter_values[transno][row]))
 				continue;
 		}
 		for (argno = 0; argno < nargs; argno++)
+		{
 			state->values[transno][argno] =
-				VectorExprGetValue(state->args[transno][argno], row,
-								   &state->nulls[transno][argno]);
+				state->arg_values[transno][argno][row];
+			state->nulls[transno][argno] =
+				(state->arg_nulls[transno][argno][row / 64] >> (row % 64)) & 1;
+		}
 		if (pertrans->numSortCols == 0 &&
 			advance_byval_fast(state, pergroup, transno, row))
 			continue;

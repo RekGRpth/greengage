@@ -2705,6 +2705,17 @@ VectorExprGetValue(VectorExprState *state, int row, bool *isnull)
 }
 
 /*
+ * The root step's value array and null bitmap, so per-row consumers can
+ * read rows inline instead of calling VectorExprGetValue() per row.
+ */
+void
+VectorExprRootValue(VectorExprState *state, Datum **values, uint64 **null_words)
+{
+	*values = state->root->value.values;
+	*null_words = state->root->value.nulls;
+}
+
+/*
  * Ask a numeric arithmetic expression to leave its fast-path results in
  * decoded form for an aggregate consumer instead of building Numerics.
  * Only the + - * fast path qualifies; anything else keeps building datums.
