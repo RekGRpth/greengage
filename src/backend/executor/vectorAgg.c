@@ -501,7 +501,6 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 		case VEC_AGG_STDDEV_POP_INT8:
 		{
 			NumericAggState *aggstate;
-			Numeric		newval;
 			MemoryContext oldcontext;
 			bool		calcSumX2 = pertrans->aggref->aggfnoid != VEC_AGG_AVG_NUMERIC &&
 				pertrans->aggref->aggfnoid != VEC_AGG_SUM_NUMERIC;
@@ -520,10 +519,13 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				aggstate = (NumericAggState *) DatumGetPointer(pergroupstate->transValue);
 			oldcontext = MemoryContextSwitchTo(
 				state->agg->tmpcontext->ecxt_per_tuple_memory);
-			newval = calcSumX2 ?
-				DatumGetNumeric(DirectFunctionCall1(int8_numeric, value)) :
-				DatumGetNumeric(value);
-			do_numeric_accum(aggstate, newval);
+			if (calcSumX2)
+				do_numeric_accum(aggstate,
+								 DatumGetNumeric(DirectFunctionCall1(int8_numeric,
+																	 value)));
+			else
+				/* decodes inline varlenas without a detoast copy */
+				do_numeric_accum_datum(aggstate, value);
 			MemoryContextSwitchTo(oldcontext);
 			return true;
 		}

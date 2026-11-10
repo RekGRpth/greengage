@@ -463,6 +463,7 @@ static void init_var_from_var(const NumericVar *value, NumericVar *dest);
 static void init_ro_var_from_var(const NumericVar *value, NumericVar *dest);
 static void set_var_from_num(Numeric value, NumericVar *dest);
 static void init_var_from_num(Numeric value, NumericVar *dest);
+static bool init_var_from_datum(Datum value, NumericVar *dest);
 static char *get_str_from_var(const NumericVar *var);
 static char *get_str_from_var_sci(const NumericVar *var, int rscale);
 
@@ -545,6 +546,9 @@ static void compute_bucket(Numeric operand, Numeric bound1, Numeric bound2,
 						   const NumericVar *count_var, NumericVar *result_var);
 
 static void accum_sum_add(NumericSumAccum *accum, const NumericVar *var1);
+static void do_numeric_accum_var(NumericAggState *state, NumericVar *X);
+static bool numeric_decode_from_var(NumericVar *var, int64 *mantissa,
+									int *scale, int *dscale);
 static void accum_sum_rescale(NumericSumAccum *accum, const NumericVar *val);
 static void accum_sum_carry(NumericSumAccum *accum);
 static void accum_sum_reset(NumericSumAccum *accum);
@@ -2204,6 +2208,34 @@ cmp_numerics(Numeric num1, Numeric num2)
 }
 
 /*
+ * Like cmp_numerics(), but takes the datums as stored and skips the detoast
+ * copies for inline varlenas.  NaN ordering matches cmp_numerics().
+ */
+int
+cmp_numeric_datums(Datum num1, Datum num2)
+{
+	NumericVar	v1,
+				v2;
+	bool		ok1 = init_var_from_datum(num1, &v1);
+	bool		ok2 = init_var_from_datum(num2, &v2);
+
+	if (!ok1 || !ok2)
+		return cmp_numerics(DatumGetNumeric(num1), DatumGetNumeric(num2));
+
+	if (v1.sign == NUMERIC_NAN)
+	{
+		if (v2.sign == NUMERIC_NAN)
+			return 0;			/* NAN = NAN */
+		return 1;				/* NAN > non-NAN */
+	}
+	if (v2.sign == NUMERIC_NAN)
+		return -1;				/* non-NAN < NAN */
+
+	return cmp_var_common(v1.digits, v1.ndigits, v1.weight, v1.sign,
+						  v2.digits, v2.ndigits, v2.weight, v2.sign);
+}
+
+/*
  * in_range support function for numeric.
  */
 Datum
@@ -3858,8 +3890,6 @@ void
 do_numeric_accum(NumericAggState *state, Numeric newval)
 {
 	NumericVar	X;
-	NumericVar	X2;
-	MemoryContext old_context;
 
 	/* Count NaN inputs separately from all else */
 	if (NUMERIC_IS_NAN(newval))
@@ -3871,23 +3901,57 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	/* load processed number in short-lived context */
 	init_var_from_num(newval, &X);
 
+	do_numeric_accum_var(state, &X);
+}
+
+/*
+ * Like do_numeric_accum(), but takes the datum as stored and skips the
+ * detoast copy for inline varlenas.  Falls back to the detoasting variant
+ * for external, compressed, or over-wide datums.
+ */
+void
+do_numeric_accum_datum(NumericAggState *state, Datum newval)
+{
+	NumericVar	X;
+
+	if (!init_var_from_datum(newval, &X))
+	{
+		do_numeric_accum(state, DatumGetNumeric(newval));
+		return;
+	}
+	if (X.sign == NUMERIC_NAN)
+	{
+		state->NaNcount++;
+		return;
+	}
+
+	do_numeric_accum_var(state, &X);
+}
+
+/* The transition body shared by the accum entry points above. */
+static void
+do_numeric_accum_var(NumericAggState *state, NumericVar *X)
+{
+	NumericVar	X2;
+	MemoryContext old_context;
+
 	/*
 	 * Track the highest input dscale that we've seen, to support inverse
 	 * transitions (see do_numeric_discard).
 	 */
-	if (X.dscale > state->maxScale)
+	if (X->dscale > state->maxScale)
 	{
-		state->maxScale = X.dscale;
+		state->maxScale = X->dscale;
 		state->maxScaleCount = 1;
 	}
-	else if (X.dscale == state->maxScale)
+	else if (X->dscale == state->maxScale)
 		state->maxScaleCount++;
 
 	/* if we need X^2, calculate that in short-lived context */
 	if (state->calcSumX2)
 	{
 		init_var(&X2);
-		mul_var(&X, &X, &X2, X.dscale * 2);
+		mul_var(X, X, &X2, X->dscale * 2);
 	}
 
 	/* The rest of this needs to work in the aggregate context */
@@ -3896,7 +3960,7 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	state->N++;
 
 	/* Accumulate sums */
-	accum_sum_add(&(state->sumX), &X);
+	accum_sum_add(&(state->sumX), X);
 
 	if (state->calcSumX2)
 		accum_sum_add(&(state->sumX2), &X2);
@@ -6262,6 +6326,70 @@ init_var_from_num(Numeric num, NumericVar *dest)
 	dest->dscale = NUMERIC_DSCALE(num);
 	dest->digits = NUMERIC_DIGITS(num);
 	dest->buf = dest->ndb;
+}
+
+/*
+ * Initialize a read-only NumericVar straight from an inline (1-byte or
+ * 4-byte uncompressed header) varlena datum, without the detoast copy that
+ * DatumGetNumeric() would make for the 1-byte-header values AOCS blocks
+ * hand out.  Digits are copied into the var's local buffer (at most
+ * NUMERIC_LOCAL_NDIG groups, aligned); 1-byte payloads would not be safe to
+ * dereference in place anyway.  Returns false for external or compressed
+ * datums and for values too wide for the local buffer; the caller then
+ * detoasts.
+ */
+static bool
+init_var_from_datum(Datum value, NumericVar *dest)
+{
+	char	   *ptr = (char *) DatumGetPointer(value);
+	char	   *data;
+	int			len;
+	uint16		header;
+
+	if (VARATT_IS_4B_U(ptr))
+	{
+		data = VARDATA_4B(ptr);
+		len = VARSIZE_4B(ptr) - VARHDRSZ;
+	}
+	else if (VARATT_IS_1B(ptr) && !VARATT_IS_1B_E(ptr))
+	{
+		data = VARDATA_1B(ptr);
+		len = VARSIZE_1B(ptr) - VARHDRSZ_SHORT;
+	}
+	else
+		return false;
+
+	memcpy(&header, data, sizeof(uint16));
+	dest->buf = dest->ndb;
+	if ((header & NUMERIC_SIGN_MASK) == NUMERIC_SHORT)
+	{
+		dest->sign = (header & NUMERIC_SHORT_SIGN_MASK) ? NUMERIC_NEG : NUMERIC_POS;
+		dest->dscale = (header & NUMERIC_SHORT_DSCALE_MASK) >>
+			NUMERIC_SHORT_DSCALE_SHIFT;
+		dest->weight = (header & NUMERIC_SHORT_WEIGHT_SIGN_MASK ?
+						~NUMERIC_SHORT_WEIGHT_MASK : 0) |
+			(header & NUMERIC_SHORT_WEIGHT_MASK);
+		data += sizeof(uint16);
+		len -= sizeof(uint16);
+	}
+	else
+	{
+		int16		weight;
+
+		memcpy(&weight, data + sizeof(uint16), sizeof(int16));
+		dest->sign = header & NUMERIC_SIGN_MASK;
+		dest->dscale = header & NUMERIC_DSCALE_MASK;
+		dest->weight = weight;
+		data += sizeof(uint16) + sizeof(int16);
+		len -= sizeof(uint16) + sizeof(int16);
+	}
+	dest->ndigits = len / sizeof(NumericDigit);
+	if (dest->ndigits > NUMERIC_LOCAL_NDIG)
+		return false;		/* too wide for the local buffer */
+	if (dest->ndigits > 0)
+		memcpy(dest->ndb, data, dest->ndigits * sizeof(NumericDigit));
+	dest->digits = dest->ndb;
+	return true;
 }
 
 
@@ -9938,24 +10066,50 @@ bool
 numeric_decode_fast(Numeric num, int64 *mantissa, int *scale, int *dscale)
 {
 	NumericVar	var;
+
+	init_var_from_num(num, &var);
+	return numeric_decode_from_var(&var, mantissa, scale, dscale);
+}
+
+/*
+ * Like numeric_decode_fast(), but takes the datum as stored and skips the
+ * detoast copy for inline varlenas (AOCS blocks store small numerics with
+ * 1-byte headers).  Falls back to the detoasting decode for external,
+ * compressed, or over-wide datums.
+ */
+bool
+numeric_decode_fast_datum(Datum value, int64 *mantissa, int *scale,
+						  int *dscale)
+{
+	NumericVar	var;
+
+	if (!init_var_from_datum(value, &var))
+		return numeric_decode_fast(DatumGetNumeric(value), mantissa, scale,
+								   dscale);
+	return numeric_decode_from_var(&var, mantissa, scale, dscale);
+}
+
+/* The exact (mantissa, scale, dscale) fold shared by the decoders above. */
+static bool
+numeric_decode_from_var(NumericVar *var, int64 *mantissa, int *scale,
+						int *dscale)
+{
 	int64		total = 0;
 	int			i;
 
-	if (numeric_is_nan(num))
+	if (var->sign == NUMERIC_NAN)
 		return false;
 
-	init_var_from_num(num, &var);
-
-	for (i = 0; i < var.ndigits; i++)
+	for (i = 0; i < var->ndigits; i++)
 	{
-		if (total > (PG_INT64_MAX - (int64) var.digits[i]) / NBASE)
+		if (total > (PG_INT64_MAX - (int64) var->digits[i]) / NBASE)
 			return false;
-		total = total * NBASE + var.digits[i];
+		total = total * NBASE + var->digits[i];
 	}
-	if (var.sign == NUMERIC_NEG)
+	if (var->sign == NUMERIC_NEG)
 		total = -total;
 
-	*scale = (var.ndigits - var.weight - 1) * DEC_DIGITS;
+	*scale = (var->ndigits - var->weight - 1) * DEC_DIGITS;
 	while (*scale < 0)
 	{
 		if (total > PG_INT64_MAX / 10 || total < PG_INT64_MIN / 10)
@@ -9967,7 +10121,7 @@ numeric_decode_fast(Numeric num, int64 *mantissa, int *scale, int *dscale)
 		return false;
 
 	*mantissa = total;
-	*dscale = var.dscale;
+	*dscale = var->dscale;
 	return true;
 }
 

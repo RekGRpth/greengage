@@ -13,6 +13,7 @@ DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
 DROP TABLE IF EXISTS vector_numeric_test;
 DROP TABLE IF EXISTS vector_numeric_batch_test;
+DROP TABLE IF EXISTS vector_numeric_wide_test;
 DROP TABLE IF EXISTS vector_arithmetic_test;
 DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
@@ -76,6 +77,18 @@ SELECT g, g % 5,
        END
 FROM generate_series(1, 7000) AS g;
 ANALYZE vector_numeric_batch_test;
+-- Wide numerics: more than 144 significant digits exceed the local digit
+-- buffer of the inline (detoast-free) decode, and more than about 244
+-- digits are stored with 4-byte varlena headers at all.
+CREATE TABLE vector_numeric_wide_test (id int4, n numeric)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_numeric_wide_test VALUES
+(1, repeat('1234567890', 15)::numeric),
+(2, repeat('9876543210', 30)::numeric),
+(3, -repeat('1357913579', 15)::numeric / 3),
+(4, NULL);
+ANALYZE vector_numeric_wide_test;
 CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8, s int2)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
@@ -355,6 +368,10 @@ SELECT count(*), sum(s) FROM
 SELECT sum(n) FILTER (WHERE id % 2 = 0),
        avg(n) FILTER (WHERE id % 3 = 0)
 FROM vector_numeric_batch_test;
+SELECT sum(n), avg(n), min(n), max(n), count(n)
+FROM vector_numeric_wide_test;
+SELECT id, n > repeat('1', 150)::numeric, n < 0
+FROM vector_numeric_wide_test ORDER BY id;
 SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
@@ -730,6 +747,8 @@ DROP TABLE vector_limit_test;
 DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
+DROP TABLE vector_numeric_batch_test;
+DROP TABLE vector_numeric_wide_test;
 DROP TABLE vector_arithmetic_test;
 DROP TABLE vector_rle_test;
 DROP TABLE vector_float_test;

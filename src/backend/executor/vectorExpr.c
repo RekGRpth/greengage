@@ -1352,15 +1352,7 @@ VectorExprDestroy(VectorExprState *state)
 static int
 numeric_compare_datums(Datum left, Datum right)
 {
-	Numeric		nleft = DatumGetNumeric(left);
-	Numeric		nright = DatumGetNumeric(right);
-	int			result = cmp_numerics(nleft, nright);
-
-	if ((Pointer) nleft != DatumGetPointer(left))
-		pfree(nleft);
-	if ((Pointer) nright != DatumGetPointer(right))
-		pfree(nright);
-	return result;
+	return cmp_numeric_datums(left, right);
 }
 
 static void
@@ -1560,11 +1552,11 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
 			return true;
 		}
 		/*
-		 * DatumGetNumeric also unpacks 1-byte-header varlenas that AOCS
-		 * blocks store compactly; the copy lands in the batch arena.
+		 * The datum decode handles the 1-byte-header varlenas that AOCS
+		 * blocks store compactly, without a detoast copy.
 		 */
-		if (numeric_decode_fast(DatumGetNumeric(arg->value.values[row]),
-								mant, scale, dscale))
+		if (numeric_decode_fast_datum(arg->value.values[row],
+									  mant, scale, dscale))
 		{
 			col->cache_gen = gen;
 			col->cache_mant[row] = *mant;
@@ -1575,8 +1567,8 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
 		}
 		return false;
 	}
-	return numeric_decode_fast(DatumGetNumeric(arg->value.values[row]),
-							   mant, scale, dscale);
+	return numeric_decode_fast_datum(arg->value.values[row],
+									  mant, scale, dscale);
 }
 
 /*

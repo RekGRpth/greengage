@@ -13,6 +13,7 @@ DROP TABLE IF EXISTS vector_unique_test;
 DROP TABLE IF EXISTS vector_time_test;
 DROP TABLE IF EXISTS vector_numeric_test;
 DROP TABLE IF EXISTS vector_numeric_batch_test;
+DROP TABLE IF EXISTS vector_numeric_wide_test;
 DROP TABLE IF EXISTS vector_arithmetic_test;
 DROP TABLE IF EXISTS vector_float_test;
 DROP TABLE IF EXISTS vector_append_parent CASCADE;
@@ -76,6 +77,18 @@ SELECT g, g % 5,
        END
 FROM generate_series(1, 7000) AS g;
 ANALYZE vector_numeric_batch_test;
+-- Wide numerics: more than 144 significant digits exceed the local digit
+-- buffer of the inline (detoast-free) decode, and more than about 244
+-- digits are stored with 4-byte varlena headers at all.
+CREATE TABLE vector_numeric_wide_test (id int4, n numeric)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_numeric_wide_test VALUES
+(1, repeat('1234567890', 15)::numeric),
+(2, repeat('9876543210', 30)::numeric),
+(3, -repeat('1357913579', 15)::numeric / 3),
+(4, NULL);
+ANALYZE vector_numeric_wide_test;
 CREATE TABLE vector_arithmetic_test (id int4, a int4, b int8, s int2)
 WITH (appendonly = true, orientation = column)
 DISTRIBUTED BY (id);
@@ -848,6 +861,23 @@ FROM vector_numeric_batch_test;
  3064250000002628500.003060750 | 14123166589659633708916942754.0887332028922625
 (1 row)
 
+SELECT sum(n), avg(n), min(n), max(n), count(n)
+FROM vector_numeric_wide_test;
+                                                                                                                                                     sum                                                                                                                                                      |                                                                                                                                                     avg                                                                                                                                                      |                                                                          min                                                                           |                                                                                                                                                     max                                                                                                                                                      | count 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------
+ 987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543211065847324139918065747325139908065847324139918065747325139908065847324139918065747325139908065847324139918065747325139908065847324139918065747325139907 | 329218107032921810703292181070329218107032921810703292181070329218107032921810703292181070329218107032921810703292181070329218107032921810703292181070355282441379972688582441713302688615774713306021915775046636021949108046639355249108379969355282441379972688582441713302688615774713306021915775046636 | -45263785971193045263785971193045263785971193045263785971193045263785971193045263785971193045263785971193045263785971193045263785971193045263785971193 | 987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210 |     3
+(1 row)
+
+SELECT id, n > repeat('1', 150)::numeric, n < 0
+FROM vector_numeric_wide_test ORDER BY id;
+ id | ?column? | ?column? 
+----+----------+----------
+  1 | t        | f
+  2 | t        | f
+  3 | f        | t
+  4 |          | 
+(4 rows)
+
 SELECT min(n), max(n) FROM vector_numeric_test;
   min  | max 
 -------+-----
@@ -857,14 +887,14 @@ SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
    n   | ?column? | ?column? | ?column? | ?column? | ?column? 
 -------+----------+----------+----------+----------+----------
+ -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
+   2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
+   NaN |      NaN |      NaN |      NaN |      NaN |      NaN
      0 |        1 |       -1 |        0 |        0 |        0
    1.2 |      2.2 |      0.2 |      3.6 |      2.4 |     1.44
  1.200 |    2.200 |    0.200 |    3.600 |    2.400 | 1.440000
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
        |          |          |          |          |         
-   2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
-   NaN |      NaN |      NaN |      NaN |      NaN |      NaN
- -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
 (8 rows)
 
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
@@ -2433,6 +2463,8 @@ DROP TABLE vector_limit_test;
 DROP TABLE vector_unique_test;
 DROP TABLE vector_time_test;
 DROP TABLE vector_numeric_test;
+DROP TABLE vector_numeric_batch_test;
+DROP TABLE vector_numeric_wide_test;
 DROP TABLE vector_arithmetic_test;
 DROP TABLE vector_rle_test;
 DROP TABLE vector_float_test;
