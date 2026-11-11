@@ -18,6 +18,7 @@
 #include "access/tupdesc.h"
 #include "cdb/cdbaocsam.h"
 #include "executor/executor.h"
+#include "executor/execPartition.h"
 #include "executor/nodeAppend.h"
 #include "executor/nodeCustom.h"
 #include "executor/nodeLimit.h"
@@ -327,7 +328,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("vector append expects at least one input")));
-		state->append_index = 0;
+		state->append_index = -1;
 		state->scan = (SeqScanState *) state->append->appendplans[0];
 		if (!IsA(state->scan, SeqScanState))
 			elog(ERROR, "vector append child is not a SeqScan");
@@ -667,6 +668,37 @@ VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc,
 	return nrows > 0;
 }
 
+/*
+ * Choose the first child to scan.  Exec pruning parameters are available
+ * only at execution time, so the valid set is computed on first use (and
+ * recomputed by VectorRegionRescan for nested-loop rescans).  Returns false
+ * when no subplan survives pruning.
+ */
+static bool
+append_first_valid(VectorRegionState *state)
+{
+	AppendState *append = state->append;
+	Append	   *plan = (Append *) append->ps.plan;
+	int			idx;
+
+	if (append->as_prune_state != NULL && append->as_valid_subplans == NULL)
+		append->as_valid_subplans = ExecFindMatchingSubPlans(
+			append->as_prune_state, state->css.ss.ps.state,
+			list_length(plan->appendplans), plan->join_prune_paramids);
+
+	if (append->as_valid_subplans != NULL)
+		idx = bms_next_member(append->as_valid_subplans, -1);
+	else
+		idx = 0;
+	if (idx < 0)
+		return false;
+	state->append_index = idx;
+	state->scan = (SeqScanState *) append->appendplans[idx];
+	state->qual = state->append_quals[idx];
+	state->eof = false;
+	return true;
+}
+
 static bool
 VectorRegionNextBatch(VectorRegionState *state)
 {
@@ -681,6 +713,9 @@ VectorRegionNextBatch(VectorRegionState *state)
 
 	for (;;)
 	{
+		if (state->append != NULL && state->append_index < 0 &&
+			!append_first_valid(state))
+			return false;
 		while (!state->eof)
 		{
 			TableScanDesc scandesc;
@@ -732,10 +767,21 @@ VectorRegionNextBatch(VectorRegionState *state)
 				return true;
 		}
 
-		if (state->append == NULL ||
-			state->append_index + 1 >= state->append->as_nplans)
+		if (state->append == NULL)
 			return false;
-		state->append_index++;
+		if (state->append->as_valid_subplans != NULL)
+			state->append_index = bms_next_member(state->append->as_valid_subplans,
+											  state->append_index);
+		else
+			state->append_index++;
+		if (state->append_index < 0)
+		{
+			/* no more children: park at the end, do not restart the append */
+			state->append_index = state->append->as_nplans;
+			return false;
+		}
+		if (state->append_index >= state->append->as_nplans)
+			return false;
 		state->scan = (SeqScanState *) state->append->appendplans[state->append_index];
 		state->qual = state->append_quals[state->append_index];
 		state->position = 0;
@@ -1046,7 +1092,10 @@ VectorRegionRescan(CustomScanState *node)
 	}
 	if (state->append != NULL)
 	{
-		state->append_index = 0;
+		if (state->append->as_prune_state != NULL &&
+			state->append->as_prune_state->do_exec_prune)
+			state->append->as_valid_subplans = NULL;
+		state->append_index = -1;
 		state->scan = (SeqScanState *) state->append->appendplans[0];
 		state->qual = state->append_quals[0];
 	}

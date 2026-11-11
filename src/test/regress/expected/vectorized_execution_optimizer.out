@@ -1003,9 +1003,9 @@ SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
  1.200 |    2.200 |    0.200 |    3.600 |    2.400 | 1.440000
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
        |          |          |          |          |         
+ -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
    2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
- -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
 (8 rows)
 
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
@@ -2645,6 +2645,25 @@ SELECT count(*) FROM vector_part_test WHERE grp = 7;
    600
 (1 row)
 
+-- Pruning inside one region: an empty valid set yields no rows, and exec
+-- pruning is recomputed for each nested-loop outer row.
+SELECT count(*) FROM vector_part_test WHERE id > 10000;
+ count 
+-------
+     0
+(1 row)
+
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT count(*) FROM (VALUES (1), (2), (3)) v(k)
+JOIN vector_part_test p ON p.id BETWEEN v.k * 1000 AND v.k * 1000 + 50;
+ count 
+-------
+   153
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
 SELECT count(*), sum(num) FROM vector_drop_test WHERE id % 3 = 0;
  count |   sum    
 -------+----------

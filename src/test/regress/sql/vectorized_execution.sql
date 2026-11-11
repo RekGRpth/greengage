@@ -823,6 +823,15 @@ WHERE id BETWEEN (SELECT min(id) FROM vector_part_test WHERE grp = 3)
             AND (SELECT max(id) FROM vector_part_test WHERE grp = 3);
 -- No pruning at all: the whole Append runs inside one region.
 SELECT count(*) FROM vector_part_test WHERE grp = 7;
+-- Pruning inside one region: an empty valid set yields no rows, and exec
+-- pruning is recomputed for each nested-loop outer row.
+SELECT count(*) FROM vector_part_test WHERE id > 10000;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT count(*) FROM (VALUES (1), (2), (3)) v(k)
+JOIN vector_part_test p ON p.id BETWEEN v.k * 1000 AND v.k * 1000 + 50;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
 SELECT count(*), sum(num) FROM vector_drop_test WHERE id % 3 = 0;
 SELECT grp, count(*), sum(num) FROM vector_drop_test GROUP BY grp ORDER BY grp;
 SELECT count(*), sum(v) FROM

@@ -126,8 +126,7 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 	ListCell   *lc;
 	bool		supported = false;
 
-	if (append->appendplans == NIL || append->part_prune_info != NULL ||
-		append->join_prune_paramids != NIL || append->plan.parallel_aware)
+	if (append->appendplans == NIL || append->plan.parallel_aware)
 		return false;
 
 	foreach(lc, append->appendplans)
