@@ -647,6 +647,20 @@ SELECT id % 2 AS a, GROUPING(id % 2) AS g,
        string_agg(val, ',' ORDER BY id) AS vals
 FROM vector_aoco_small GROUP BY ROLLUP(a) ORDER BY a, g;
 RESET enable_hashagg;
+-- Mixed aggregation (hashed grouping sets plus the plain empty set):
+-- every row advances every set in one pass, plain sets project first.
+SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,
+       count(*), sum(big), min(big), max(big)
+FROM vector_aoco_small GROUP BY ROLLUP (a, b) ORDER BY a, b, g;
+SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g, count(*)
+FROM vector_aoco_small GROUP BY CUBE (a, b) ORDER BY a, b, g;
+SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g, count(*)
+FROM vector_aoco_small GROUP BY GROUPING SETS ((a, b), (a), ()) ORDER BY a, b, g;
+SELECT count(*), sum(big) FROM vector_aoco_small GROUP BY GROUPING SETS (());
+SET statement_mem = '512kB';
+SELECT id % 1000 AS a, count(*), sum(id)
+FROM vector_aoco_test GROUP BY ROLLUP (a) ORDER BY a;
+RESET statement_mem;
 EXPLAIN (COSTS OFF)
 SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM vector_aoco_small;
 SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id),

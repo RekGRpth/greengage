@@ -99,6 +99,9 @@ struct VectorAggState
 	bool		group_open;
 	bool		input_done;
 	bool		output_done;
+	/* AGG_MIXED: plain (non-hash) grouping sets are emitted before hashed */
+	int			mixed_plain_index;
+	bool		mixed_hashed_started;
 };
 
 static bool
@@ -110,7 +113,8 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	int			col = 0;
 
 	if (!IsA(outer, SeqScan) && !IsA(outer, Motion) &&
-		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED)
+		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED &&
+		agg->aggstrategy != AGG_MIXED)
 		return false;
 
 	vars->outer_ncols = list_length(outer->targetlist);
@@ -184,11 +188,35 @@ VectorAggPlanIsSupported(Agg *agg)
 	bool		supported = false;
 
 	if ((agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED &&
-		 agg->aggstrategy != AGG_SORTED) ||
+		 agg->aggstrategy != AGG_SORTED && agg->aggstrategy != AGG_MIXED) ||
 		(agg->aggsplit != AGGSPLIT_SIMPLE &&
 		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
-		agg->chain != NIL ||
 		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming)
+		return false;
+	if (agg->aggstrategy == AGG_MIXED)
+	{
+		ListCell   *clc;
+
+		/*
+		 * Only mixed plans whose non-hash phases are all plain (no ordered
+		 * input) run in one pass over the batch stream.  Sorted phases would
+		 * need the tuplesort machinery, which the region does not have.
+		 */
+		foreach(clc, agg->chain)
+		{
+			Agg		   *ch = (Agg *) lfirst(clc);
+
+			/*
+			 * The chain holds the other hashed groupings (AGG_HASHED)
+			 * followed by plain empty-set phases (AGG_PLAIN).  Sorted phases
+			 * need ordered input the region does not provide.
+			 */
+			if ((ch->aggstrategy != AGG_HASHED && ch->aggstrategy != AGG_PLAIN) ||
+				(ch->aggstrategy == AGG_PLAIN && ch->numCols != 0))
+				return false;
+		}
+	}
+	else if (agg->chain != NIL)
 		return false;
 	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
 		(agg->aggstrategy != AGG_PLAIN && agg->numCols == 0))
@@ -208,8 +236,8 @@ VectorAggPlanIsSupported(Agg *agg)
 
 		if (te->resjunk)
 			goto done;
-		if (IsA(te->expr, GroupingSetId))
-			continue;
+		if (IsA(te->expr, GroupingSetId) || IsA(te->expr, GroupingFunc))
+			continue;	/* evaluated by nodeAgg's projection, not the batch exprs */
 		if (IsA(te->expr, Var))
 		{
 			if (!VectorExprIsSupported((Expr *) te->expr, &vars))
@@ -242,7 +270,7 @@ VectorAggPlanIsSupported(Agg *agg)
 				TargetEntry *arg = (TargetEntry *) lfirst(arglc);
 
 				if (!VectorExprIsSupported(arg->expr, &vars))
-					goto done;
+				goto done;
 			}
 		}
 	}
@@ -350,6 +378,17 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 		/* nodeAgg owns its tuplesorts and frees them after the region state. */
 		MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
 		VectorAggInitializePlain(agg);
+		MemoryContextSwitchTo(state->context);
+	}
+	if (agg->aggstrategy == AGG_MIXED)
+	{
+		/*
+		 * Non-hash grouping sets live in pergroups[] in phase order, one per
+		 * plain phase; initialize them like the standard executor would on
+		 * the first input tuple of each phase.
+		 */
+		MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
+		VectorAggInitializeSet(agg, agg->maxsets);
 		MemoryContextSwitchTo(state->context);
 	}
 	MemoryContextSwitchTo(oldcontext);
@@ -525,6 +564,58 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 	if (agg->hash_spill_mode)
 	{
 		VectorAggSpillTuple(agg, fill_input_slot(state, batch, row), hash);
+		return NULL;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("vectorized hash aggregate could not create a group")));
+	return NULL;
+}
+
+/*
+ * AGG_MIXED: find the row's group in the hash table of one hashed grouping
+ * set.  No memo here: keys are compared per set, and with several sets the
+ * previous row's group of this set is rarely the same anyway.
+ */
+static AggStatePerGroup
+lookup_group_mixed(VectorAggState *state, VectorBatch *batch, int row,
+				   int setno)
+{
+	AggState   *agg = state->agg;
+	AggStatePerHash perhash = &agg->perhash[setno];
+	TupleTableSlot *hashslot = perhash->hashslot;
+	TupleHashEntry entry;
+	bool		isnew = false;
+	uint32		hash = 0;
+	int			col;
+
+	ExecClearTuple(hashslot);
+	for (col = 0; col < perhash->numhashGrpCols; col++)
+	{
+		int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
+		AttrNumber	attno = state->vars.outer_attnos[inputcol];
+
+		hashslot->tts_values[col] = batch->columns[attno - 1].values[row];
+		hashslot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
+	}
+	ExecStoreVirtualTuple(hashslot);
+
+	if (agg->hash_spill_mode)
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, NULL, &hash);
+	else
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, &isnew, &hash);
+	if (entry != NULL)
+	{
+		if (isnew)
+			VectorAggInitializeEntry(agg, entry);
+		return (AggStatePerGroup) entry->additional;
+	}
+
+	/* A new group that no longer fits is spilled and processed on refill. */
+	if (agg->hash_spill_mode)
+	{
+		VectorAggSpillTupleSet(agg, fill_input_slot(state, batch, row), hash,
+							   setno);
 		return NULL;
 	}
 	ereport(ERROR,
@@ -922,6 +1013,27 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 			if (pergroup == NULL)
 				continue;
 		}
+		else if (agg->aggstrategy == AGG_MIXED)
+		{
+			int			setno;
+
+			/* hashed grouping sets: one lookup per set per row */
+			for (setno = 0; setno < agg->num_hashes; setno++)
+			{
+				VectorAggSelectHashSet(agg, setno);
+				pergroup = lookup_group_mixed(state, batch, row, setno);
+				if (pergroup != NULL)
+					advance_row(state, pergroup, row);
+				/* a spilled row still feeds the plain grouping sets below */
+			}
+			/* plain grouping sets: every row advances every one of them */
+			for (setno = 0; setno < agg->maxsets; setno++)
+			{
+				VectorAggSelectSet(agg, setno);
+				advance_row(state, agg->pergroups[setno], row);
+			}
+			continue;
+		}
 		else
 			pergroup = agg->pergroups[0];
 
@@ -1087,6 +1199,35 @@ VectorAggNext(VectorAggState *state)
 		return NULL;
 	}
 
+	if (state->agg->aggstrategy == AGG_MIXED)
+	{
+		AggState   *agg = state->agg;
+
+		/* plain grouping sets go first, in phase order, as in nodeAgg */
+		while (!state->mixed_hashed_started &&
+			   state->mixed_plain_index < agg->maxsets)
+		{
+			int			k = state->mixed_plain_index++;
+
+			/* each plain phase contributes exactly one grouping set */
+			result = VectorAggRetrievePlainSet(agg, k + 1, 0, k);
+			if (result != NULL)
+				return result;
+		}
+		if (!state->mixed_hashed_started)
+		{
+			agg->phase = &agg->phases[0];
+			ResetTupleHashIterator(agg->perhash[0].hashtable,
+								   &agg->perhash[0].hashiter);
+			VectorAggSelectHashSet(agg, 0);
+			state->mixed_hashed_started = true;
+		}
+		result = VectorAggRetrieveHashed(agg);
+		if (result == NULL)
+			state->output_done = true;
+		return result;
+	}
+
 	if (state->agg->aggstrategy == AGG_HASHED)
 		return VectorAggRetrieveHashed(state->agg);
 
@@ -1107,6 +1248,16 @@ VectorAggReset(VectorAggState *state)
 
 		VectorAggInitializePlain(state->agg);
 		MemoryContextSwitchTo(oldcontext);
+	}
+	if (state->agg->aggstrategy == AGG_MIXED)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(
+			state->agg->ss.ps.state->es_query_cxt);
+
+		VectorAggInitializeSet(state->agg, state->agg->maxsets);
+		MemoryContextSwitchTo(oldcontext);
+		state->mixed_plain_index = 0;
+		state->mixed_hashed_started = false;
 	}
 	/* A reused hash table must be iterated, not populated a second time. */
 	state->input_done = state->agg->aggstrategy == AGG_HASHED &&

@@ -33,6 +33,9 @@ extern void VectorAggInitializeEntry(AggState *aggstate,
 extern void VectorAggInitializePlain(AggState *aggstate);
 extern void VectorAggInitializeSet(AggState *aggstate, int numReset);
 extern void VectorAggSelectSet(AggState *aggstate, int currentSet);
+extern void VectorAggSelectHashSet(AggState *aggstate, int currentSet);
+extern void VectorAggSpillTupleSet(AggState *aggstate, TupleTableSlot *slot,
+									   uint32 hash, int setno);
 extern void VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot,
 								uint32 hash);
 extern void VectorAggFinishInput(AggState *aggstate);
@@ -41,5 +44,8 @@ extern TupleTableSlot *VectorAggRetrieveGroup(AggState *aggstate, int currentSet
 extern bool VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot,
 							   int numCols);
 extern TupleTableSlot *VectorAggRetrieveHashed(AggState *aggstate);
+extern TupleTableSlot *VectorAggRetrievePlainSet(AggState *aggstate,
+															  int phaseidx, int phaseset,
+															  int setno);
 
 #endif							/* VECTORAGG_H */

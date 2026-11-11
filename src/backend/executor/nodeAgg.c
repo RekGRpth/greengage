@@ -5401,6 +5401,24 @@ VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot, uint32 hash)
 }
 
 void
+VectorAggSpillTupleSet(AggState *aggstate, TupleTableSlot *slot, uint32 hash,
+					   int setno)
+{
+	HashAggSpill *spill = &aggstate->hash_spills[setno];
+
+	SIMPLE_FAULT_INJECTOR("vector_agg_spill");
+
+	if (spill->partitions == NULL)
+	{
+		hashagg_spill_init(aggstate, spill, aggstate->hash_tapeinfo, setno,
+						   aggstate->perhash[setno].aggnode->numGroups,
+						   aggstate->hashentrysize);
+		aggstate->perhash[setno].num_spill_parts += spill->npartitions;
+	}
+	hashagg_spill_tuple(aggstate, spill, slot, hash);
+}
+
+void
 VectorAggInitializePlain(AggState *aggstate)
 {
 	initialize_aggregates(aggstate, aggstate->pergroups, 0);
@@ -5419,10 +5437,17 @@ VectorAggSelectSet(AggState *aggstate, int currentSet)
 }
 
 void
+VectorAggSelectHashSet(AggState *aggstate, int currentSet)
+{
+	select_current_set(aggstate, currentSet, true);
+}
+
+void
 VectorAggFinishInput(AggState *aggstate)
 {
 	aggstate->input_done = true;
-	if (aggstate->aggstrategy == AGG_HASHED)
+	if (aggstate->aggstrategy == AGG_HASHED ||
+		aggstate->aggstrategy == AGG_MIXED)
 	{
 		hashagg_finish_initial_spills(aggstate);
 		aggstate->table_filled = true;
@@ -5430,6 +5455,21 @@ VectorAggFinishInput(AggState *aggstate)
 		ResetTupleHashIterator(aggstate->perhash[0].hashtable,
 							   &aggstate->perhash[0].hashiter);
 	}
+}
+
+TupleTableSlot *
+VectorAggRetrievePlainSet(AggState *aggstate, int phaseidx, int phaseset,
+						  int setno)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+
+	ReScanExprContext(econtext);
+	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
+	aggstate->phase = &aggstate->phases[phaseidx];
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple, phaseset);
+	select_current_set(aggstate, setno, false);
+	finalize_aggregates(aggstate, aggstate->peragg, aggstate->pergroups[setno]);
+	return project_aggregates(aggstate);
 }
 
 TupleTableSlot *
