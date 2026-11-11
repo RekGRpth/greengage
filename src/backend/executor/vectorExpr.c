@@ -22,6 +22,7 @@
 #include "executor/execExpr.h"
 #include "executor/nodeSubplan.h"
 #include "executor/vectorExpr.h"
+#include "executor/nodeSubplan.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -275,6 +276,9 @@ typedef struct VectorExprStep
 			EState	   *estate;
 			int			plan_id;
 			bool		is_initplan;
+			SubPlanState *sstate;	/* correlated: per-row execution state */
+			ExprContext *econtext;
+			TupleTableSlot *slot;	/* scan-shaped row of the current batch */
 		}			subplan;
 	}			u;
 } VectorExprStep;
@@ -556,8 +560,10 @@ VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 				 * param; correlated subplans must run per row and are left
 				 * to the standard executor.
 				 */
-				return sp->parParam == NIL &&
-					(sp->is_initplan || sp->setParam != NIL);
+				return (sp->parParam == NIL &&
+						(sp->is_initplan || sp->setParam != NIL)) ||
+					(vars->allow_correlated && sp->parParam != NIL &&
+					 sp->setParam == NIL);
 			}
 		default:
 			return false;
@@ -1344,6 +1350,35 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				 * without output params has no value to read; both stay on
 				 * the standard executor.
 				 */
+				if (sp->parParam != NIL && sp->setParam == NIL &&
+					vars->allow_correlated && vars->parent != NULL)
+				{
+					/*
+					 * A correlated subplan runs once per batch row through the
+					 * standard ExecSubPlan machinery: its parParam expressions
+					 * are evaluated in our ExprContext against a slot holding the
+					 * current row of the batch.
+					 */
+					step = alloc_step(VEC_SUBPLAN, 0, batch->capacity);
+					init_value(&step->value, exprType((Node *) sp), -1,
+							   batch->capacity, true);
+				{
+					MemoryContext oldcontext = MemoryContextSwitchTo(
+						vars->estate->es_query_cxt);
+
+					/* the slot is registered in es_tupleTable and must outlive
+					 * this expression state's context */
+					step->u.subplan.sstate = ExecInitSubPlan(sp, vars->parent);
+					step->u.subplan.econtext = CreateExprContext(vars->estate);
+					step->u.subplan.econtext->ecxt_param_exec_vals =
+						vars->estate->es_param_exec_vals;
+					step->u.subplan.slot = ExecInitExtraTupleSlot(vars->estate,
+																  batch->tupdesc, &TTSOpsVirtual);
+					MemoryContextSwitchTo(oldcontext);
+				}
+				step->u.subplan.is_initplan = false;
+					return step;
+				}
 				if (sp->parParam != NIL ||
 					(!sp->is_initplan && sp->setParam == NIL))
 					return NULL;
@@ -2712,6 +2747,33 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 			}
 			return;
 		case VEC_SUBPLAN:
+			if (!step->u.subplan.is_initplan)
+			{
+				/* correlated: re-execute the subplan per row, as ExecSubPlan */
+				for (pos = 0; pos < nselected; pos++)
+				{
+					int			row = selection[pos];
+					TupleTableSlot *slot = step->u.subplan.slot;
+					Datum		result;
+					bool		isnull;
+					int			col;
+
+					ExecClearTuple(slot);
+					for (col = 0; col < batch->ncols; col++)
+					{
+						slot->tts_values[col] = batch->columns[col].values[row];
+						slot->tts_isnull[col] = VectorBatchIsNull(batch, col, row);
+					}
+					ExecStoreVirtualTuple(slot);
+					step->u.subplan.econtext->ecxt_scantuple = slot;
+					ResetExprContext(step->u.subplan.econtext);
+					step->u.subplan.econtext->ecxt_outertuple = slot;
+					result = ExecSubPlan(step->u.subplan.sstate,
+										 step->u.subplan.econtext, &isnull);
+					value_set(&step->value, row, result, isnull);
+				}
+				return;
+			}
 			for (pos = 0; pos < nselected; pos++)
 			{
 				int			row = selection[pos];

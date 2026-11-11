@@ -525,6 +525,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		{
 			VectorExprVarMap vars = {scan->scanrelid, NULL, 0, estate};
 
+			vars.parent = &state->css.ss.ps;
+			vars.allow_correlated = (state->append == NULL);
 			state->qual = VectorExprCompile(estate->es_query_cxt,
 											(Expr *) scan->plan.qual,
 											state->batch, &vars);
@@ -540,6 +542,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		{
 			VectorExprVarMap vars = {scan->scanrelid, NULL, 0, estate};
 
+			vars.parent = &state->css.ss.ps;
+			vars.allow_correlated = true;
 			col = 0;
 			foreach(lc, scan->plan.targetlist)
 			{

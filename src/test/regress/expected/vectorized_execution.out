@@ -1554,6 +1554,36 @@ FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
   7 |   1
 (7 rows)
 
+-- Correlated subplans in scan expressions: re-executed per batch row via
+-- ExecSubPlan, with the current row supplied as both scan and outer slot.
+SELECT count(*) FROM vector_aoco_test t
+WHERE EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test t
+WHERE NOT EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
+ count 
+-------
+  4545
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test t
+WHERE t.id IN (SELECT s.id FROM vector_aoco_small s WHERE s.id < t.id + 3);
+ count 
+-------
+    10
+(1 row)
+
+SELECT sum(num) FROM vector_aoco_test t
+WHERE EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
+  sum  
+-------
+ 18.33
+(1 row)
+
 EXPLAIN (COSTS OFF)
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
                                     QUERY PLAN                                     

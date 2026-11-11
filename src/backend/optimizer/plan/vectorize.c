@@ -87,6 +87,7 @@ is_simple_scan(VectorizeContext *ctx, SeqScan *scan)
 	RangeTblEntry *rte;
 	ListCell   *lc;
 	VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+	vars.allow_correlated = true;
 
 	if (scan->scanrelid <= 0 ||
 		scan->plan.lefttree != NULL || scan->plan.righttree != NULL)
@@ -240,6 +241,7 @@ is_projection_scan(VectorizeContext *ctx, SeqScan *scan)
 	RangeTblEntry *rte;
 	ListCell   *lc;
 	VectorExprVarMap vars = {scan->scanrelid, NULL, 0};
+	vars.allow_correlated = true;
 
 	if (scan->scanrelid <= 0 ||
 		scan->plan.lefttree != NULL || scan->plan.righttree != NULL)

@@ -558,6 +558,16 @@ SELECT t.id, NOT EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id) AS
 FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
 SELECT t.id, (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id) AS cnt
 FROM vector_aoco_test t WHERE t.id < 8 ORDER BY t.id;
+-- Correlated subplans in scan expressions: re-executed per batch row via
+-- ExecSubPlan, with the current row supplied as both scan and outer slot.
+SELECT count(*) FROM vector_aoco_test t
+WHERE EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
+SELECT count(*) FROM vector_aoco_test t
+WHERE NOT EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
+SELECT count(*) FROM vector_aoco_test t
+WHERE t.id IN (SELECT s.id FROM vector_aoco_small s WHERE s.id < t.id + 3);
+SELECT sum(num) FROM vector_aoco_test t
+WHERE EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
 EXPLAIN (COSTS OFF)
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;

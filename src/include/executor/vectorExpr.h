@@ -26,6 +26,10 @@ typedef struct VectorExprVarMap
 	 * or 0 when the attribute has no batch column.
 	 */
 	AttrNumber *self_remap;
+	/* Correlated subplans are executed per row through ExecSubPlan: the
+	 * region supplies the parent PlanState and a scan-shaped slot. */
+	PlanState  *parent;
+	bool		allow_correlated;
 } VectorExprVarMap;
 
 extern bool VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars);
