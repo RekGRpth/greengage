@@ -279,6 +279,8 @@ typedef struct VectorExprStep
 			SubPlanState *sstate;	/* correlated: per-row execution state */
 			ExprContext *econtext;
 			TupleTableSlot *slot;	/* scan-shaped row of the current batch */
+			AttrNumber *outer_attnos;	/* Agg outer tlist -> batch columns */
+			int			outer_ncols;
 		}			subplan;
 	}			u;
 } VectorExprStep;
@@ -1372,11 +1374,28 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					step->u.subplan.econtext = CreateExprContext(vars->estate);
 					step->u.subplan.econtext->ecxt_param_exec_vals =
 						vars->estate->es_param_exec_vals;
+					TupleDesc	slotdesc = batch->tupdesc;
+
+					/* Aggregate correlation Vars reference the outer plan's
+					 * targetlist, not the physical batch column order. */
+					if (IsA(vars->parent, AggState) && vars->outer_attnos != NULL)
+					{
+						slotdesc = ((AggState *) vars->parent)->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+						step->u.subplan.outer_attnos = vars->outer_attnos;
+						step->u.subplan.outer_ncols = vars->outer_ncols;
+					}
+					else if (IsA(vars->parent, SeqScanState) &&
+							 vars->self_remap != NULL)
+					{
+						slotdesc = ((SeqScanState *) vars->parent)->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+						step->u.subplan.outer_attnos = vars->self_remap;
+						step->u.subplan.outer_ncols = slotdesc->natts;
+					}
 					step->u.subplan.slot = ExecInitExtraTupleSlot(vars->estate,
-																  batch->tupdesc, &TTSOpsVirtual);
+															 slotdesc, &TTSOpsVirtual);
 					MemoryContextSwitchTo(oldcontext);
 				}
-				step->u.subplan.is_initplan = false;
+					step->u.subplan.is_initplan = false;
 					return step;
 				}
 				if (sp->parParam != NIL ||
@@ -2759,10 +2778,25 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 					int			col;
 
 					ExecClearTuple(slot);
-					for (col = 0; col < batch->ncols; col++)
+					for (col = 0;
+						 col < (step->u.subplan.outer_attnos != NULL ?
+								step->u.subplan.outer_ncols : batch->ncols);
+						 col++)
 					{
-						slot->tts_values[col] = batch->columns[col].values[row];
-						slot->tts_isnull[col] = VectorBatchIsNull(batch, col, row);
+						int			attno = step->u.subplan.outer_attnos != NULL ?
+							step->u.subplan.outer_attnos[col] : col + 1;
+
+						if (attno > 0)
+						{
+							slot->tts_values[col] = batch->columns[attno - 1].values[row];
+							slot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
+						}
+						else
+						{
+							/* This child attribute is absent from the Append tlist. */
+							slot->tts_values[col] = (Datum) 0;
+							slot->tts_isnull[col] = true;
+						}
 					}
 					ExecStoreVirtualTuple(slot);
 					step->u.subplan.econtext->ecxt_scantuple = slot;

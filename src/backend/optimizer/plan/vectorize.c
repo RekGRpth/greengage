@@ -119,6 +119,30 @@ is_simple_scan(VectorizeContext *ctx, SeqScan *scan)
  * physical tuple descriptor and the same simple targetlist.  Runtime pruning,
  * parallel workers and more general input mappings stay with the row executor.
  */
+typedef struct AppendQualVarsContext
+{
+	Index		scanrelid;
+	Bitmapset  *attrs;
+} AppendQualVarsContext;
+
+static bool
+append_qual_subplan_vars_walker(Node *node, void *context)
+{
+	AppendQualVarsContext *ctx = (AppendQualVarsContext *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubPlan))
+	{
+		SubPlan    *sp = (SubPlan *) node;
+
+		/* pull_varattnos deliberately does not descend into SubPlan args,
+		 * but those outer Vars also need a column in the shared batch. */
+		pull_varattnos((Node *) sp->args, ctx->scanrelid, &ctx->attrs);
+	}
+	return expression_tree_walker(node, append_qual_subplan_vars_walker, context);
+}
+
 static bool
 is_simple_append(VectorizeContext *ctx, Append *append)
 {
@@ -187,10 +211,12 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 				if (exprType((Node *) firstte->expr) != exprType((Node *) scante->expr) ||
 					exprTypmod((Node *) firstte->expr) != exprTypmod((Node *) scante->expr))
 					goto done;
-				if (scan->plan.qual != NIL)
-				{
+			}
+			if (scan->plan.qual != NIL)
+			{
 					Bitmapset *mapped = NULL;
 					Bitmapset *qattrs = NULL;
+					AppendQualVarsContext subctx;
 					int		attno;
 					bool		covered = true;
 
@@ -205,6 +231,10 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 									FirstLowInvalidHeapAttributeNumber);
 					}
 					pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &qattrs);
+					subctx.scanrelid = scan->scanrelid;
+					subctx.attrs = qattrs;
+					append_qual_subplan_vars_walker((Node *) scan->plan.qual, &subctx);
+					qattrs = subctx.attrs;
 					while ((attno = bms_first_member(qattrs)) > 0)
 					{
 						attno += FirstLowInvalidHeapAttributeNumber;
@@ -218,7 +248,6 @@ is_simple_append(VectorizeContext *ctx, Append *append)
 					bms_free(qattrs);
 					if (!covered)
 						goto done;
-				}
 			}
 		}
 	}
@@ -607,6 +636,7 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 
 	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
+		IsA(outerPlan(node), SeqScan) &&
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash))

@@ -568,6 +568,22 @@ SELECT count(*) FROM vector_aoco_test t
 WHERE t.id IN (SELECT s.id FROM vector_aoco_small s WHERE s.id < t.id + 3);
 SELECT sum(num) FROM vector_aoco_test t
 WHERE EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id);
+-- Correlated subplans in aggregate arguments and FILTER use the aggregate's
+-- outer targetlist layout when supplying the current row to ExecSubPlan.
+SET gp_eager_two_phase_agg = on;
+SELECT id % 3 AS g,
+       sum((SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id)) AS matches,
+       avg((SELECT max(s.id) FROM vector_aoco_small s WHERE s.id = t.id % 12)) AS avg_id
+FROM vector_aoco_test t WHERE t.id < 100 GROUP BY g ORDER BY g;
+SELECT id % 3 AS g, sum(num) FILTER (WHERE EXISTS
+       (SELECT 1 FROM vector_aoco_small s WHERE s.id = t.id)) AS sum_num
+FROM vector_aoco_test t WHERE t.id < 100 GROUP BY g ORDER BY g;
+SET enable_hashagg = off;
+SELECT id % 3 AS g, count(DISTINCT
+       (SELECT s.id % 3 FROM vector_aoco_small s WHERE s.id = t.id % 12)) AS nd
+FROM vector_aoco_test t WHERE t.id < 100 GROUP BY g ORDER BY g;
+RESET enable_hashagg;
+RESET gp_eager_two_phase_agg;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
 SELECT id FROM vector_aoco_small WHERE id > (SELECT max(id) FROM vector_aoco_small) - 2 ORDER BY id;
@@ -687,6 +703,10 @@ SELECT id % 2 AS a, id % 3 AS b, GROUPING(id % 2, id % 3) AS g,
        count(*), sum(id)
 FROM vector_aoco_small WHERE id < 0 GROUP BY GROUPING SETS ((a, b), (a), (b), ())
 ORDER BY a, b, g;
+SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,
+       count(*), sum((SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id)) AS matches
+FROM vector_aoco_test t WHERE t.id < 100 GROUP BY GROUPING SETS ((a, b), (a), (b), ())
+ORDER BY a NULLS FIRST, b NULLS FIRST, g;
 RESET gp_eager_two_phase_agg;
 RESET optimizer_force_multistage_agg;
 RESET optimizer_enable_hashagg;
@@ -878,6 +898,25 @@ SELECT count(*), sum(v) FROM
 SELECT count(*), sum(v) FROM
 (SELECT id, v FROM vector_union_h WHERE id % 3 = 0
  UNION ALL SELECT id, v FROM vector_union_hj WHERE id % 3 = 0) t;
+-- Correlated subplans in Append children: identical inheritance layouts run
+-- in one region; a divergent child uses its own tupdesc plus the attno remap.
+SELECT count(*) FROM vector_append_parent p
+WHERE p.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = p.id) > 0;
+SELECT count(*) FROM vector_append_parent p
+WHERE p.id < 100 AND EXISTS (SELECT 1 FROM vector_aoco_small s WHERE s.id = p.id);
+SELECT id FROM
+(SELECT id, v FROM vector_union_a UNION ALL SELECT id, v FROM vector_union_b) t
+WHERE t.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id) > 0
+ORDER BY id;
+-- With an empty targetlist the divergent mapping is unavailable, so the
+-- Append stays on the row executor above independent per-child regions.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM
+(SELECT id, v FROM vector_union_a UNION ALL SELECT id, v FROM vector_union_b) t
+WHERE t.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id) > 0;
+SELECT count(*) FROM
+(SELECT id, v FROM vector_union_a UNION ALL SELECT id, v FROM vector_union_b) t
+WHERE t.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id) > 0;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;

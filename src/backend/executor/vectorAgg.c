@@ -249,6 +249,8 @@ VectorAggPlanIsSupported(Agg *agg)
 		return false;
 	if (!build_var_map(agg, CurrentMemoryContext, &vars))
 		return false;
+	/* Aggregate arguments and FILTER may execute correlated subplans per row. */
+	vars.allow_correlated = true;
 
 	for (col = 0; col < agg->numCols; col++)
 	{
@@ -488,6 +490,8 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 		return NULL;
 	}
 	state->vars.estate = agg->ss.ps.state;
+	state->vars.parent = &agg->ss.ps;
+	state->vars.allow_correlated = true;
 
 	state->args = palloc0(sizeof(VectorExprState **) * agg->numtrans);
 	state->filters = palloc0(sizeof(VectorExprState *) * agg->numtrans);

@@ -513,6 +513,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 											 state->append_remaps != NULL ?
 											 state->append_remaps[i] : NULL};
 
+					vars.parent = &childscan->ss.ps;
+					vars.allow_correlated = true;
 					state->append_quals[i] = VectorExprCompile(estate->es_query_cxt,
 															(Expr *) childplan->plan.qual,
 															state->batch, &vars);
