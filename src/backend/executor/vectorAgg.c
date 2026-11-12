@@ -21,6 +21,7 @@
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/tuplesort.h"
+#include "utils/tuplestore.h"
 #include "utils/datum.h"
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
@@ -102,6 +103,16 @@ struct VectorAggState
 	/* AGG_MIXED: plain (non-hash) grouping sets are emitted before hashed */
 	int			mixed_plain_index;
 	bool		mixed_hashed_started;
+	/* multi-phase sorted aggregation: per-phase spools and phase driver */
+	bool		multi_phase;
+	VectorBatch *batch;
+	TupleTableSlot *sort_slot;	/* minimal-tuple slot for spool reads */
+	int			position;
+	int			current_phase_idx;
+	bool		spool_done;		/* current phase's input is exhausted */
+	uint32		spool_gen;		/* batch generation already spooled */
+	Tuplesortstate **phase_sorts;	/* per phase >= 2: next-phase sort input */
+	Tuplestorestate **phase_stores;	/* plain phases need no ordering */
 };
 
 static bool
@@ -216,6 +227,21 @@ VectorAggPlanIsSupported(Agg *agg)
 				return false;
 		}
 	}
+	else if (agg->aggstrategy == AGG_SORTED && agg->chain != NIL)
+	{
+		ListCell   *clc;
+
+		/* multi-phase sorted aggregation: phases replay from per-phase
+		 * tuplesorts built during the single pass over the input */
+		foreach(clc, agg->chain)
+		{
+			Agg		   *ch = (Agg *) lfirst(clc);
+
+			if ((ch->aggstrategy != AGG_SORTED && ch->aggstrategy != AGG_PLAIN) ||
+				(ch->aggstrategy == AGG_PLAIN && ch->numCols != 0))
+				return false;
+		}
+	}
 	else if (agg->chain != NIL)
 		return false;
 	if ((agg->aggstrategy == AGG_PLAIN && agg->numCols != 0) ||
@@ -279,6 +305,162 @@ VectorAggPlanIsSupported(Agg *agg)
 done:
 	pfree(vars.outer_attnos);
 	return supported;
+}
+
+static TupleTableSlot *fill_input_slot(VectorAggState *state,
+										   VectorBatch *batch, int row);
+
+/*
+ * Build the spool each phase (> 1) will be read back from.  A sorted next
+ * phase gets a tuplesort keyed by its sort node; a plain phase needs only
+ * insertion order, so it gets a tuplestore.
+ */
+static void
+init_phase_spools(VectorAggState *state)
+{
+	AggState   *agg = state->agg;
+	MemoryContext spoolcontext;
+	int			i;
+
+	if (!state->multi_phase)
+		return;
+	if (state->sort_slot == NULL)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(
+			agg->ss.ps.state->es_query_cxt);
+
+		/* registered in es_tupleTable: must outlive this VectorAggState */
+		state->sort_slot = ExecInitExtraTupleSlot(agg->ss.ps.state,
+												 agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+												 &TTSOpsMinimalTuple);
+		MemoryContextSwitchTo(oldcontext);
+	}
+	if (state->phase_sorts == NULL)
+		state->phase_sorts = MemoryContextAllocZero(state->context,
+										  sizeof(Tuplesortstate *) * agg->numphases);
+	if (state->phase_stores == NULL)
+		state->phase_stores = MemoryContextAllocZero(state->context,
+										   sizeof(Tuplestorestate *) * agg->numphases);
+	spoolcontext = MemoryContextSwitchTo(state->context);
+	for (i = 2; i < agg->numphases; i++)
+	{
+		Sort	   *sortnode = agg->phases[i].sortnode;
+		int			memkb = PlanStateOperatorMemKB((PlanState *) agg);
+
+		if (sortnode != NULL)
+			state->phase_sorts[i] = tuplesort_begin_heap(
+				agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+				sortnode->numCols, sortnode->sortColIdx,
+				sortnode->sortOperators, sortnode->collations,
+				sortnode->nullsFirst, memkb, NULL, false);
+		else
+			state->phase_stores[i] = tuplestore_begin_heap(true, false, memkb);
+	}
+	MemoryContextSwitchTo(spoolcontext);
+}
+
+/* Spool this batch's rows for the next phase, if there is one. */
+static void
+spool_next_phase(VectorAggState *state, VectorBatch *batch)
+{
+	int			next = state->current_phase_idx + 1;
+	int			pos;
+
+	if (!state->multi_phase || next >= state->agg->numphases)
+		return;
+	/* ProcessBatchSorted may be resumed on the same batch at every group
+	 * boundary: spool each generation exactly once, or rows multiply. */
+	if (state->spool_gen == batch->gen)
+		return;
+	state->spool_gen = batch->gen;
+	for (pos = 0; pos < batch->nselected; pos++)
+	{
+		int			row = VectorBatchSelectedRow(batch, pos);
+		TupleTableSlot *slot = fill_input_slot(state, batch, row);
+
+		if (state->phase_sorts[next] != NULL)
+			tuplesort_puttupleslot(state->phase_sorts[next], slot);
+		else
+			tuplestore_puttupleslot(state->phase_stores[next], slot);
+	}
+}
+
+/* Fill the batch with the next rows of the current phase's spool. */
+static bool
+next_spool_batch(VectorAggState *state)
+{
+	VectorBatch *batch = state->batch;
+	int			cur = state->current_phase_idx;
+	int			nrows = 0;
+	int			col;
+
+	VectorBatchReset(batch);
+	while (nrows < batch->capacity)
+	{
+		TupleTableSlot *slot = state->sort_slot;
+
+		if (state->phase_sorts[cur] != NULL)
+		{
+			if (!tuplesort_gettupleslot(state->phase_sorts[cur], true, false, slot, NULL))
+				break;
+		}
+		else
+		{
+			if (!tuplestore_gettupleslot(state->phase_stores[cur], true, false, slot))
+				break;
+		}
+		slot_getallattrs(slot);
+		for (col = 0; col < batch->ncols; col++)
+		{
+			Datum		value;
+			bool		isnull;
+
+			value = slot_getattr(slot, col + 1, &isnull);
+			value = VectorBatchCopyDatum(batch, col, value, isnull);
+			VectorBatchSetValue(batch, col, nrows, value, isnull);
+		}
+		nrows++;
+	}
+	VectorBatchSetRowCount(batch, nrows);
+	if (nrows == 0)
+		return false;
+	for (col = 0; col < nrows; col++)
+		batch->selection[col] = col;
+	batch->nselected = nrows;
+	state->position = 0;
+	return true;
+}
+
+/* Advance to the next phase and make its spool readable. */
+static bool
+advance_phase(VectorAggState *state)
+{
+	AggState   *agg = state->agg;
+	int			idx = state->current_phase_idx + 1;
+	int			old_numsets = Max(agg->phase->numsets, 1);
+	MemoryContext oldcontext;
+	int			i;
+
+	if (idx >= agg->numphases)
+		return false;
+	/* The old phase's transition values are no longer needed. */
+	for (i = 0; i < old_numsets; i++)
+		ReScanExprContext(agg->aggcontexts[i]);
+	state->current_phase_idx = idx;
+	agg->current_phase = idx;
+	agg->phase = &agg->phases[idx];
+	if (state->phase_sorts[idx] != NULL)
+		tuplesort_performsort(state->phase_sorts[idx]);
+	state->projected_set = -1;
+	state->group_open = false;
+	state->spool_done = false;
+	/* No spool batch is active yet: fetch one on the next VectorAggNext. */
+	state->position = state->batch->nselected;
+	/* each phase reuses the same per-group storage: reinitialize it */
+	oldcontext = MemoryContextSwitchTo(agg->ss.ps.state->es_query_cxt);
+	VectorAggInitializeSet(agg, Max(agg->phase->numsets, 1));
+	MemoryContextSwitchTo(oldcontext);
+	return true;
 }
 
 VectorAggState *
@@ -373,6 +555,19 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 			state->deferred[transno] =
 				VectorExprDeferNumericResult(state->args[transno][0]);
 	}
+	state->multi_phase = agg->aggstrategy == AGG_SORTED && agg->numphases > 2;
+	state->batch = batch;
+	state->current_phase_idx = 1;
+	if (state->multi_phase)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(
+			agg->ss.ps.state->es_query_cxt);
+
+		/* per-group storage is reused by all phases: initialize it once */
+		VectorAggInitializeSet(agg, agg->maxsets);
+		MemoryContextSwitchTo(oldcontext);
+	}
+	init_phase_spools(state);
 	if (agg->aggstrategy == AGG_PLAIN)
 	{
 		/* nodeAgg owns its tuplesorts and frees them after the region state. */
@@ -407,8 +602,20 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 void
 VectorAggDestroy(VectorAggState *state)
 {
+	int			i;
+
 	if (state == NULL)
 		return;
+	if (state->multi_phase)
+	{
+		for (i = 2; i < state->agg->numphases; i++)
+		{
+			if (state->phase_sorts[i] != NULL)
+				tuplesort_end(state->phase_sorts[i]);
+			if (state->phase_stores[i] != NULL)
+				tuplestore_end(state->phase_stores[i]);
+		}
+	}
 	MemoryContextDelete(state->context);
 	pfree(state);
 }
@@ -949,7 +1156,7 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 		{
 			Assert(agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_SORTED);
 			if (nargs == 1)
-				tuplesort_putdatum(pertrans->sortstates[0],
+				tuplesort_putdatum(pertrans->sortstates[agg->current_set],
 								   state->values[transno][0],
 								   state->nulls[transno][0]);
 			else
@@ -964,7 +1171,7 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 				}
 				sortslot->tts_nvalid = nargs;
 				ExecStoreVirtualTuple(sortslot);
-				tuplesort_puttupleslot(pertrans->sortstates[0], sortslot);
+				tuplesort_puttupleslot(pertrans->sortstates[agg->current_set], sortslot);
 			}
 		}
 		else
@@ -1078,6 +1285,7 @@ VectorAggProcessBatchSorted(VectorAggState *state, VectorBatch *batch,
 	if (batch->nselected == 0)
 		return NULL;
 
+	spool_next_phase(state, batch);
 	eval_arguments(state, batch);
 	while (*position < batch->nselected)
 	{
@@ -1165,9 +1373,102 @@ VectorAggNext(VectorAggState *state)
 	if (state->output_done)
 		return NULL;
 
+	if (state->multi_phase)
+	{
+		AggState   *agg = state->agg;
+
+		for (;;)
+		{
+			if (!state->spool_done)
+			{
+				if (state->current_phase_idx == 1)
+					state->spool_done = true;	/* streaming input is over */
+				else
+				{
+					/* Resume a partially consumed spool batch before fetching more. */
+					if (state->position >= state->batch->nselected &&
+						!next_spool_batch(state))
+						state->spool_done = true;
+					if (!state->spool_done)
+					{
+						if (agg->phase->aggnode->numCols == 0)
+						{
+							int			pos;
+
+							spool_next_phase(state, state->batch);
+							eval_arguments(state, state->batch);
+							VectorAggSelectSet(agg, 0);
+							for (pos = 0; pos < state->batch->nselected; pos++)
+								advance_row(state, agg->pergroups[0],
+											VectorBatchSelectedRow(state->batch, pos));
+							state->position = state->batch->nselected;
+							ResetExprContext(agg->tmpcontext);
+							result = NULL;
+						}
+						else
+							result = VectorAggProcessBatchSorted(state, state->batch,
+																 &state->position);
+						if (result != NULL)
+							return result;
+						continue;
+					}
+				}
+			}
+
+			/* current phase is exhausted: flush its remaining groups */
+			if (agg->phase->aggnode->numCols == 0)
+			{
+				if (state->projected_set < 0)
+				{
+					state->projected_set = 0;
+					return VectorAggRetrievePlainSet(agg,
+												 state->current_phase_idx, 0, 0);
+				}
+			}
+			else
+			{
+				int			numsets = Max(agg->phase->numsets, 1);
+				bool		had_input = state->projected_set >= 0;
+
+				if (state->group_open)
+				{
+					ResetExprContext(agg->tmpcontext);
+					result = VectorAggRetrieveGroup(agg, state->projected_set);
+					state->group_open = false;
+					if (result != NULL)
+						return result;
+				}
+				while (state->projected_set + 1 < numsets)
+				{
+					int			nextset = state->projected_set + 1;
+
+					if (!had_input && agg->phase->aggnode->numCols > 0 &&
+						(agg->phase->gset_lengths == NULL ||
+						 agg->phase->gset_lengths[nextset] > 0))
+					{
+						state->projected_set = nextset;
+						continue;
+					}
+					state->projected_set = nextset;
+					if (!had_input)
+						initialize_empty_sorted_set(state);
+					result = VectorAggRetrieveGroup(agg, state->projected_set);
+					if (result != NULL)
+						return result;
+				}
+			}
+			if (!advance_phase(state))
+			{
+				state->output_done = true;
+				return NULL;
+			}
+		}
+	}
+
 	if (state->agg->aggstrategy == AGG_SORTED)
 	{
 		int			numsets = Max(state->agg->phase->numsets, 1);
+		bool		had_input = state->projected_set >= 0;
 
 		if (state->group_open)
 		{
@@ -1182,7 +1483,7 @@ VectorAggNext(VectorAggState *state)
 			int			nextset = state->projected_set + 1;
 
 			/* Empty input has rows only for grouping sets of size zero. */
-			if (state->projected_set < 0 && state->agg->phase->aggnode->numCols > 0 &&
+			if (!had_input && state->agg->phase->aggnode->numCols > 0 &&
 				(state->agg->phase->gset_lengths == NULL ||
 				 state->agg->phase->gset_lengths[nextset] > 0))
 			{
@@ -1190,7 +1491,8 @@ VectorAggNext(VectorAggState *state)
 				continue;
 			}
 			state->projected_set = nextset;
-			initialize_empty_sorted_set(state);
+			if (!had_input)
+				initialize_empty_sorted_set(state);
 			result = VectorAggRetrieveGroup(state->agg, state->projected_set);
 			if (result != NULL)
 				return result;
@@ -1262,6 +1564,30 @@ VectorAggReset(VectorAggState *state)
 	/* A reused hash table must be iterated, not populated a second time. */
 	state->input_done = state->agg->aggstrategy == AGG_HASHED &&
 		state->agg->table_filled;
+	if (state->multi_phase)
+	{
+		AggState   *agg = state->agg;
+		int			i;
+
+		for (i = 2; i < agg->numphases; i++)
+		{
+			if (state->phase_sorts[i] != NULL)
+			{
+				tuplesort_end(state->phase_sorts[i]);
+				state->phase_sorts[i] = NULL;
+			}
+			if (state->phase_stores[i] != NULL)
+			{
+				tuplestore_end(state->phase_stores[i]);
+				state->phase_stores[i] = NULL;
+			}
+		}
+		state->current_phase_idx = 1;
+		state->spool_done = false;
+		agg->current_phase = 1;
+		agg->phase = &agg->phases[1];
+		init_phase_spools(state);
+	}
 	state->group_open = false;
 	state->projected_set = -1;
 	state->output_done = false;

@@ -657,6 +657,45 @@ SELECT id % 2 AS a, GROUPING(id % 2) AS g,
        string_agg(val, ',' ORDER BY id) AS vals
 FROM vector_aoco_small GROUP BY ROLLUP(a) ORDER BY a, g;
 RESET enable_hashagg;
+-- Multi-phase sorted aggregation: each later phase replays the input from
+-- its own tuplesort.  The 7000-row input crosses spool batch boundaries.
+SET enable_hashagg = off;
+SET optimizer_enable_hashagg = off;
+SET gp_eager_two_phase_agg = on;
+SET optimizer_force_multistage_agg = on;
+EXPLAIN (COSTS OFF)
+SELECT id % 20 AS a, id % 10 AS b, GROUPING(id % 20, id % 10) AS g,
+       count(*), sum(id)
+FROM vector_numeric_batch_test GROUP BY GROUPING SETS ((a, b), (a), (b), ());
+SELECT id % 20 AS a, id % 10 AS b, GROUPING(id % 20, id % 10) AS g,
+       count(*), sum(id)
+FROM vector_numeric_batch_test GROUP BY GROUPING SETS ((a, b), (a), (b), ())
+ORDER BY a NULLS FIRST, b NULLS FIRST, g;
+SELECT g, count(*) AS ngroups, sum(cnt) AS input_rows, sum(sum_id) AS sum_id
+FROM (SELECT id % 20 AS a, id % 10 AS b, id % 3 AS c,
+             GROUPING(id % 20, id % 10, id % 3) AS g,
+             count(*) AS cnt, sum(id) AS sum_id
+      FROM vector_numeric_batch_test
+      GROUP BY GROUPING SETS ((a,b,c),(a,b),(a,c),(b,c),(a),(b),(c),())) s
+GROUP BY g ORDER BY g;
+SELECT count(*) AS ngroups, sum(cnt) AS input_rows
+FROM (SELECT id % 20 AS a, id % 10 AS b, id % 3 AS c, count(*) AS cnt
+      FROM vector_numeric_batch_test
+      GROUP BY GROUPING SETS ((a,b,c),(a,b),(a,c),(b,c),(a),(b),(c),())
+      HAVING count(*) > 25) s;
+SELECT id % 2 AS a, id % 3 AS b, GROUPING(id % 2, id % 3) AS g,
+       count(*), sum(id)
+FROM vector_aoco_small WHERE id < 0 GROUP BY GROUPING SETS ((a, b), (a), (b), ())
+ORDER BY a, b, g;
+RESET gp_eager_two_phase_agg;
+RESET optimizer_force_multistage_agg;
+RESET optimizer_enable_hashagg;
+-- DISTINCT and ORDER BY aggregates have a separate sort state per grouping set.
+SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,
+       count(DISTINCT id % 3) AS dc, string_agg(val, ',' ORDER BY id) AS vals
+FROM vector_aoco_small GROUP BY GROUPING SETS ((a, b), (a), ())
+ORDER BY a NULLS FIRST, b NULLS FIRST, g;
+RESET enable_hashagg;
 -- Mixed aggregation (hashed grouping sets plus the plain empty set):
 -- every row advances every set in one pass, plain sets project first.
 SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,
