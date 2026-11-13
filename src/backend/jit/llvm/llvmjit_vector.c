@@ -201,42 +201,29 @@ emit_node(LLVMBuilderRef b, LLVMModuleRef mod, VectorJitNode *node,
 			{
 				JitResult left = emit_node(b, mod, node->left, row, gen);
 				JitResult right = emit_node(b, mod, node->right, row, gen);
-				LLVMTypeRef i128 = LLVMIntTypeInContext(lc, 128);
-				LLVMValueRef left128 = LLVMBuildSExt(b, left.value, i128, "");
-				LLVMValueRef right128 = LLVMBuildSExt(b, right.value, i128, "");
-				LLVMValueRef prod = LLVMBuildMul(b, left128, right128, "prod");
-				LLVMValueRef max128 = l_int64_const(lc, PG_INT64_MAX);
-				LLVMValueRef min128 = l_int64_const(lc, PG_INT64_MIN);
 				LLVMValueRef dres = LLVMBuildAdd(b, left.dscale, right.dscale, "dres");
 				LLVMValueRef scale = LLVMBuildAdd(b, left.scale, right.scale, "scale");
-				LLVMValueRef ov = LLVMBuildOr(b,
-					LLVMBuildICmp(b, LLVMIntSGT, prod, LLVMBuildSExt(b, max128, i128, ""), ""),
-					LLVMBuildICmp(b, LLVMIntSLT, prod, LLVMBuildSExt(b, min128, i128, ""), ""), "");
 				LLVMValueRef display_ov = LLVMBuildICmp(b, LLVMIntUGT, dres,
 					l_int32_const(lc, NUMERIC_MAX_DISPLAY_SCALE), "");
 				LLVMValueRef mant_ptr = LLVMBuildAlloca(b, i64, "mant");
-				LLVMTypeRef scale_params[3] = {l_ptr(i64), i32, i32};
-				LLVMTypeRef scale_type = LLVMFunctionType(LLVMInt1TypeInContext(lc),
-					scale_params, 3, false);
-				LLVMValueRef round_fn = l_ptr_const((void *) numeric_round_scale_fast,
-					l_ptr(scale_type));
-				LLVMValueRef round_args[3] = {mant_ptr, scale, dres};
+				LLVMTypeRef params[5] = {i64, i64, i32, i32, l_ptr(i64)};
+				LLVMTypeRef fn_type = LLVMFunctionType(LLVMInt1TypeInContext(lc),
+					params, 5, false);
+				LLVMValueRef fn = l_ptr_const((void *) numeric_mul_fast,
+					l_ptr(fn_type));
+				LLVMValueRef args[5] = {left.value, right.value, scale, dres, mant_ptr};
+				LLVMValueRef ok;
 
-				max128 = LLVMBuildSExt(b, max128, i128, "");
-				min128 = LLVMBuildSExt(b, min128, i128, "");
-				ov = LLVMBuildOr(b,
-					LLVMBuildICmp(b, LLVMIntSGT, prod, max128, ""),
-					LLVMBuildICmp(b, LLVMIntSLT, prod, min128, ""), "");
-				LLVMBuildStore(b, LLVMBuildTrunc(b, prod, i64, ""), mant_ptr);
+				LLVMBuildStore(b, left.value, mant_ptr);
+				ok = l_call(b, fn_type, fn, args, 5, "");
 				result.value = l_load(b, i64, mant_ptr, "mant");
 				result.scale = scale;
 				result.dscale = dres;
 				result.isnull = LLVMBuildOr(b, left.isnull, right.isnull, "");
 				result.overflow = LLVMBuildOr(b, left.overflow, right.overflow, "");
-				result.overflow = LLVMBuildOr(b, result.overflow, ov, "");
 				result.overflow = LLVMBuildOr(b, result.overflow, display_ov, "");
 				result.overflow = LLVMBuildOr(b, result.overflow,
-					LLVMBuildNot(b, l_call(b, scale_type, round_fn, round_args, 3, ""), ""), "");
+					LLVMBuildNot(b, ok, ""), "");
 				return result;
 			}
 	}

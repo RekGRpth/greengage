@@ -160,6 +160,8 @@ extern bool numeric_decode_fast(Numeric num, int64 *mantissa, int *scale,
 								int *dscale);
 extern bool numeric_scale_fast(int64 *mantissa, int scale, int target);
 extern bool numeric_round_scale_fast(int64 *mantissa, int scale, int target);
+extern bool numeric_mul_fast(int64 left, int64 right, int scale, int dscale,
+							 int64 *mantissa);
 extern Numeric numeric_build_fast(int64 mantissa, int dscale);
 extern Numeric numeric_sub_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);

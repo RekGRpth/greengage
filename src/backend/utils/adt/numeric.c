@@ -10209,6 +10209,26 @@ numeric_round_scale_fast(int64 *mantissa, int scale, int target)
 }
 
 /*
+ * Multiply two decoded values, retaining the int128 product inside this C
+ * helper rather than in generated LLVM IR.  The display scale is rounded once.
+ */
+bool
+numeric_mul_fast(int64 left, int64 right, int scale, int dscale,
+				 int64 *mantissa)
+{
+#ifdef HAVE_INT128
+	int128		product = (int128) left * (int128) right;
+
+	if (product > PG_INT64_MAX || product < PG_INT64_MIN)
+		return false;
+	*mantissa = (int64) product;
+	return numeric_round_scale_fast(mantissa, scale, dscale);
+#else
+	return false;
+#endif
+}
+
+/*
  * Build a numeric with the given mantissa and display scale:
  * value == mantissa * 10^-dscale.
  */
