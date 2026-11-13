@@ -941,6 +941,11 @@ SELECT id * 2 + 1 FROM vector_aoco_small
 WHERE id IS NULL OR id BETWEEN -1000 AND 1000 ORDER BY id;
 SELECT 2147483647 * 2 + 1 FROM vector_aoco_small LIMIT 1;
 SELECT (-2147483648) * 2 + 1 FROM vector_aoco_small LIMIT 1;
+-- Bare numeric Vars stay on the generic path; deferred arithmetic is JITted
+-- with exact scale/rounding and a whole-row fallback for NaN and wide values.
+SELECT sum(n), avg(n) FROM vector_numeric_test;
+SELECT sum(n * 2), avg(n + 1), sum(n - 0.5), sum(n * n) FROM vector_numeric_test;
+SELECT sum(n * (1 - n)), avg((1 - n) * (1 + n)) FROM vector_numeric_batch_test;
 RESET jit;
 RESET jit_above_cost;
 RESET jit_inline_above_cost;

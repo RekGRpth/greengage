@@ -19,7 +19,12 @@ typedef enum VectorJitNodeKind
 	VECTOR_JIT_VAR,
 	VECTOR_JIT_CONST,
 	VECTOR_JIT_INT4_ADD,
-	VECTOR_JIT_INT4_MUL
+	VECTOR_JIT_INT4_MUL,
+	VECTOR_JIT_NUMERIC_VAR,
+	VECTOR_JIT_NUMERIC_CONST,
+	VECTOR_JIT_NUMERIC_ADD,
+	VECTOR_JIT_NUMERIC_SUB,
+	VECTOR_JIT_NUMERIC_MUL
 } VectorJitNodeKind;
 
 typedef struct VectorJitNode
@@ -30,6 +35,10 @@ typedef struct VectorJitNode
 	Datum	   *values;
 	uint64	   *nulls;
 	int32		const_value;
+	struct VectorExprStep *step;
+	int64		mantissa;
+	int16		scale;
+	int16		dscale;
 } VectorJitNode;
 
 typedef struct VectorExprJitRuntime
@@ -38,8 +47,12 @@ typedef struct VectorExprJitRuntime
 	VectorBatch *batch;
 	int32	   *selection;
 	int			nselected;
+	uint32		gen;
 	Datum	   *out_values;
 	uint64	   *out_nulls;
+	int64	   *defer_mant;
+	int16	   *defer_dscale;
+	uint64	   *defer_valid;
 } VectorExprJitRuntime;
 
 typedef void (*VectorExprJitFunc)(VectorExprJitRuntime *runtime);
@@ -81,5 +94,10 @@ extern VectorJitNode *VectorExprJitGetTree(VectorExprState *state);
 extern EState *VectorExprJitEState(VectorExprState *state);
 extern void VectorExprEvalRowFallback(VectorExprState *state,
 									  VectorBatch *batch, int32 row);
+extern bool VectorExprNumericArgDecode(struct VectorExprStep *arg, int row,
+									   uint32 gen, int64 *mant, int *scale,
+									   int *dscale);
+extern void VectorExprStoreDeferred(VectorExprState *state, int32 row,
+									int64 mantissa, int dscale, bool isnull);
 
 #endif							/* VECTOREXPR_H */

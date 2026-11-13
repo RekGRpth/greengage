@@ -1438,12 +1438,14 @@ jit_build_node(VectorExprStep *step, MemoryContext context)
 	switch (step->kind)
 	{
 		case VEC_VAR:
+			if (step->value.typid != INT4OID)
+				return NULL;
 			node->kind = VECTOR_JIT_VAR;
 			node->values = step->value.values;
 			node->nulls = step->value.nulls;
 			return node;
 		case VEC_CONST:
-			if (value_is_null(&step->value, 0))
+			if (step->value.typid != INT4OID || value_is_null(&step->value, 0))
 				return NULL;
 			node->kind = VECTOR_JIT_CONST;
 			node->const_value = DatumGetInt32(step->value.values[0]);
@@ -1472,9 +1474,78 @@ jit_build_node(VectorExprStep *step, MemoryContext context)
 	}
 }
 
+static int
+jit_numeric_arith_kind(VectorExprStep *step)
+{
+	if (step->kind != VEC_FUNC || step->nargs != 2)
+		return -1;
+	switch (step->u.func.arithmetic)
+	{
+		case VEC_ARITHMETIC_NUMERIC_ADD:
+			return VECTOR_JIT_NUMERIC_ADD;
+		case VEC_ARITHMETIC_NUMERIC_SUB:
+			return VECTOR_JIT_NUMERIC_SUB;
+		case VEC_ARITHMETIC_NUMERIC_MUL:
+			return VECTOR_JIT_NUMERIC_MUL;
+		default:
+			return -1;
+	}
+}
+
+static VectorJitNode *
+jit_build_numeric_node(VectorExprStep *step, MemoryContext context)
+{
+	VectorJitNode *node;
+	int			kind;
+	int			scale,
+				dscale;
+
+	if (step == NULL)
+		return NULL;
+	node = MemoryContextAllocZero(context, sizeof(VectorJitNode));
+	switch (step->kind)
+	{
+		case VEC_VAR:
+			if (step->value.typid != NUMERICOID)
+				return NULL;
+			node->kind = VECTOR_JIT_NUMERIC_VAR;
+			node->step = step;
+			node->values = step->value.values;
+			node->nulls = step->value.nulls;
+			return node;
+		case VEC_CONST:
+			if (step->value.typid != NUMERICOID ||
+				!numeric_decode_fast_datum(step->value.values[0],
+										  &node->mantissa, &scale, &dscale))
+				return NULL;
+			node->kind = VECTOR_JIT_NUMERIC_CONST;
+			node->scale = scale;
+			node->dscale = dscale;
+			return node;
+		case VEC_FUNC:
+			kind = jit_numeric_arith_kind(step);
+			if (kind < 0)
+				return NULL;
+			node->kind = kind;
+			node->left = jit_build_numeric_node(step->args[0], context);
+			node->right = jit_build_numeric_node(step->args[1], context);
+			if (node->left == NULL || node->right == NULL)
+				return NULL;
+			return node;
+		default:
+			return NULL;
+	}
+}
+
 VectorJitNode *
 VectorExprJitGetTree(VectorExprState *state)
 {
+	if (jit_numeric_arith_kind(state->root) >= 0)
+	{
+		if (state->root->defer_build)
+			return jit_build_numeric_node(state->root, state->context);
+		return NULL;
+	}
 	return jit_build_node(state->root, state->context);
 }
 
@@ -1488,6 +1559,22 @@ void
 VectorExprEvalRowFallback(VectorExprState *state, VectorBatch *batch, int32 row)
 {
 	eval_step(state->root, batch, &row, 1);
+}
+
+void
+VectorExprStoreDeferred(VectorExprState *state, int32 row, int64 mantissa,
+						int dscale, bool isnull)
+{
+	VectorExprStep *step = state->root;
+	uint64		mask = (uint64) 1 << (row % 64);
+
+	step->defer_mant[row] = mantissa;
+	step->defer_dscale[row] = (int16) dscale;
+	if (isnull)
+		step->defer_valid[row / 64] &= ~mask;
+	else
+		step->defer_valid[row / 64] |= mask;
+	value_set(&step->value, row, (Datum) 0, isnull);
 }
 
 VectorExprState *
@@ -1767,6 +1854,13 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
 	}
 	return numeric_decode_fast_datum(arg->value.values[row],
 									  mant, scale, dscale);
+}
+
+bool
+VectorExprNumericArgDecode(VectorExprStep *arg, int row, uint32 gen,
+						   int64 *mant, int *scale, int *dscale)
+{
+	return numeric_arg_decode(arg, row, gen, mant, scale, dscale);
 }
 
 /*
@@ -2950,8 +3044,12 @@ VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
 		state->jit_rt.batch = batch;
 		state->jit_rt.selection = selection;
 		state->jit_rt.nselected = nselected;
+		state->jit_rt.gen = batch->gen;
 		state->jit_rt.out_values = state->root->value.values;
 		state->jit_rt.out_nulls = state->root->value.nulls;
+		state->jit_rt.defer_mant = state->root->defer_mant;
+		state->jit_rt.defer_dscale = state->root->defer_dscale;
+		state->jit_rt.defer_valid = state->root->defer_valid;
 		((VectorExprJitFunc) state->jit_func)(&state->jit_rt);
 	}
 	else
