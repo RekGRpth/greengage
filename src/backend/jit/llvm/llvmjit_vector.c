@@ -51,8 +51,9 @@ emit_null_bit(LLVMBuilderRef b, LLVMValueRef nulls, LLVMValueRef row)
 	LLVMValueRef wordidx = LLVMBuildLShr(b, row, l_int32_const(lc, 6), "");
 	LLVMValueRef wordptr = l_gep(b, i64, nulls, &wordidx, 1, "");
 	LLVMValueRef word = l_load(b, i64, wordptr, "");
-	LLVMValueRef bit = LLVMBuildShl(b, l_int64_const(lc, 1),
-								   LLVMBuildAnd(b, row, l_int32_const(lc, 63), ""), "");
+	LLVMValueRef shift = LLVMBuildZExt(b,
+		LLVMBuildAnd(b, row, l_int32_const(lc, 63), ""), i64, "");
+	LLVMValueRef bit = LLVMBuildShl(b, l_int64_const(lc, 1), shift, "");
 	LLVMValueRef masked = LLVMBuildAnd(b, word, bit, "");
 
 	return LLVMBuildICmp(b, LLVMIntNE, masked, l_int64_const(lc, 0), "");
@@ -243,8 +244,9 @@ emit_result_store(LLVMBuilderRef b, LLVMValueRef out_values,
 	LLVMValueRef wordidx = LLVMBuildLShr(b, row, l_int32_const(lc, 6), "");
 	LLVMValueRef wordptr = l_gep(b, i64, out_nulls, &wordidx, 1, "");
 	LLVMValueRef word = l_load(b, i64, wordptr, "");
-	LLVMValueRef bit = LLVMBuildShl(b, l_int64_const(lc, 1),
-								   LLVMBuildAnd(b, row, l_int32_const(lc, 63), ""), "");
+	LLVMValueRef shift = LLVMBuildZExt(b,
+		LLVMBuildAnd(b, row, l_int32_const(lc, 63), ""), i64, "");
+	LLVMValueRef bit = LLVMBuildShl(b, l_int64_const(lc, 1), shift, "");
 	LLVMValueRef set = LLVMBuildOr(b, word, bit, "");
 	LLVMValueRef clear = LLVMBuildAnd(b, word,
 									 LLVMBuildNot(b, bit, ""), "");
