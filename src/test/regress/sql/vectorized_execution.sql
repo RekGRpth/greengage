@@ -927,6 +927,27 @@ EXPLAIN (COSTS OFF) SELECT sum(num) FROM vector_heap_test WHERE num > 10;
 EXPLAIN (COSTS OFF) SELECT id FROM vector_aoco_test LIMIT 3;
 EXPLAIN (COSTS OFF) SELECT id, id * 2 AS d FROM vector_aoco_test LIMIT 3;
 SELECT sum(id * 2 + 1) FROM vector_aoco_test;
+-- INT4 batch JIT: fuse arithmetic into one selection loop, preserve NULLs and
+-- fall back to the ordinary evaluator on signed overflow.
+SET jit = on;
+SET jit_above_cost = 0;
+SET jit_inline_above_cost = 0;
+SET jit_optimize_above_cost = 0;
+SET optimizer_jit_above_cost = 0;
+SET optimizer_jit_inline_above_cost = 0;
+SET optimizer_jit_optimize_above_cost = 0;
+SELECT sum(id * 2 + 1) FROM vector_aoco_test;
+SELECT id * 2 + 1 FROM vector_aoco_small
+WHERE id IS NULL OR id BETWEEN -1000 AND 1000 ORDER BY id;
+SELECT 2147483647 * 2 + 1 FROM vector_aoco_small LIMIT 1;
+SELECT (-2147483648) * 2 + 1 FROM vector_aoco_small LIMIT 1;
+RESET jit;
+RESET jit_above_cost;
+RESET jit_inline_above_cost;
+RESET jit_optimize_above_cost;
+RESET optimizer_jit_above_cost;
+RESET optimizer_jit_inline_above_cost;
+RESET optimizer_jit_optimize_above_cost;
 EXPLAIN (COSTS OFF) SELECT id, val FROM vector_aoco_test LIMIT 3;
 SET statement_mem = '256kB';
 EXPLAIN (COSTS OFF) SELECT val, count(*) FROM vector_aoco_test GROUP BY val;

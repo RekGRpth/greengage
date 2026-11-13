@@ -181,6 +181,14 @@ jit_compile_expr(struct ExprState *state)
 	return false;
 }
 
+void *
+jit_compile_vector_expr(struct VectorExprState *state)
+{
+	if (provider_init())
+		return provider.compile_vector_expr(state);
+	return NULL;
+}
+
 /* Aggregate JIT instrumentation information */
 void
 InstrJitAgg(JitInstrumentation *dst, JitInstrumentation *add)

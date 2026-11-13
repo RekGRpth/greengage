@@ -3059,6 +3059,48 @@ SELECT sum(id * 2 + 1) FROM vector_aoco_test;
  22827385
 (1 row)
 
+-- INT4 batch JIT: fuse arithmetic into one selection loop, preserve NULLs and
+-- fall back to the ordinary evaluator on signed overflow.
+SET jit = on;
+SET jit_above_cost = 0;
+SET jit_inline_above_cost = 0;
+SET jit_optimize_above_cost = 0;
+SET optimizer_jit_above_cost = 0;
+SET optimizer_jit_inline_above_cost = 0;
+SET optimizer_jit_optimize_above_cost = 0;
+SELECT sum(id * 2 + 1) FROM vector_aoco_test;
+   sum    
+----------
+ 22827385
+(1 row)
+
+SELECT id * 2 + 1 FROM vector_aoco_small
+WHERE id IS NULL OR id BETWEEN -1000 AND 1000 ORDER BY id;
+ ?column? 
+----------
+        3
+        5
+        7
+        9
+       11
+       13
+       15
+       17
+       19
+       21
+(10 rows)
+
+SELECT 2147483647 * 2 + 1 FROM vector_aoco_small LIMIT 1;
+ERROR:  integer out of range
+SELECT (-2147483648) * 2 + 1 FROM vector_aoco_small LIMIT 1;
+ERROR:  integer out of range
+RESET jit;
+RESET jit_above_cost;
+RESET jit_inline_above_cost;
+RESET jit_optimize_above_cost;
+RESET optimizer_jit_above_cost;
+RESET optimizer_jit_inline_above_cost;
+RESET optimizer_jit_optimize_above_cost;
 EXPLAIN (COSTS OFF) SELECT id, val FROM vector_aoco_test LIMIT 3;
                    QUERY PLAN                   
 ------------------------------------------------

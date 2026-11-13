@@ -25,6 +25,7 @@
 #include "executor/nodeSubplan.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "jit/jit.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
@@ -290,6 +291,10 @@ struct VectorExprState
 	MemoryContext context;
 	VectorExprStep *root;
 	int			capacity;
+	EState	   *estate;
+	VectorJitNode *jit_tree;
+	VectorExprJitRuntime jit_rt;
+	void	   *jit_func;
 };
 
 static VectorExprStep *build_step(Expr *expr, VectorBatch *batch,
@@ -1422,6 +1427,69 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 	}
 }
 
+static VectorJitNode *
+jit_build_node(VectorExprStep *step, MemoryContext context)
+{
+	VectorJitNode *node;
+
+	if (step == NULL)
+		return NULL;
+	node = MemoryContextAllocZero(context, sizeof(VectorJitNode));
+	switch (step->kind)
+	{
+		case VEC_VAR:
+			node->kind = VECTOR_JIT_VAR;
+			node->values = step->value.values;
+			node->nulls = step->value.nulls;
+			return node;
+		case VEC_CONST:
+			if (value_is_null(&step->value, 0))
+				return NULL;
+			node->kind = VECTOR_JIT_CONST;
+			node->const_value = DatumGetInt32(step->value.values[0]);
+			return node;
+		case VEC_FUNC:
+			if (step->nargs != 2)
+				return NULL;
+			switch (step->u.func.arithmetic)
+			{
+				case VEC_ARITHMETIC_INT4_ADD:
+					node->kind = VECTOR_JIT_INT4_ADD;
+					break;
+				case VEC_ARITHMETIC_INT4_MUL:
+					node->kind = VECTOR_JIT_INT4_MUL;
+					break;
+				default:
+					return NULL;
+			}
+			node->left = jit_build_node(step->args[0], context);
+			node->right = jit_build_node(step->args[1], context);
+			if (node->left == NULL || node->right == NULL)
+				return NULL;
+			return node;
+		default:
+			return NULL;
+	}
+}
+
+VectorJitNode *
+VectorExprJitGetTree(VectorExprState *state)
+{
+	return jit_build_node(state->root, state->context);
+}
+
+EState *
+VectorExprJitEState(VectorExprState *state)
+{
+	return state->estate;
+}
+
+void
+VectorExprEvalRowFallback(VectorExprState *state, VectorBatch *batch, int32 row)
+{
+	eval_step(state->root, batch, &row, 1);
+}
+
 VectorExprState *
 VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
 				  const VectorExprVarMap *vars)
@@ -1448,6 +1516,12 @@ VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
 		VectorExprDestroy(state);
 		return NULL;
 	}
+	state->estate = vars->estate;
+	state->jit_tree = VectorExprJitGetTree(state);
+	if (state->jit_tree != NULL && state->estate != NULL &&
+		(state->estate->es_jit_flags & PGJIT_PERFORM) &&
+		(state->estate->es_jit_flags & PGJIT_EXPR))
+		state->jit_func = jit_compile_vector_expr(state);
 	return state;
 }
 
@@ -2870,7 +2944,18 @@ VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
 
 	CHECK_FOR_INTERRUPTS();
 	oldcontext = MemoryContextSwitchTo(batch->varlena_context);
-	eval_step(state->root, batch, selection, nselected);
+	if (state->jit_func != NULL)
+	{
+		state->jit_rt.expr = state;
+		state->jit_rt.batch = batch;
+		state->jit_rt.selection = selection;
+		state->jit_rt.nselected = nselected;
+		state->jit_rt.out_values = state->root->value.values;
+		state->jit_rt.out_nulls = state->root->value.nulls;
+		((VectorExprJitFunc) state->jit_func)(&state->jit_rt);
+	}
+	else
+		eval_step(state->root, batch, selection, nselected);
 	MemoryContextSwitchTo(oldcontext);
 }
 

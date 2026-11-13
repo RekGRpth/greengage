@@ -14,6 +14,36 @@
 
 typedef struct VectorExprState VectorExprState;
 
+typedef enum VectorJitNodeKind
+{
+	VECTOR_JIT_VAR,
+	VECTOR_JIT_CONST,
+	VECTOR_JIT_INT4_ADD,
+	VECTOR_JIT_INT4_MUL
+} VectorJitNodeKind;
+
+typedef struct VectorJitNode
+{
+	VectorJitNodeKind kind;
+	struct VectorJitNode *left;
+	struct VectorJitNode *right;
+	Datum	   *values;
+	uint64	   *nulls;
+	int32		const_value;
+} VectorJitNode;
+
+typedef struct VectorExprJitRuntime
+{
+	VectorExprState *expr;
+	VectorBatch *batch;
+	int32	   *selection;
+	int			nselected;
+	Datum	   *out_values;
+	uint64	   *out_nulls;
+} VectorExprJitRuntime;
+
+typedef void (*VectorExprJitFunc)(VectorExprJitRuntime *runtime);
+
 typedef struct VectorExprVarMap
 {
 	Index		scanrelid;
@@ -47,5 +77,9 @@ extern bool VectorExprDeferNumericResult(VectorExprState *state);
 extern bool VectorExprGetDeferredNumeric(VectorExprState *state, int row,
 										 int64 *mant, int *dscale);
 extern void VectorExprFilter(VectorBatch *batch, VectorExprState *state);
+extern VectorJitNode *VectorExprJitGetTree(VectorExprState *state);
+extern EState *VectorExprJitEState(VectorExprState *state);
+extern void VectorExprEvalRowFallback(VectorExprState *state,
+									  VectorBatch *batch, int32 row);
 
 #endif							/* VECTOREXPR_H */
