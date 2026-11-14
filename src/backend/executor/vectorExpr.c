@@ -126,6 +126,15 @@ typedef enum VectorCompareOp
 typedef enum VectorArithmeticOp
 {
 	VEC_ARITHMETIC_NONE,
+	VEC_ARITHMETIC_INT2_ADD,
+	VEC_ARITHMETIC_INT2_SUB,
+	VEC_ARITHMETIC_INT2_MUL,
+	VEC_ARITHMETIC_INT2_DIV,
+	VEC_ARITHMETIC_INT2_MOD,
+	VEC_ARITHMETIC_INT42_ADD,
+	VEC_ARITHMETIC_INT42_SUB,
+	VEC_ARITHMETIC_INT42_MUL,
+	VEC_ARITHMETIC_INT42_DIV,
 	VEC_ARITHMETIC_INT24_ADD,
 	VEC_ARITHMETIC_INT24_SUB,
 	VEC_ARITHMETIC_INT24_MUL,
@@ -461,6 +470,15 @@ VectorExprPackedI32IsSupported(Expr *expr)
 		return false;
 	switch (((OpExpr *) expr)->opfuncid)
 	{
+		case F_INT2PL:
+		case F_INT2MI:
+		case F_INT2MUL:
+		case F_INT2DIV:
+		case F_INT2MOD:
+		case F_INT42PL:
+		case F_INT42MI:
+		case F_INT42MUL:
+		case F_INT42DIV:
 		case F_INT24PL:
 		case F_INT24MI:
 		case F_INT24MUL:
@@ -894,6 +912,24 @@ vector_arithmetic_op(Oid functionid)
 {
 	switch (functionid)
 	{
+		case F_INT2PL:
+			return VEC_ARITHMETIC_INT2_ADD;
+		case F_INT2MI:
+			return VEC_ARITHMETIC_INT2_SUB;
+		case F_INT2MUL:
+			return VEC_ARITHMETIC_INT2_MUL;
+		case F_INT2DIV:
+			return VEC_ARITHMETIC_INT2_DIV;
+		case F_INT2MOD:
+			return VEC_ARITHMETIC_INT2_MOD;
+		case F_INT42PL:
+			return VEC_ARITHMETIC_INT42_ADD;
+		case F_INT42MI:
+			return VEC_ARITHMETIC_INT42_SUB;
+		case F_INT42MUL:
+			return VEC_ARITHMETIC_INT42_MUL;
+		case F_INT42DIV:
+			return VEC_ARITHMETIC_INT42_DIV;
 		case F_INT24PL:
 			return VEC_ARITHMETIC_INT24_ADD;
 		case F_INT24MI:
@@ -2378,6 +2414,120 @@ eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 }
 
 static void
+eval_arithmetic_packed_int2(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		int16		arg1;
+		int16		arg2;
+		int16		result = 0;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set_int2(&step->value, row, 0, true);
+			continue;
+		}
+		arg1 = left->i16_values[row];
+		arg2 = right->i16_values[row];
+		switch (step->u.func.arithmetic)
+		{
+			case VEC_ARITHMETIC_INT2_ADD:
+				if (unlikely(pg_add_s16_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("smallint out of range")));
+				break;
+			case VEC_ARITHMETIC_INT2_SUB:
+				if (unlikely(pg_sub_s16_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("smallint out of range")));
+				break;
+			case VEC_ARITHMETIC_INT2_MUL:
+				if (unlikely(pg_mul_s16_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("smallint out of range")));
+				break;
+			case VEC_ARITHMETIC_INT2_DIV:
+				if (unlikely(arg2 == 0))
+					ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+									errmsg("division by zero")));
+				if (unlikely(arg2 == -1 && arg1 == PG_INT16_MIN))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("smallint out of range")));
+				result = arg2 == -1 ? -arg1 : arg1 / arg2;
+				break;
+			case VEC_ARITHMETIC_INT2_MOD:
+				if (unlikely(arg2 == 0))
+					ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+									errmsg("division by zero")));
+				result = arg2 == -1 ? 0 : arg1 % arg2;
+				break;
+			default:
+				pg_unreachable();
+		}
+		value_set_int2(&step->value, row, result, false);
+	}
+}
+
+static void
+eval_arithmetic_packed_int42(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		int32		arg1;
+		int32		arg2;
+		int32		result = 0;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set_int4(&step->value, row, 0, true);
+			continue;
+		}
+		arg1 = left->i32_values[row];
+		arg2 = right->i16_values[row];
+		switch (step->u.func.arithmetic)
+		{
+			case VEC_ARITHMETIC_INT42_ADD:
+				if (unlikely(pg_add_s32_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				break;
+			case VEC_ARITHMETIC_INT42_SUB:
+				if (unlikely(pg_sub_s32_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				break;
+			case VEC_ARITHMETIC_INT42_MUL:
+				if (unlikely(pg_mul_s32_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				break;
+			case VEC_ARITHMETIC_INT42_DIV:
+				if (unlikely(arg2 == 0))
+					ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+									errmsg("division by zero")));
+				if (unlikely(arg2 == -1 && arg1 == PG_INT32_MIN))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				result = arg2 == -1 ? -arg1 : arg1 / arg2;
+				break;
+			default:
+				pg_unreachable();
+		}
+		value_set_int4(&step->value, row, result, false);
+	}
+}
+
+static void
 eval_arithmetic_packed_int24(VectorExprStep *step, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
@@ -2532,6 +2682,16 @@ eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int 
 	VectorValue *right = &step->args[1]->value;
 	int			pos;
 
+	if (left->i16_values != NULL && right->i16_values != NULL)
+	{
+		eval_arithmetic_packed_int2(step, selection, nselected);
+		return;
+	}
+	if (left->i32_values != NULL && right->i16_values != NULL)
+	{
+		eval_arithmetic_packed_int42(step, selection, nselected);
+		return;
+	}
 	if (left->i16_values != NULL && right->i32_values != NULL)
 	{
 		eval_arithmetic_packed_int24(step, selection, nselected);
@@ -2563,6 +2723,82 @@ eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int 
 			case VEC_ARITHMETIC_NUMERIC_MUL:
 				eval_numeric_arith_row(step, batch, row);
 				continue;
+			case VEC_ARITHMETIC_INT2_ADD:
+			case VEC_ARITHMETIC_INT2_SUB:
+			case VEC_ARITHMETIC_INT2_MUL:
+				{
+					int16		arg1 = DatumGetInt16(left->values[row]);
+					int16		arg2 = DatumGetInt16(right->values[row]);
+					int16		result = 0;
+					bool		overflow = step->u.func.arithmetic == VEC_ARITHMETIC_INT2_ADD ?
+						pg_add_s16_overflow(arg1, arg2, &result) :
+						step->u.func.arithmetic == VEC_ARITHMETIC_INT2_SUB ?
+						pg_sub_s16_overflow(arg1, arg2, &result) :
+						pg_mul_s16_overflow(arg1, arg2, &result);
+
+					if (unlikely(overflow))
+						ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+										errmsg("smallint out of range")));
+					value_set(&step->value, row, Int16GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT2_DIV:
+			case VEC_ARITHMETIC_INT2_MOD:
+				{
+					int16		arg1 = DatumGetInt16(left->values[row]);
+					int16		arg2 = DatumGetInt16(right->values[row]);
+					int16		result;
+
+					if (unlikely(arg2 == 0))
+						ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+										errmsg("division by zero")));
+					if (step->u.func.arithmetic == VEC_ARITHMETIC_INT2_DIV)
+					{
+						if (unlikely(arg2 == -1 && arg1 == PG_INT16_MIN))
+							ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+											errmsg("smallint out of range")));
+						result = arg2 == -1 ? -arg1 : arg1 / arg2;
+					}
+					else
+						result = arg2 == -1 ? 0 : arg1 % arg2;
+					value_set(&step->value, row, Int16GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT42_ADD:
+			case VEC_ARITHMETIC_INT42_SUB:
+			case VEC_ARITHMETIC_INT42_MUL:
+				{
+					int32		arg1 = DatumGetInt32(left->values[row]);
+					int32		arg2 = DatumGetInt16(right->values[row]);
+					int32		result = 0;
+					bool		overflow = step->u.func.arithmetic == VEC_ARITHMETIC_INT42_ADD ?
+						pg_add_s32_overflow(arg1, arg2, &result) :
+						step->u.func.arithmetic == VEC_ARITHMETIC_INT42_SUB ?
+						pg_sub_s32_overflow(arg1, arg2, &result) :
+						pg_mul_s32_overflow(arg1, arg2, &result);
+
+					if (unlikely(overflow))
+						ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+										errmsg("integer out of range")));
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
+			case VEC_ARITHMETIC_INT42_DIV:
+				{
+					int32		arg1 = DatumGetInt32(left->values[row]);
+					int16		arg2 = DatumGetInt16(right->values[row]);
+					int32		result;
+
+					if (unlikely(arg2 == 0))
+						ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+										errmsg("division by zero")));
+					if (unlikely(arg2 == -1 && arg1 == PG_INT32_MIN))
+						ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+										errmsg("integer out of range")));
+					result = arg2 == -1 ? -arg1 : arg1 / arg2;
+					value_set(&step->value, row, Int32GetDatum(result), false);
+					break;
+				}
 			case VEC_ARITHMETIC_INT24_ADD:
 				{
 					int32		result;
