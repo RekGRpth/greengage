@@ -449,6 +449,11 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		 VectorExprPackedI32QualIsSupported((Expr *) scan->plan.qual)) &&
 		packed_i32_targetlist(scan->plan.targetlist))
 		state->packed_i32 = true;
+	else if (state->sort != NULL && state->scan != NULL && state->append == NULL &&
+			 (scan->plan.qual == NIL ||
+			  VectorExprPackedI32QualIsSupported((Expr *) scan->plan.qual)) &&
+			 packed_i32_targetlist(scan->plan.targetlist))
+		state->packed_i32 = true;
 
 	if (state->agg == NULL && state->hj == NULL)
 	{

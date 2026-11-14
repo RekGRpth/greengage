@@ -614,7 +614,10 @@ VectorSortPlanIsSupported(Sort *sort)
 typedef struct VectorSortColumn
 {
 	Datum	   *values;
+	int32	   *i32_values;
+	int16	   *i16_values;
 	uint64	   *nulls;
+	Oid			typid;
 	int16		typlen;
 	bool		typbyval;
 } VectorSortColumn;
@@ -632,7 +635,28 @@ typedef struct VectorSortState
 	int64		position;
 	int64		mem_limit;
 	bool		native;
+	bool		packed_i32;
 } VectorSortState;
+
+static inline Datum
+VectorSortGetDatum(VectorSortColumn *column, int64 row)
+{
+	if (column->i16_values != NULL)
+		return Int16GetDatum(column->i16_values[row]);
+	if (column->i32_values != NULL)
+	{
+		if (column->typid == FLOAT4OID)
+		{
+			uint32		bits = (uint32) column->i32_values[row];
+			float4		value;
+
+			memcpy(&value, &bits, sizeof(value));
+			return Float4GetDatum(value);
+		}
+		return Int32GetDatum(column->i32_values[row]);
+	}
+	return column->values[row];
+}
 
 static Tuplesortstate *
 VectorSortBegin(SortState *node)
@@ -669,7 +693,7 @@ VectorSortPutTuple(SortState *node, TupleTableSlot *slot)
 }
 
 static VectorSortState *
-VectorSortCreate(SortState *node)
+VectorSortCreate(SortState *node, const VectorBatch *batch)
 {
 	EState	   *estate = node->ss.ps.state;
 	Sort	   *sort = (Sort *) node->ss.ps.plan;
@@ -681,6 +705,7 @@ VectorSortCreate(SortState *node)
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 	state = palloc0(sizeof(VectorSortState));
 	state->node = node;
+	state->packed_i32 = batch->packed_i32;
 	state->ncols = tupdesc->natts;
 	state->columns = palloc0(sizeof(VectorSortColumn) * Max(state->ncols, 1));
 	state->sort_keys = palloc0(sizeof(SortSupportData) * sort->numCols);
@@ -695,6 +720,7 @@ VectorSortCreate(SortState *node)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, col);
 
+		state->columns[col].typid = attr->atttypid;
 		state->columns[col].typlen = attr->attlen;
 		state->columns[col].typbyval = attr->attbyval;
 	}
@@ -755,7 +781,7 @@ VectorSortFallback(VectorSortState *state)
 		ExecClearTuple(input);
 		for (col = 0; col < state->ncols; col++)
 		{
-			input->tts_values[col] = state->columns[col].values[row];
+			input->tts_values[col] = VectorSortGetDatum(&state->columns[col], row);
 			input->tts_isnull[col] =
 				(state->columns[col].nulls[row / 64] &
 				 ((uint64) 1 << (row % 64))) != 0;
@@ -769,6 +795,8 @@ VectorSortFallback(VectorSortState *state)
 	for (col = 0; col < state->ncols; col++)
 	{
 		state->columns[col].values = NULL;
+		state->columns[col].i32_values = NULL;
+		state->columns[col].i16_values = NULL;
 		state->columns[col].nulls = NULL;
 	}
 	state->nrows = 0;
@@ -796,19 +824,74 @@ VectorSortGrow(VectorSortState *state)
 		VectorSortColumn *column = &state->columns[col];
 		Size		nullsize = sizeof(uint64) * VECTOR_BATCH_NULLWORDS(new_capacity);
 
-		if (column->values == NULL)
+		if (column->values == NULL && column->i32_values == NULL &&
+			column->i16_values == NULL)
 		{
-			column->values = palloc0(sizeof(Datum) * new_capacity);
+			if (state->packed_i32 && column->typid == INT2OID)
+				column->i16_values = palloc0(sizeof(int16) * new_capacity);
+			else if (state->packed_i32 &&
+					 (column->typid == INT4OID || column->typid == DATEOID ||
+					  column->typid == FLOAT4OID))
+				column->i32_values = palloc0(sizeof(int32) * new_capacity);
+			else
+				column->values = palloc0(sizeof(Datum) * new_capacity);
 			column->nulls = palloc0(nullsize);
 		}
 		else
 		{
-			column->values = repalloc(column->values, sizeof(Datum) * new_capacity);
+			if (column->i16_values != NULL)
+				column->i16_values = repalloc(column->i16_values,
+					sizeof(int16) * new_capacity);
+			else if (column->i32_values != NULL)
+				column->i32_values = repalloc(column->i32_values,
+					sizeof(int32) * new_capacity);
+			else
+				column->values = repalloc(column->values, sizeof(Datum) * new_capacity);
 			column->nulls = repalloc(column->nulls, nullsize);
 		}
 	}
 	state->capacity = new_capacity;
 	MemoryContextSwitchTo(oldcontext);
+}
+
+static inline int
+VectorSortPackedCompare(VectorSortState *state, int key, int col,
+						int32 a, int32 b, bool anull, bool bnull)
+{
+	VectorSortColumn *column = &state->columns[col];
+	SortSupport ssup = &state->sort_keys[key];
+	int			cmp;
+
+	if (anull || bnull)
+		return ApplySortComparator((Datum) 0, anull, (Datum) 0, bnull, ssup);
+	if (column->i16_values != NULL)
+	{
+		int16		l = column->i16_values[a];
+		int16		r = column->i16_values[b];
+
+		cmp = l < r ? -1 : l > r ? 1 : 0;
+	}
+	else if (column->typid == FLOAT4OID)
+	{
+		uint32		lbits = (uint32) column->i32_values[a];
+		uint32		rbits = (uint32) column->i32_values[b];
+		float4		l;
+		float4		r;
+
+		memcpy(&l, &lbits, sizeof(l));
+		memcpy(&r, &rbits, sizeof(r));
+		cmp = float4_cmp_internal(l, r);
+	}
+	else
+	{
+		int32		l = column->i32_values[a];
+		int32		r = column->i32_values[b];
+
+		cmp = l < r ? -1 : l > r ? 1 : 0;
+	}
+	if (ssup->ssup_reverse)
+		INVERT_COMPARE_RESULT(cmp);
+	return cmp;
 }
 
 static int
@@ -826,9 +909,14 @@ VectorSortCompare(const void *left, const void *right, void *arg)
 		VectorSortColumn *column = &state->columns[col];
 		bool		anull = (column->nulls[a / 64] & ((uint64) 1 << (a % 64))) != 0;
 		bool		bnull = (column->nulls[b / 64] & ((uint64) 1 << (b % 64))) != 0;
-		int			cmp = ApplySortComparator(column->values[a], anull,
-										  column->values[b], bnull,
-										  &state->sort_keys[key]);
+		int			cmp;
+
+		if (column->i16_values != NULL || column->i32_values != NULL)
+			cmp = VectorSortPackedCompare(state, key, col, a, b, anull, bnull);
+		else
+			cmp = ApplySortComparator(column->values[a], anull,
+									  column->values[b], bnull,
+									  &state->sort_keys[key]);
 
 		if (cmp != 0)
 			return cmp;
@@ -851,7 +939,7 @@ VectorSortPutBatch(SortState *node, const VectorBatch *batch,
 
 	Assert(!node->sort_Done);
 	if (state == NULL && !node->bounded && !node->randomAccess)
-		state = VectorSortCreate(node);
+		state = VectorSortCreate(node, batch);
 	if (state == NULL || !state->native)
 	{
 		VectorSortPutBatchRows(node, batch, input_attnos);
@@ -876,17 +964,26 @@ VectorSortPutBatch(SortState *node, const VectorBatch *batch,
 		for (col = 0; col < state->ncols; col++)
 		{
 			VectorSortColumn *column = &state->columns[col];
+			VectorColumn *source;
 			int			attno = input_attnos[col];
 			Datum		value;
 			bool		isnull;
 			uint64		mask = (uint64) 1 << (row % 64);
 
 			Assert(attno >= 0 && attno < batch->ncols);
+			source = &batch->columns[attno];
 			isnull = VectorBatchIsNull(batch, attno, input_row);
-			value = VectorBatchGetDatum(batch, attno, input_row);
-			if (!isnull && !column->typbyval)
-				value = datumCopy(value, column->typbyval, column->typlen);
-			column->values[row] = value;
+			if (column->i16_values != NULL)
+				column->i16_values[row] = source->i16_values[input_row];
+			else if (column->i32_values != NULL)
+				column->i32_values[row] = source->i32_values[input_row];
+			else
+			{
+				value = VectorBatchGetDatum(batch, attno, input_row);
+				if (!isnull && !column->typbyval)
+					value = datumCopy(value, column->typbyval, column->typlen);
+				column->values[row] = value;
+			}
 			if (isnull)
 				column->nulls[row / 64] |= mask;
 			else
@@ -964,7 +1061,7 @@ VectorSortNext(SortState *node)
 			state->order[state->nrows - position - 1];
 		for (col = 0; col < state->ncols; col++)
 		{
-			slot->tts_values[col] = state->columns[col].values[row];
+			slot->tts_values[col] = VectorSortGetDatum(&state->columns[col], row);
 			slot->tts_isnull[col] =
 				(state->columns[col].nulls[row / 64] &
 				 ((uint64) 1 << (row % 64))) != 0;
@@ -1010,7 +1107,7 @@ VectorSortNextBatch(SortState *node, VectorBatch *batch,
 				int32		row = forward ? state->order[position] :
 					state->order[state->nrows - position - 1];
 
-				VectorBatchSetValue(batch, attno, pos, column->values[row],
+				VectorBatchSetValue(batch, attno, pos, VectorSortGetDatum(column, row),
 					(column->nulls[row / 64] & ((uint64) 1 << (row % 64))) != 0);
 			}
 		}
@@ -1057,6 +1154,8 @@ VectorSortReset(SortState *node)
 	for (col = 0; col < state->ncols; col++)
 	{
 		state->columns[col].values = NULL;
+		state->columns[col].i32_values = NULL;
+		state->columns[col].i16_values = NULL;
 		state->columns[col].nulls = NULL;
 	}
 	state->nrows = 0;

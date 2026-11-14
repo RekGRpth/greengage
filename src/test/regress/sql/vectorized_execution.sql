@@ -416,6 +416,11 @@ SELECT sum(s * 1::int2), min(s * 1::int2), max(s * 1::int2) FROM vector_arithmet
 SELECT sum(2147480000 + s) FROM vector_arithmetic_test;
 SELECT sum(s * 100::int2) FROM vector_arithmetic_test;
 SELECT sum(s % 0::int2) FROM vector_arithmetic_test;
+-- Packed native Sort: DESC and NULLS LAST for every packed key type.
+SELECT a FROM vector_arithmetic_test ORDER BY a DESC NULLS LAST;
+SELECT s FROM vector_arithmetic_test ORDER BY s DESC NULLS LAST;
+SELECT f4 FROM vector_float_test ORDER BY f4 DESC NULLS LAST;
+SELECT d FROM vector_time_test ORDER BY d DESC NULLS LAST;
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
        stddev_pop(id::int2), stddev_samp(id::int2)

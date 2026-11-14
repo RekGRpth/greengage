@@ -914,6 +914,53 @@ SELECT sum(s * 100::int2) FROM vector_arithmetic_test;
 ERROR:  smallint out of range
 SELECT sum(s % 0::int2) FROM vector_arithmetic_test;
 ERROR:  division by zero
+-- Packed native Sort: DESC and NULLS LAST for every packed key type.
+SELECT a FROM vector_arithmetic_test ORDER BY a DESC NULLS LAST;
+      a      
+-------------
+  2147483647
+          12
+ -2147483648
+            
+(4 rows)
+
+SELECT s FROM vector_arithmetic_test ORDER BY s DESC NULLS LAST;
+   s    
+--------
+  32767
+     12
+ -32768
+       
+(4 rows)
+
+SELECT f4 FROM vector_float_test ORDER BY f4 DESC NULLS LAST;
+    f4     
+-----------
+       NaN
+       NaN
+  Infinity
+       1.5
+        -0
+         0
+ -Infinity
+          
+(8 rows)
+
+SELECT d FROM vector_time_test ORDER BY d DESC NULLS LAST;
+     d      
+------------
+ 01-11-2001
+ 01-10-2001
+ 01-09-2001
+ 01-07-2001
+ 01-06-2001
+ 01-05-2001
+ 01-04-2001
+ 01-03-2001
+ 01-02-2001
+ 
+(10 rows)
+
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
  avg 
 -----
