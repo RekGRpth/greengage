@@ -51,14 +51,14 @@ typedef struct VectorBatch
 	uint32		gen;		/* batch generation, bumped on every reset */
 	VectorColumn *columns;
 	int32	   *selection;
-	bool		packed_int4;
+	bool		packed_i32;
 	TupleDesc	tupdesc;
 	MemoryContext varlena_context;
 } VectorBatch;
 
 extern VectorBatch *VectorBatchCreate(MemoryContext parent,
 									  TupleDesc tupdesc, int capacity,
-									  bool packed_int4);
+									  bool packed_i32);
 extern void VectorBatchDestroy(VectorBatch *batch);
 extern void VectorBatchReset(VectorBatch *batch);
 extern void VectorBatchSetRowCount(VectorBatch *batch, int nrows);

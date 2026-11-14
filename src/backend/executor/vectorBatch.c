@@ -13,7 +13,7 @@
 
 VectorBatch *
 VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity,
-				  bool packed_int4)
+				  bool packed_i32)
 {
 	VectorBatch *batch;
 	MemoryContext oldcontext;
@@ -28,7 +28,7 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity,
 	batch = palloc0(sizeof(VectorBatch));
 	batch->ncols = tupdesc->natts;
 	batch->capacity = capacity;
-	batch->packed_int4 = packed_int4;
+	batch->packed_i32 = packed_i32;
 	batch->columns = palloc0(sizeof(VectorColumn) * Max(batch->ncols, 1));
 	batch->selection = palloc(sizeof(int32) * capacity);
 	batch->tupdesc = tupdesc;
@@ -47,7 +47,8 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity,
 		column->typmod = attr->atttypmod;
 		column->typlen = attr->attlen;
 		column->typbyval = attr->attbyval;
-		if (packed_int4 && column->typid == INT4OID)
+		if (packed_i32 &&
+			(column->typid == INT4OID || column->typid == DATEOID))
 			column->i32_values = palloc0(sizeof(int32) * capacity);
 		else
 			column->values = palloc0(sizeof(Datum) * capacity);

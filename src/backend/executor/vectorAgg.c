@@ -79,7 +79,7 @@ typedef enum VectorAggBuiltin
 struct VectorAggState
 {
 	MemoryContext context;
-	bool		packed_int4;
+	bool		packed_i32;
 	AggState   *agg;
 	VectorExprVarMap vars;
 	VectorExprState ***args;
@@ -119,7 +119,7 @@ struct VectorAggState
 };
 
 bool
-VectorAggPackedInt4IsSupported(AggState *agg)
+VectorAggPackedI32IsSupported(AggState *agg)
 {
 	int			transno;
 
@@ -138,7 +138,8 @@ VectorAggPackedInt4IsSupported(AggState *agg)
 										  plan->grpColIdx[col]);
 
 			if (te == NULL || !IsA(te->expr, Var) ||
-				((Var *) te->expr)->vartype != INT4OID)
+				(((Var *) te->expr)->vartype != INT4OID &&
+				 ((Var *) te->expr)->vartype != DATEOID))
 				return false;
 		}
 	}
@@ -151,13 +152,14 @@ VectorAggPackedInt4IsSupported(AggState *agg)
 			pertrans->aggref->aggdistinct)
 			return false;
 		if (fnoid != VEC_AGG_SUM_INT4 && fnoid != VEC_AGG_AVG_INT4 &&
-			fnoid != VEC_AGG_MIN_INT4 && fnoid != VEC_AGG_MAX_INT4)
+			fnoid != VEC_AGG_MIN_INT4 && fnoid != VEC_AGG_MAX_INT4 &&
+			fnoid != VEC_AGG_MIN_DATE && fnoid != VEC_AGG_MAX_DATE)
 			return false;
 		{
 			ListCell   *lc;
 
 			foreach(lc, pertrans->aggref->args)
-				if (!VectorExprPackedInt4IsSupported(
+				if (!VectorExprPackedI32IsSupported(
 					((TargetEntry *) lfirst(lc))->expr))
 					return false;
 		}
@@ -532,7 +534,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 										 ALLOCSET_DEFAULT_INITSIZE,
 										 ALLOCSET_DEFAULT_MAXSIZE);
 	state->agg = agg;
-	state->packed_int4 = batch->packed_int4;
+	state->packed_i32 = batch->packed_i32;
 	oldcontext = MemoryContextSwitchTo(state->context);
 	if (!build_var_map((Agg *) agg->ss.ps.plan, state->context, &state->vars))
 	{
@@ -1216,6 +1218,7 @@ advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 				pergroupstate->transValueIsNull = false;
 				break;
 			case VEC_AGG_MAX_INT4:
+			case VEC_AGG_MAX_DATE:
 				if (pergroupstate->noTransValue ||
 					DatumGetInt32(pergroupstate->transValue) < value)
 					pergroupstate->transValue = Int32GetDatum(value);
@@ -1223,6 +1226,7 @@ advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 				pergroupstate->transValueIsNull = false;
 				break;
 			case VEC_AGG_MIN_INT4:
+			case VEC_AGG_MIN_DATE:
 				if (pergroupstate->noTransValue ||
 					DatumGetInt32(pergroupstate->transValue) > value)
 					pergroupstate->transValue = Int32GetDatum(value);
@@ -1241,7 +1245,7 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 	AggState   *agg = state->agg;
 	int			transno;
 
-	if (state->packed_int4)
+	if (state->packed_i32)
 	{
 		advance_packed_row(state, pergroup, row);
 		return;

@@ -71,7 +71,7 @@ typedef struct VectorRegionState
 	int			output_ncols;
 	int			position;
 	bool		eof;
-	bool		packed_int4;
+	bool		packed_i32;
 	/* Per-child layout remap for a divergent Append child (NULL arrays
 	 * for children laid out like the first one). */
 	AttrNumber **append_remaps;	/* child attno (1-based) -> batch attno, or 0 */
@@ -146,12 +146,12 @@ VectorRegionCreateState(CustomScan *cscan)
 }
 
 static bool
-packed_int4_targetlist(List *targetlist)
+packed_i32_targetlist(List *targetlist)
 {
 	ListCell   *lc;
 
 	foreach(lc, targetlist)
-		if (!VectorExprPackedInt4IsSupported(((TargetEntry *) lfirst(lc))->expr))
+		if (!VectorExprPackedI32IsSupported(((TargetEntry *) lfirst(lc))->expr))
 			return false;
 	return true;
 }
@@ -411,7 +411,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			state->append_batches[i] = VectorBatchCreate(estate->es_query_cxt,
 														 RelationGetDescr(childrel),
 														 VECTOR_BATCH_DEFAULT_CAPACITY,
-													 state->packed_int4);
+													 state->packed_i32);
 			if (!RelationIsAoCols(childrel))
 			{
 				Bitmapset *attrs = NULL;
@@ -444,11 +444,11 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	}
 
 	if (state->agg != NULL && state->scan != NULL && state->append == NULL &&
-		VectorAggPackedInt4IsSupported(state->agg) &&
+		VectorAggPackedI32IsSupported(state->agg) &&
 		(scan->plan.qual == NIL ||
-		 VectorExprPackedInt4QualIsSupported((Expr *) scan->plan.qual)) &&
-		packed_int4_targetlist(scan->plan.targetlist))
-		state->packed_int4 = true;
+		 VectorExprPackedI32QualIsSupported((Expr *) scan->plan.qual)) &&
+		packed_i32_targetlist(scan->plan.targetlist))
+		state->packed_i32 = true;
 
 	if (state->agg == NULL && state->hj == NULL)
 	{
@@ -484,7 +484,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 										 RelationGetDescr(relation) :
 										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
 										 VECTOR_BATCH_DEFAULT_CAPACITY,
-										 state->packed_int4);
+										 state->packed_i32);
 		if (state->scan != NULL &&
 			(needs_row_reader || !RelationIsAoCols(relation)))
 		{

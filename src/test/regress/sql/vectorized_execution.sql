@@ -450,6 +450,11 @@ SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
 SELECT f4 / 0 FROM vector_float_test WHERE id = 4;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
 SELECT min(d), max(d), min(ts), max(ts), min(tz), max(tz) FROM vector_time_test;
+-- Packed 32-bit DATE: range comparison, min/max and a hashed NULL key.
+SELECT min(d), max(d) FROM vector_time_test
+WHERE d >= DATE '2001-01-03' AND d < DATE '2001-01-09';
+SELECT d, min(d), max(d) FROM vector_time_test
+GROUP BY d ORDER BY d NULLS LAST;
 SELECT array_agg(CASE WHEN id = 2 THEN NULL ELSE id END ORDER BY id)
 FROM vector_aoco_small WHERE id <= 3;
 SELECT count(a + 1), count(b + 1) FROM vector_arithmetic_test;
