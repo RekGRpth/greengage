@@ -2460,6 +2460,7 @@ typedef struct SortState
 	bool		bounded_Done;	/* value of bounded we did the sort with */
 	int64		bound_Done;		/* value of bound we did the sort with */
 	void	   *tuplesortstate; /* private state of tuplesort.c */
+	void	   *vector_sort_state;	/* private state of native batch sort */
 	bool		am_worker;		/* are we a worker? */
 	SharedSortInfo *shared_info;	/* one entry per worker * Greengage: per QE */
 

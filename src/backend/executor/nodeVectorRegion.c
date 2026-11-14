@@ -796,30 +796,12 @@ VectorRegionSortInput(VectorRegionState *state)
 {
 	ScanDirection dir = state->css.ss.ps.state->es_direction;
 
+	if (state->sort->sort_Done)
+		return;
 	state->css.ss.ps.state->es_direction = ForwardScanDirection;
 	while (VectorRegionNextBatch(state))
 	{
-		int			pos;
-
-		for (pos = 0; pos < state->batch->nselected; pos++)
-		{
-			TupleTableSlot *input = state->sort->ss.ss_ScanTupleSlot;
-			int			row = VectorBatchSelectedRow(state->batch, pos);
-			int			col;
-
-			ExecClearTuple(input);
-			for (col = 0; col < state->output_ncols; col++)
-			{
-				int			attno = state->output_attnos[col];
-
-				Assert(attno >= 0);	/* simple scan targetlist */
-				input->tts_values[col] = state->batch->columns[attno].values[row];
-				input->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
-			}
-			input->tts_nvalid = state->output_ncols;
-			ExecStoreVirtualTuple(input);
-			VectorSortPutTuple(state->sort, input);
-		}
+		VectorSortPutBatch(state->sort, state->batch, state->output_attnos);
 		state->position = state->batch->nselected;
 	}
 	VectorSortFinish(state->sort);
@@ -931,7 +913,7 @@ VectorRegionExec(CustomScanState *node)
 		}
 	}
 
-	if (state->sort != NULL)
+	if (state->sort != NULL && state->sort->randomAccess)
 	{
 		VectorRegionSortInput(state);
 		return VectorSortNext(state->sort);
@@ -976,7 +958,18 @@ VectorRegionExec(CustomScanState *node)
 	for (;;)
 	{
 		ExecClearTuple(slot);
-		if (!VectorRegionNextBatch(state))
+		if (state->sort != NULL)
+		{
+			if (state->position >= state->batch->nselected)
+			{
+				VectorRegionSortInput(state);
+				if (!VectorSortNextBatch(state->sort, state->batch,
+									 state->output_attnos))
+					return slot;
+				state->position = 0;
+			}
+		}
+		else if (!VectorRegionNextBatch(state))
 			return slot;
 
 		/* evaluate projection steps once per batch, after the qual filter */
