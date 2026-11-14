@@ -26,7 +26,10 @@
 #include "cdb/cdbvars.h" /* CDB *//* gp_sort_flags */
 #include "utils/workfile_mgr.h"
 #include "executor/instrument.h"
+#include "executor/vectorBatch.h"
+#include "utils/datum.h"
 #include "utils/faultinjector.h"
+#include "utils/sortsupport.h"
 
 static void ExecSortExplainEnd(PlanState *planstate, struct StringInfoData *buf);
 static void ExecEagerFreeSort(SortState *node);
@@ -410,6 +413,8 @@ ExecReScanSort(SortState *node)
 	if (!node->sort_Done)
 		return;
 
+	VectorSortReset(node);
+
 	/* must drop pointer to sort result tuple */
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 
@@ -477,6 +482,9 @@ ExecEagerFreeSort(SortState *node)
 
 	/* must drop pointer to sort result tuple */
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+
+	if (node->vector_sort_state != NULL)
+		VectorSortDestroy(node);
 
 	if (node->tuplesortstate != NULL)
 	{
@@ -593,4 +601,485 @@ ExecSortRetrieveInstrumentation(SortState *node)
 	si = palloc(size);
 	memcpy(si, node->shared_info, size);
 	node->shared_info = si;
+}
+
+bool
+VectorSortPlanIsSupported(Sort *sort)
+{
+	return sort->numCols > 0 && sort->plan.qual == NIL &&
+		sort->plan.initPlan == NIL && sort->plan.extParam == NULL &&
+		sort->plan.allParam == NULL;
+}
+
+typedef struct VectorSortColumn
+{
+	Datum	   *values;
+	uint64	   *nulls;
+	int16		typlen;
+	bool		typbyval;
+} VectorSortColumn;
+
+typedef struct VectorSortState
+{
+	SortState  *node;
+	VectorSortColumn *columns;
+	SortSupport sort_keys;
+	MemoryContext values_context;
+	int32	   *order;
+	int			ncols;
+	int64		nrows;
+	int64		capacity;
+	int64		position;
+	int64		mem_limit;
+	bool		native;
+} VectorSortState;
+
+static Tuplesortstate *
+VectorSortBegin(SortState *node)
+{
+	Sort	   *plannode = (Sort *) node->ss.ps.plan;
+	Tuplesortstate *tuplesortstate;
+
+	if (node->tuplesortstate != NULL)
+		return (Tuplesortstate *) node->tuplesortstate;
+
+	node->ss.ps.state->es_direction = ForwardScanDirection;
+	tuplesortstate = tuplesort_begin_heap(ExecGetResultType(outerPlanState(node)),
+										 plannode->numCols,
+										 plannode->sortColIdx,
+										 plannode->sortOperators,
+										 plannode->collations,
+										 plannode->nullsFirst,
+										 PlanStateOperatorMemKB((PlanState *) node),
+										 NULL, node->randomAccess);
+	if (node->bounded)
+		tuplesort_set_bound(tuplesortstate, node->bound);
+	node->tuplesortstate = tuplesortstate;
+	if (node->ss.ps.instrument && node->ss.ps.instrument->need_cdb)
+		tuplesort_set_instrument(tuplesortstate, node->ss.ps.instrument,
+								 node->ss.ps.cdbexplainbuf);
+	return tuplesortstate;
+}
+
+void
+VectorSortPutTuple(SortState *node, TupleTableSlot *slot)
+{
+	Assert(!node->sort_Done);
+	tuplesort_puttupleslot(VectorSortBegin(node), slot);
+}
+
+static VectorSortState *
+VectorSortCreate(SortState *node)
+{
+	EState	   *estate = node->ss.ps.state;
+	Sort	   *sort = (Sort *) node->ss.ps.plan;
+	TupleDesc	tupdesc = ExecGetResultType(outerPlanState(node));
+	VectorSortState *state;
+	MemoryContext oldcontext;
+	int			col;
+
+	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+	state = palloc0(sizeof(VectorSortState));
+	state->node = node;
+	state->ncols = tupdesc->natts;
+	state->columns = palloc0(sizeof(VectorSortColumn) * Max(state->ncols, 1));
+	state->sort_keys = palloc0(sizeof(SortSupportData) * sort->numCols);
+	state->mem_limit = (int64) PlanStateOperatorMemKB((PlanState *) node) * 1024;
+	state->native = state->mem_limit > 0;
+	state->values_context = AllocSetContextCreate(estate->es_query_cxt,
+											 "Vector Sort Values",
+											 ALLOCSET_DEFAULT_MINSIZE,
+											 ALLOCSET_DEFAULT_INITSIZE,
+											 ALLOCSET_DEFAULT_MAXSIZE);
+	for (col = 0; col < state->ncols; col++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, col);
+
+		state->columns[col].typlen = attr->attlen;
+		state->columns[col].typbyval = attr->attbyval;
+	}
+	for (col = 0; col < sort->numCols; col++)
+	{
+		SortSupport key = &state->sort_keys[col];
+
+		key->ssup_cxt = estate->es_query_cxt;
+		key->ssup_collation = sort->collations[col];
+		key->ssup_nulls_first = sort->nullsFirst[col];
+		key->ssup_attno = sort->sortColIdx[col];
+		PrepareSortSupportFromOrderingOp(sort->sortOperators[col], key);
+	}
+	node->vector_sort_state = state;
+	MemoryContextSwitchTo(oldcontext);
+	return state;
+}
+
+static void
+VectorSortPutBatchRows(SortState *node, const VectorBatch *batch,
+					   const int *input_attnos)
+{
+	TupleTableSlot *input = node->ss.ss_ScanTupleSlot;
+	int			pos;
+
+	for (pos = 0; pos < batch->nselected; pos++)
+	{
+		int			row = VectorBatchSelectedRow(batch, pos);
+		int			col;
+
+		ExecClearTuple(input);
+		for (col = 0; col < node->ss.ps.ps_ResultTupleDesc->natts; col++)
+		{
+			int			attno = input_attnos[col];
+
+			Assert(attno >= 0 && attno < batch->ncols);
+			input->tts_values[col] = VectorBatchGetDatum(batch, attno, row);
+			input->tts_isnull[col] = VectorBatchIsNull(batch, attno, row);
+		}
+		input->tts_nvalid = node->ss.ps.ps_ResultTupleDesc->natts;
+		ExecStoreVirtualTuple(input);
+		VectorSortPutTuple(node, input);
+	}
+}
+
+static void
+VectorSortFallback(VectorSortState *state)
+{
+	SortState  *node = state->node;
+	TupleTableSlot *input = node->ss.ss_ScanTupleSlot;
+	int64		row;
+	int			col;
+
+	Assert(state->native);
+	VectorSortBegin(node);
+	for (row = 0; row < state->nrows; row++)
+	{
+		ExecClearTuple(input);
+		for (col = 0; col < state->ncols; col++)
+		{
+			input->tts_values[col] = state->columns[col].values[row];
+			input->tts_isnull[col] =
+				(state->columns[col].nulls[row / 64] &
+				 ((uint64) 1 << (row % 64))) != 0;
+		}
+		input->tts_nvalid = state->ncols;
+		ExecStoreVirtualTuple(input);
+		VectorSortPutTuple(node, input);
+	}
+	MemoryContextReset(state->values_context);
+	state->order = NULL;
+	for (col = 0; col < state->ncols; col++)
+	{
+		state->columns[col].values = NULL;
+		state->columns[col].nulls = NULL;
+	}
+	state->nrows = 0;
+	state->capacity = 0;
+	state->position = 0;
+	state->native = false;
+}
+
+static void
+VectorSortGrow(VectorSortState *state)
+{
+	int64		new_capacity = state->capacity == 0 ?
+		VECTOR_BATCH_DEFAULT_CAPACITY : Min(state->capacity * 2, (int64) INT32_MAX);
+	MemoryContext oldcontext;
+	int			col;
+
+	Assert(new_capacity > state->capacity);
+	oldcontext = MemoryContextSwitchTo(state->values_context);
+	if (state->order == NULL)
+		state->order = palloc(sizeof(int32) * new_capacity);
+	else
+		state->order = repalloc(state->order, sizeof(int32) * new_capacity);
+	for (col = 0; col < state->ncols; col++)
+	{
+		VectorSortColumn *column = &state->columns[col];
+		Size		nullsize = sizeof(uint64) * VECTOR_BATCH_NULLWORDS(new_capacity);
+
+		if (column->values == NULL)
+		{
+			column->values = palloc0(sizeof(Datum) * new_capacity);
+			column->nulls = palloc0(nullsize);
+		}
+		else
+		{
+			column->values = repalloc(column->values, sizeof(Datum) * new_capacity);
+			column->nulls = repalloc(column->nulls, nullsize);
+		}
+	}
+	state->capacity = new_capacity;
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static int
+VectorSortCompare(const void *left, const void *right, void *arg)
+{
+	VectorSortState *state = (VectorSortState *) arg;
+	int32		a = *(const int32 *) left;
+	int32		b = *(const int32 *) right;
+	Sort	   *sort = (Sort *) state->node->ss.ps.plan;
+	int			key;
+
+	for (key = 0; key < sort->numCols; key++)
+	{
+		int			col = sort->sortColIdx[key] - 1;
+		VectorSortColumn *column = &state->columns[col];
+		bool		anull = (column->nulls[a / 64] & ((uint64) 1 << (a % 64))) != 0;
+		bool		bnull = (column->nulls[b / 64] & ((uint64) 1 << (b % 64))) != 0;
+		int			cmp = ApplySortComparator(column->values[a], anull,
+										  column->values[b], bnull,
+										  &state->sort_keys[key]);
+
+		if (cmp != 0)
+			return cmp;
+	}
+	if (a < b)
+		return -1;
+	if (a > b)
+		return 1;
+	return 0;
+}
+
+void
+VectorSortPutBatch(SortState *node, const VectorBatch *batch,
+				   const int *input_attnos)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+	MemoryContext oldcontext;
+	int			pos;
+	int			col;
+
+	Assert(!node->sort_Done);
+	if (state == NULL && !node->bounded && !node->randomAccess)
+		state = VectorSortCreate(node);
+	if (state == NULL || !state->native)
+	{
+		VectorSortPutBatchRows(node, batch, input_attnos);
+		return;
+	}
+	if (state->nrows > (int64) INT32_MAX - batch->nselected)
+	{
+		VectorSortFallback(state);
+		VectorSortPutBatchRows(node, batch, input_attnos);
+		return;
+	}
+	while (state->capacity < state->nrows + batch->nselected)
+		VectorSortGrow(state);
+
+	oldcontext = MemoryContextSwitchTo(state->values_context);
+	for (pos = 0; pos < batch->nselected; pos++)
+	{
+		int			input_row = VectorBatchSelectedRow(batch, pos);
+		int64		row = state->nrows + pos;
+
+		state->order[row] = row;
+		for (col = 0; col < state->ncols; col++)
+		{
+			VectorSortColumn *column = &state->columns[col];
+			int			attno = input_attnos[col];
+			Datum		value;
+			bool		isnull;
+			uint64		mask = (uint64) 1 << (row % 64);
+
+			Assert(attno >= 0 && attno < batch->ncols);
+			isnull = VectorBatchIsNull(batch, attno, input_row);
+			value = VectorBatchGetDatum(batch, attno, input_row);
+			if (!isnull && !column->typbyval)
+				value = datumCopy(value, column->typbyval, column->typlen);
+			column->values[row] = value;
+			if (isnull)
+				column->nulls[row / 64] |= mask;
+			else
+				column->nulls[row / 64] &= ~mask;
+		}
+	}
+	state->nrows += batch->nselected;
+	MemoryContextSwitchTo(oldcontext);
+	if (MemoryContextMemAllocated(state->values_context, true) > state->mem_limit)
+		VectorSortFallback(state);
+}
+
+void
+VectorSortFinish(SortState *node)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+	Tuplesortstate *tuplesortstate;
+	ScanDirection dir = node->ss.ps.state->es_direction;
+
+	if (node->sort_Done)
+		return;
+	if (state != NULL && state->native)
+	{
+		if (state->nrows > 1)
+			qsort_arg(state->order, state->nrows, sizeof(int32),
+					  VectorSortCompare, state);
+		state->position = 0;
+		node->sort_Done = true;
+		node->bounded_Done = node->bounded;
+		node->bound_Done = node->bound;
+		return;
+	}
+	tuplesortstate = VectorSortBegin(node);
+	tuplesort_performsort(tuplesortstate);
+	node->ss.ps.state->es_direction = dir;
+	node->sort_Done = true;
+	node->bounded_Done = node->bounded;
+	node->bound_Done = node->bound;
+	if (node->shared_info && node->am_worker)
+	{
+		TuplesortInstrumentation *si;
+
+		Assert(IsParallelWorker());
+		Assert(ParallelWorkerNumber <= node->shared_info->num_workers);
+		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
+		tuplesort_get_stats(tuplesortstate, si);
+	}
+}
+
+TupleTableSlot *
+VectorSortNext(SortState *node)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+	Tuplesortstate *tuplesortstate = (Tuplesortstate *) node->tuplesortstate;
+	TupleTableSlot *slot;
+	ScanDirection dir = node->ss.ps.state->es_direction;
+
+	Assert(node->sort_Done);
+	if (state != NULL && state->native)
+	{
+		int64		position;
+		int32		row;
+		int			col;
+
+		slot = node->ss.ps.ps_ResultTupleSlot;
+		ExecClearTuple(slot);
+		if (state->position >= state->nrows)
+		{
+			if (!node->delayEagerFree)
+				ExecEagerFreeSort(node);
+			return slot;
+		}
+		position = state->position++;
+		row = ScanDirectionIsForward(dir) ? state->order[position] :
+			state->order[state->nrows - position - 1];
+		for (col = 0; col < state->ncols; col++)
+		{
+			slot->tts_values[col] = state->columns[col].values[row];
+			slot->tts_isnull[col] =
+				(state->columns[col].nulls[row / 64] &
+				 ((uint64) 1 << (row % 64))) != 0;
+		}
+		slot->tts_nvalid = state->ncols;
+		return ExecStoreVirtualTuple(slot);
+	}
+	if (tuplesortstate == NULL)
+		return NULL;
+	slot = node->ss.ps.ps_ResultTupleSlot;
+	(void) tuplesort_gettupleslot(tuplesortstate,
+								  ScanDirectionIsForward(dir), false, slot, NULL);
+	if (TupIsNull(slot) && !node->delayEagerFree)
+		ExecEagerFreeSort(node);
+	return slot;
+}
+
+bool
+VectorSortNextBatch(SortState *node, VectorBatch *batch,
+					const int *output_attnos)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+	bool		native = state != NULL && state->native;
+	bool		forward = ScanDirectionIsForward(node->ss.ps.state->es_direction);
+	int			nrows = 0;
+	int			col;
+
+	Assert(node->sort_Done);
+	VectorBatchReset(batch);
+	if (native)
+	{
+		nrows = Min(batch->capacity, state->nrows - state->position);
+		for (col = 0; col < state->ncols; col++)
+		{
+			VectorSortColumn *column = &state->columns[col];
+			int			attno = output_attnos[col];
+			int			pos;
+
+			Assert(attno >= 0 && attno < batch->ncols);
+			for (pos = 0; pos < nrows; pos++)
+			{
+				int64		position = state->position + pos;
+				int32		row = forward ? state->order[position] :
+					state->order[state->nrows - position - 1];
+
+				VectorBatchSetValue(batch, attno, pos, column->values[row],
+					(column->nulls[row / 64] & ((uint64) 1 << (row % 64))) != 0);
+			}
+		}
+		state->position += nrows;
+	}
+	else
+	{
+		while (nrows < batch->capacity)
+		{
+			TupleTableSlot *slot = VectorSortNext(node);
+
+			if (TupIsNull(slot))
+				break;
+			slot_getallattrs(slot);
+			for (col = 0; col < node->ss.ps.ps_ResultTupleDesc->natts; col++)
+			{
+				int			attno = output_attnos[col];
+				Datum		value = slot->tts_values[col];
+				bool		isnull = slot->tts_isnull[col];
+
+				Assert(attno >= 0 && attno < batch->ncols);
+				value = VectorBatchCopyDatum(batch, attno, value, isnull);
+				VectorBatchSetValue(batch, attno, nrows, value, isnull);
+			}
+			nrows++;
+		}
+	}
+	VectorBatchSetRowCount(batch, nrows);
+	if (nrows == 0 && native && !node->delayEagerFree)
+		ExecEagerFreeSort(node);
+	return nrows > 0;
+}
+
+void
+VectorSortReset(SortState *node)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+	int			col;
+
+	if (state == NULL || !state->native)
+		return;
+	MemoryContextReset(state->values_context);
+	state->order = NULL;
+	for (col = 0; col < state->ncols; col++)
+	{
+		state->columns[col].values = NULL;
+		state->columns[col].nulls = NULL;
+	}
+	state->nrows = 0;
+	state->capacity = 0;
+	state->position = 0;
+}
+
+void
+VectorSortDestroy(SortState *node)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+
+	if (state == NULL)
+		return;
+	MemoryContextDelete(state->values_context);
+	pfree(state->columns);
+	pfree(state->sort_keys);
+	pfree(state);
+	node->vector_sort_state = NULL;
+}
+
+TupleTableSlot *
+VectorSortExec(PlanState *pstate)
+{
+	return VectorSortNext(castNode(SortState, pstate));
 }

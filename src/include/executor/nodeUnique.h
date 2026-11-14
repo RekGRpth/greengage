@@ -20,4 +20,8 @@ extern UniqueState *ExecInitUnique(Unique *node, EState *estate, int eflags);
 extern void ExecEndUnique(UniqueState *node);
 extern void ExecReScanUnique(UniqueState *node);
 
+extern bool VectorUniquePlanIsSupported(Unique *node);
+extern TupleTableSlot *VectorUniqueNext(UniqueState *node,
+									 TupleTableSlot *slot);
+
 #endif							/* NODEUNIQUE_H */

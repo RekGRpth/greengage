@@ -121,6 +121,7 @@
 #include "executor/instrument.h"	/* Instrumentation */
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
+#include "executor/vectorHashJoin.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/memutils.h"
@@ -2141,4 +2142,227 @@ static inline void SaveWorkFileSetStatsInfo(HashJoinTable hashtable)
 		hashtable->workset_avg_file_size = work_set->total_bytes / work_set->num_files;
 		hashtable->workset_compression_buf_total = work_set->compression_buf_total;
 	}
+}
+
+void
+VectorHashJoinBuild(HashJoinState *node)
+{
+	HashState  *hashNode = castNode(HashState, innerPlanState(node));
+	HashJoinTable hashtable;
+
+	hashtable = ExecHashTableCreate(hashNode, node, node->hj_HashOperators,
+									node->hj_Collations,
+									HJ_FILL_INNER(node) || hashNode->hs_keepnull,
+									PlanStateOperatorMemKB((PlanState *) hashNode));
+	node->hj_HashTable = hashtable;
+	hashNode->hashtable = hashtable;
+	MultiExecHash(hashNode);
+	node->hj_HashTable = hashNode->hashtable;
+	node->hj_HashTable->nbatch_outstart = node->hj_HashTable->nbatch;
+	node->hj_InnerEmpty = node->hj_HashTable->totalTuples == 0;
+	node->hj_OuterNotEmpty = false;
+	node->hj_JoinState = HJ_NEED_NEW_OUTER;
+}
+
+static TupleTableSlot *
+VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eof)
+{
+	HashState  *hashNode = castNode(HashState, innerPlanState(node));
+	ExprState  *joinqual = node->js.joinqual;
+	ExprState  *otherqual = node->js.ps.qual;
+	ExprContext *econtext = node->js.ps.ps_ExprContext;
+	HashJoinTable hashtable = node->hj_HashTable;
+	uint32		hashvalue = 0;
+	bool		have_hash = false;
+
+	if (hashtable->curbatch == -1 && !hashtable->first_pass)
+	{
+		hashtable->curbatch = 0;
+		if (!ExecHashJoinReloadHashTable(node))
+			return NULL;
+	}
+
+	if (outer != NULL)
+	{
+		int			batchno;
+		bool		hashkeys_null = false;
+		bool		keep_nulls = HJ_FILL_OUTER(node) || node->hj_nonequijoin;
+
+		econtext->ecxt_outertuple = outer;
+		if (!have_hash &&
+			!ExecHashGetHashValue(hashNode, hashtable, econtext,
+								  node->hj_OuterHashKeys, true, keep_nulls,
+								  &hashvalue, &hashkeys_null))
+			return NULL;
+
+		node->hj_OuterNotEmpty = true;
+		node->hj_MatchedOuter = false;
+		node->hj_CurHashValue = hashvalue;
+		ExecHashGetBucketAndBatch(hashtable, hashvalue,
+								  &node->hj_CurBucketNo, &batchno);
+		node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable, hashvalue);
+		node->hj_CurTuple = NULL;
+		if (batchno != hashtable->curbatch &&
+			node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
+		{
+			bool		shouldFree;
+			MinimalTuple mintuple = ExecFetchSlotMinimalTuple(outer, &shouldFree);
+
+			ExecHashJoinSaveTuple(&node->js.ps, mintuple, hashvalue,
+								  hashtable, &hashtable->outerBatchFile[batchno],
+								  hashtable->bfCxt);
+			if (shouldFree)
+				pfree(mintuple);
+			node->hj_JoinState = HJ_NEED_NEW_OUTER;
+			return NULL;
+		}
+		node->hj_JoinState = HJ_SCAN_BUCKET;
+	}
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		switch (node->hj_JoinState)
+		{
+			case HJ_SCAN_BUCKET:
+				if (!ExecScanHashBucket(hashNode, node, econtext))
+				{
+					node->hj_JoinState = HJ_FILL_OUTER_TUPLE;
+					continue;
+				}
+				if (joinqual == NULL || ExecQual(joinqual, econtext))
+				{
+					node->hj_MatchedOuter = true;
+					HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(node->hj_CurTuple));
+					if (node->js.jointype == JOIN_ANTI)
+					{
+						node->hj_JoinState = HJ_NEED_NEW_OUTER;
+						continue;
+					}
+					if (node->js.single_match)
+						node->hj_JoinState = HJ_NEED_NEW_OUTER;
+					if (otherqual == NULL || ExecQual(otherqual, econtext))
+						return ExecProject(node->js.ps.ps_ProjInfo);
+					InstrCountFiltered2(node, 1);
+				}
+				else
+					InstrCountFiltered1(node, 1);
+				break;
+
+			case HJ_FILL_OUTER_TUPLE:
+				node->hj_JoinState = HJ_NEED_NEW_OUTER;
+				if (!node->hj_MatchedOuter && HJ_FILL_OUTER(node))
+				{
+					econtext->ecxt_innertuple = node->hj_NullInnerTupleSlot;
+					if (otherqual == NULL || ExecQual(otherqual, econtext))
+						return ExecProject(node->js.ps.ps_ProjInfo);
+					InstrCountFiltered2(node, 1);
+				}
+				break;
+
+			case HJ_FILL_INNER_TUPLES:
+				if (!ExecScanHashTableForUnmatched(node, econtext))
+				{
+					node->hj_JoinState = HJ_NEED_NEW_BATCH;
+					continue;
+				}
+				econtext->ecxt_outertuple = node->hj_NullOuterTupleSlot;
+				if (otherqual == NULL || ExecQual(otherqual, econtext))
+					return ExecProject(node->js.ps.ps_ProjInfo);
+				InstrCountFiltered2(node, 1);
+				break;
+
+			case HJ_NEED_NEW_OUTER:
+				/*
+				 * The outer plan is exhausted once outer_eof is set, but the
+				 * current batch's postponed outer tuples still need probing
+				 * before the batch file is closed by ExecHashJoinNewBatch.
+				 */
+				if (outer_eof && hashtable->curbatch > 0 &&
+					hashtable->outerBatchFile[hashtable->curbatch] != NULL)
+				{
+					outer = ExecHashJoinGetSavedTuple(node,
+											 hashtable->outerBatchFile[hashtable->curbatch],
+													  &hashvalue,
+													  node->hj_OuterTupleSlot);
+					if (outer != NULL)
+					{
+						int			batchno;
+
+						econtext->ecxt_outertuple = outer;
+						node->hj_OuterNotEmpty = true;
+						node->hj_MatchedOuter = false;
+						node->hj_CurHashValue = hashvalue;
+						ExecHashGetBucketAndBatch(hashtable, hashvalue,
+												  &node->hj_CurBucketNo, &batchno);
+						node->hj_CurSkewBucketNo =
+							ExecHashGetSkewBucket(hashtable, hashvalue);
+						node->hj_CurTuple = NULL;
+						if (batchno == hashtable->curbatch ||
+							node->hj_CurSkewBucketNo != INVALID_SKEW_BUCKET_NO)
+						{
+							node->hj_JoinState = HJ_SCAN_BUCKET;
+							continue;
+						}
+
+						/*
+						 * nbatch grew since this tuple was saved: postpone
+						 * it again and read the next one.
+						 */
+						{
+							bool	shouldFree;
+							MinimalTuple mintuple =
+								ExecFetchSlotMinimalTuple(outer, &shouldFree);
+
+							ExecHashJoinSaveTuple(&node->js.ps, mintuple, hashvalue,
+												  hashtable,
+												  &hashtable->outerBatchFile[batchno],
+												  hashtable->bfCxt);
+							if (shouldFree)
+								pfree(mintuple);
+						}
+						continue;
+					}
+				}
+				if (outer_eof && HJ_FILL_INNER(node))
+				{
+					ExecPrepHashTableForUnmatched(node);
+					node->hj_JoinState = HJ_FILL_INNER_TUPLES;
+					continue;
+				}
+				if (outer_eof)
+				{
+					node->hj_JoinState = HJ_NEED_NEW_BATCH;
+					continue;
+				}
+				return NULL;
+
+			case HJ_NEED_NEW_BATCH:
+				if (!ExecHashJoinNewBatch(node))
+					return NULL;
+				node->hj_JoinState = HJ_NEED_NEW_OUTER;
+				break;
+
+			default:
+				elog(ERROR, "vectorized hash join reached an invalid state");
+		}
+	}
+}
+
+TupleTableSlot *
+VectorHashJoinProbe(HashJoinState *node, TupleTableSlot *outer)
+{
+	return VectorHashJoinProbeEof(node, outer, false);
+}
+
+TupleTableSlot *
+VectorHashJoinProbeFinal(HashJoinState *node)
+{
+	return VectorHashJoinProbeEof(node, NULL, true);
+}
+
+bool
+VectorHashJoinNeedsNewOuter(HashJoinState *node)
+{
+	return node->hj_JoinState == HJ_NEED_NEW_OUTER;
 }

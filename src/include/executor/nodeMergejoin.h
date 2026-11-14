@@ -20,4 +20,7 @@ extern MergeJoinState *ExecInitMergeJoin(MergeJoin *node, EState *estate, int ef
 extern void ExecEndMergeJoin(MergeJoinState *node);
 extern void ExecReScanMergeJoin(MergeJoinState *node);
 
+extern bool VectorMergeJoinPlanIsSupported(MergeJoin *node);
+extern TupleTableSlot *VectorMergeJoinNext(MergeJoinState *node);
+
 #endif							/* NODEMERGEJOIN_H */

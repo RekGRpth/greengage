@@ -41,6 +41,8 @@ extern PGDLLIMPORT create_upper_paths_hook_type create_upper_paths_hook;
 extern PlannedStmt *standard_planner(Query *parse, int cursorOptions,
 									 ParamListInfo boundParams);
 
+extern PlannedStmt *VectorizePlan(PlannedStmt *stmt);
+
 extern PlannerInfo *subquery_planner(PlannerGlobal *glob, Query *parse,
 									 PlannerInfo *parent_root,
 									 bool hasRecursion, double tuple_fraction,

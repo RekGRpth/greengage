@@ -449,3 +449,45 @@ ExecReScanLimit(LimitState *node)
 	if (node->ps.lefttree->chgParam == NULL)
 		ExecReScan(node->ps.lefttree);
 }
+
+bool
+VectorLimitPlanIsSupported(Limit *limit)
+{
+	return limit->plan.qual == NIL && limit->plan.initPlan == NIL &&
+		limit->plan.extParam == NULL && limit->plan.allParam == NULL;
+}
+
+bool
+VectorLimitStart(LimitState *node)
+{
+	if (node->lstate == LIMIT_INITIAL)
+		recompute_limits(node);
+	if (node->lstate == LIMIT_RESCAN && node->count <= 0 && !node->noCount)
+		node->lstate = LIMIT_EMPTY;
+	return node->lstate == LIMIT_EMPTY || node->lstate == LIMIT_WINDOWEND ||
+		node->lstate == LIMIT_SUBPLANEOF;
+}
+
+VectorLimitResult
+VectorLimitNext(LimitState *node)
+{
+	if (node->lstate == LIMIT_RESCAN)
+	{
+		node->position++;
+		if (node->position <= node->offset)
+			return VECTOR_LIMIT_SKIP;
+		node->lstate = LIMIT_INWINDOW;
+		return VECTOR_LIMIT_EMIT;
+	}
+	if (node->lstate == LIMIT_INWINDOW)
+	{
+		if (!node->noCount && node->position - node->offset >= node->count)
+		{
+			node->lstate = LIMIT_WINDOWEND;
+			return VECTOR_LIMIT_EOF;
+		}
+		node->position++;
+		return VECTOR_LIMIT_EMIT;
+	}
+	return VECTOR_LIMIT_EOF;
+}
