@@ -419,6 +419,38 @@ VectorExprPackedInt4IsSupported(Expr *expr)
 }
 
 bool
+VectorExprPackedInt4QualIsSupported(Expr *expr)
+{
+	ListCell   *lc;
+
+	if (IsA(expr, BoolExpr))
+	{
+		foreach(lc, ((BoolExpr *) expr)->args)
+			if (!VectorExprPackedInt4QualIsSupported((Expr *) lfirst(lc)))
+				return false;
+		return true;
+	}
+	if (!IsA(expr, OpExpr))
+		return false;
+	switch (((OpExpr *) expr)->opfuncid)
+	{
+		case F_INT4EQ:
+		case F_INT4NE:
+		case F_INT4LT:
+		case F_INT4LE:
+		case F_INT4GT:
+		case F_INT4GE:
+			break;
+		default:
+			return false;
+	}
+	foreach(lc, ((OpExpr *) expr)->args)
+		if (!VectorExprPackedInt4IsSupported((Expr *) lfirst(lc)))
+			return false;
+	return true;
+}
+
+bool
 VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars)
 {
 	ListCell   *lc;

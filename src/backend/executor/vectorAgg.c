@@ -17,6 +17,7 @@
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "miscadmin.h"
+#include "parser/parsetree.h"
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/numeric.h"
@@ -122,8 +123,25 @@ VectorAggPackedInt4IsSupported(AggState *agg)
 {
 	int			transno;
 
-	if (agg->aggstrategy != AGG_PLAIN || agg->numtrans == 0)
+	if ((agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED) ||
+		agg->numtrans == 0)
 		return false;
+	if (agg->aggstrategy == AGG_HASHED)
+	{
+		Agg		   *plan = (Agg *) agg->ss.ps.plan;
+		Plan	   *outer = outerPlan(plan);
+		int			col;
+
+		for (col = 0; col < plan->numCols; col++)
+		{
+			TargetEntry *te = get_tle_by_resno(outer->targetlist,
+										  plan->grpColIdx[col]);
+
+			if (te == NULL || !IsA(te->expr, Var) ||
+				((Var *) te->expr)->vartype != INT4OID)
+				return false;
+		}
+	}
 	for (transno = 0; transno < agg->numtrans; transno++)
 	{
 		AggStatePerTrans pertrans = &agg->pertrans[transno];

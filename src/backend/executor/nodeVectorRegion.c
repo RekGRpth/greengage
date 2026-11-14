@@ -444,7 +444,9 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	}
 
 	if (state->agg != NULL && state->scan != NULL && state->append == NULL &&
-		VectorAggPackedInt4IsSupported(state->agg) && scan->plan.qual == NIL &&
+		VectorAggPackedInt4IsSupported(state->agg) &&
+		(scan->plan.qual == NIL ||
+		 VectorExprPackedInt4QualIsSupported((Expr *) scan->plan.qual)) &&
 		packed_int4_targetlist(scan->plan.targetlist))
 		state->packed_int4 = true;
 

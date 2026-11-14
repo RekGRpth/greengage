@@ -844,6 +844,22 @@ SELECT sum(a + 1) FROM vector_arithmetic_test;
 ERROR:  integer out of range
 SELECT sum(a * 2) FROM vector_arithmetic_test;
 ERROR:  integer out of range
+SELECT sum(a), avg(a) FROM vector_arithmetic_test WHERE a > 0 AND a < 100;
+ sum |         avg         
+-----+---------------------
+  12 | 12.0000000000000000
+(1 row)
+
+SELECT a, sum(a), avg(a), min(a), max(a) FROM vector_arithmetic_test
+GROUP BY a ORDER BY a NULLS LAST;
+      a      |     sum     |         avg          |     min     |     max     
+-------------+-------------+----------------------+-------------+-------------
+ -2147483648 | -2147483648 | -2147483648.00000000 | -2147483648 | -2147483648
+          12 |          12 |  12.0000000000000000 |          12 |          12
+  2147483647 |  2147483647 |  2147483647.00000000 |  2147483647 |  2147483647
+             |             |                      |             |            
+(4 rows)
+
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
  avg 
 -----

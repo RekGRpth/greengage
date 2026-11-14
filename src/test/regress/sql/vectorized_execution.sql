@@ -397,6 +397,9 @@ SELECT avg(s), avg(a), avg(b) FROM vector_arithmetic_test;
 SELECT sum(a), avg(a), min(a), max(a) FROM vector_arithmetic_test;
 SELECT sum(a + 1) FROM vector_arithmetic_test;
 SELECT sum(a * 2) FROM vector_arithmetic_test;
+SELECT sum(a), avg(a) FROM vector_arithmetic_test WHERE a > 0 AND a < 100;
+SELECT a, sum(a), avg(a), min(a), max(a) FROM vector_arithmetic_test
+GROUP BY a ORDER BY a NULLS LAST;
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
        stddev_pop(id::int2), stddev_samp(id::int2)

@@ -79,6 +79,7 @@ typedef struct VectorExprVarMap
 
 extern bool VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars);
 extern bool VectorExprPackedInt4IsSupported(Expr *expr);
+extern bool VectorExprPackedInt4QualIsSupported(Expr *expr);
 extern VectorExprState *VectorExprCompile(MemoryContext parent, Expr *expr,
 										  VectorBatch *batch,
 										  const VectorExprVarMap *vars);
