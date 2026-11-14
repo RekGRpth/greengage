@@ -882,6 +882,19 @@ GROUP BY s ORDER BY s NULLS LAST;
         |        |                     |        |       
 (4 rows)
 
+-- INT24 arithmetic: int2 left, int4 right/result and overflow behavior.
+SELECT sum(s * 2), min(s * 2), max(s * 2) FROM vector_arithmetic_test;
+ sum |  min   |  max  
+-----+--------+-------
+  22 | -65536 | 65534
+(1 row)
+
+SELECT sum(s + 2147480000) FROM vector_arithmetic_test;
+ERROR:  integer out of range
+SELECT sum(s * 100000) FROM vector_arithmetic_test;
+ERROR:  integer out of range
+SELECT sum(s / 0) FROM vector_arithmetic_test;
+ERROR:  division by zero
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
  avg 
 -----

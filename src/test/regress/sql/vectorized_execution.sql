@@ -405,6 +405,11 @@ SELECT sum(s), avg(s), min(s), max(s) FROM vector_arithmetic_test;
 SELECT sum(s), avg(s) FROM vector_arithmetic_test WHERE s > 0 AND s < 100;
 SELECT s, sum(s), avg(s), min(s), max(s) FROM vector_arithmetic_test
 GROUP BY s ORDER BY s NULLS LAST;
+-- INT24 arithmetic: int2 left, int4 right/result and overflow behavior.
+SELECT sum(s * 2), min(s * 2), max(s * 2) FROM vector_arithmetic_test;
+SELECT sum(s + 2147480000) FROM vector_arithmetic_test;
+SELECT sum(s * 100000) FROM vector_arithmetic_test;
+SELECT sum(s / 0) FROM vector_arithmetic_test;
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
        stddev_pop(id::int2), stddev_samp(id::int2)
