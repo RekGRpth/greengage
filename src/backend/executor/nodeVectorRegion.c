@@ -71,6 +71,7 @@ typedef struct VectorRegionState
 	int			output_ncols;
 	int			position;
 	bool		eof;
+	bool		packed_int4;
 	/* Per-child layout remap for a divergent Append child (NULL arrays
 	 * for children laid out like the first one). */
 	AttrNumber **append_remaps;	/* child attno (1-based) -> batch attno, or 0 */
@@ -142,6 +143,17 @@ VectorRegionCreateState(CustomScan *cscan)
 	NodeSetTag(state, T_CustomScanState);
 	state->css.methods = &vector_region_exec_methods;
 	return (Node *) state;
+}
+
+static bool
+packed_int4_targetlist(List *targetlist)
+{
+	ListCell   *lc;
+
+	foreach(lc, targetlist)
+		if (!VectorExprPackedInt4IsSupported(((TargetEntry *) lfirst(lc))->expr))
+			return false;
+	return true;
 }
 
 static void
@@ -398,7 +410,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			state->append_dstcols[i] = dstcol;
 			state->append_batches[i] = VectorBatchCreate(estate->es_query_cxt,
 														 RelationGetDescr(childrel),
-														 VECTOR_BATCH_DEFAULT_CAPACITY);
+														 VECTOR_BATCH_DEFAULT_CAPACITY,
+													 state->packed_int4);
 			if (!RelationIsAoCols(childrel))
 			{
 				Bitmapset *attrs = NULL;
@@ -429,6 +442,11 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		scan = (SeqScan *) state->scan->ss.ps.plan;
 		relation = state->scan->ss.ss_currentRelation;
 	}
+
+	if (state->agg != NULL && state->scan != NULL && state->append == NULL &&
+		VectorAggPackedInt4IsSupported(state->agg) && scan->plan.qual == NIL &&
+		packed_int4_targetlist(scan->plan.targetlist))
+		state->packed_int4 = true;
 
 	if (state->agg == NULL && state->hj == NULL)
 	{
@@ -463,7 +481,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 										 state->scan != NULL ?
 										 RelationGetDescr(relation) :
 										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
-										 VECTOR_BATCH_DEFAULT_CAPACITY);
+										 VECTOR_BATCH_DEFAULT_CAPACITY,
+										 state->packed_int4);
 		if (state->scan != NULL &&
 			(needs_row_reader || !RelationIsAoCols(relation)))
 		{
@@ -826,7 +845,7 @@ VectorRegionMaterialOuter(PlanState *pstate)
 		int			attno = state->output_attnos[col];
 
 		Assert(attno >= 0);	/* simple scan targetlist */
-		slot->tts_values[col] = state->batch->columns[attno].values[row];
+		slot->tts_values[col] = VectorBatchGetDatum(state->batch, attno, row);
 		slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
 	}
 	slot->tts_nvalid = state->output_ncols;
@@ -851,7 +870,7 @@ VectorRegionNestLoopOuter(PlanState *pstate)
 		int			attno = state->output_attnos[col];
 
 		Assert(attno >= 0);	/* simple scan targetlist */
-		slot->tts_values[col] = state->batch->columns[attno].values[row];
+		slot->tts_values[col] = VectorBatchGetDatum(state->batch, attno, row);
 		slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
 	}
 	slot->tts_nvalid = state->output_ncols;
@@ -998,7 +1017,7 @@ VectorRegionExec(CustomScanState *node)
 
 				if (attno >= 0)
 				{
-					slot->tts_values[col] = state->batch->columns[attno].values[row];
+					slot->tts_values[col] = VectorBatchGetDatum(state->batch, attno, row);
 					slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
 				}
 				else

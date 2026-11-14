@@ -12,7 +12,8 @@
 #include "utils/datum.h"
 
 VectorBatch *
-VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity)
+VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity,
+				  bool packed_int4)
 {
 	VectorBatch *batch;
 	MemoryContext oldcontext;
@@ -27,6 +28,7 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity)
 	batch = palloc0(sizeof(VectorBatch));
 	batch->ncols = tupdesc->natts;
 	batch->capacity = capacity;
+	batch->packed_int4 = packed_int4;
 	batch->columns = palloc0(sizeof(VectorColumn) * Max(batch->ncols, 1));
 	batch->selection = palloc(sizeof(int32) * capacity);
 	batch->tupdesc = tupdesc;
@@ -45,7 +47,10 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity)
 		column->typmod = attr->atttypmod;
 		column->typlen = attr->attlen;
 		column->typbyval = attr->attbyval;
-		column->values = palloc0(sizeof(Datum) * capacity);
+		if (packed_int4 && column->typid == INT4OID)
+			column->i32_values = palloc0(sizeof(int32) * capacity);
+		else
+			column->values = palloc0(sizeof(Datum) * capacity);
 		column->nulls = palloc0(sizeof(uint64) * VECTOR_BATCH_NULLWORDS(capacity));
 		if (column->typid == NUMERICOID)
 		{
@@ -74,7 +79,10 @@ VectorBatchDestroy(VectorBatch *batch)
 	MemoryContextDelete(batch->varlena_context);
 	for (col = 0; col < batch->ncols; col++)
 	{
-		pfree(batch->columns[col].values);
+		if (batch->columns[col].i32_values != NULL)
+			pfree(batch->columns[col].i32_values);
+		else
+			pfree(batch->columns[col].values);
 		pfree(batch->columns[col].nulls);
 		if (batch->columns[col].cache_mant != NULL)
 		{
@@ -122,18 +130,12 @@ VectorBatchSetValue(VectorBatch *batch, int col, int row,
 					Datum value, bool isnull)
 {
 	VectorColumn *column;
-	uint64		mask;
 
 	Assert(col >= 0 && col < batch->ncols);
 	Assert(row >= 0 && row < batch->capacity);
 
 	column = &batch->columns[col];
-	column->values[row] = value;
-	mask = (uint64) 1 << (row % 64);
-	if (isnull)
-		column->nulls[row / 64] |= mask;
-	else
-		column->nulls[row / 64] &= ~mask;
+	VectorColumnSetDatum(column, row, value, isnull);
 }
 
 /* Copy a value into storage that survives until the next batch reset. */
@@ -181,7 +183,10 @@ VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
 		if (d < 0)
 			continue;
 		dc = &dst->columns[d];
-		memcpy(dc->values, sc->values, sizeof(Datum) * src->nrows);
+		if (dc->i32_values != NULL)
+			memcpy(dc->i32_values, sc->i32_values, sizeof(int32) * src->nrows);
+		else
+			memcpy(dc->values, sc->values, sizeof(Datum) * src->nrows);
 		memcpy(dc->nulls, sc->nulls,
 			   sizeof(uint64) * VECTOR_BATCH_NULLWORDS(src->capacity));
 	}

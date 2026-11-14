@@ -731,7 +731,7 @@ VectorSortPutBatchRows(SortState *node, const VectorBatch *batch,
 			int			attno = input_attnos[col];
 
 			Assert(attno >= 0 && attno < batch->ncols);
-			input->tts_values[col] = batch->columns[attno].values[row];
+			input->tts_values[col] = VectorBatchGetDatum(batch, attno, row);
 			input->tts_isnull[col] = VectorBatchIsNull(batch, attno, row);
 		}
 		input->tts_nvalid = node->ss.ps.ps_ResultTupleDesc->natts;
@@ -883,7 +883,7 @@ VectorSortPutBatch(SortState *node, const VectorBatch *batch,
 
 			Assert(attno >= 0 && attno < batch->ncols);
 			isnull = VectorBatchIsNull(batch, attno, input_row);
-			value = batch->columns[attno].values[input_row];
+			value = VectorBatchGetDatum(batch, attno, input_row);
 			if (!isnull && !column->typbyval)
 				value = datumCopy(value, column->typbyval, column->typlen);
 			column->values[row] = value;

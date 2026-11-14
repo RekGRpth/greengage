@@ -393,6 +393,10 @@ FROM vector_arithmetic_test WHERE id = 3;
 SELECT sum(s), min(s), max(s) FROM vector_arithmetic_test;
 SELECT sum(b), min(b), max(b) FROM vector_arithmetic_test;
 SELECT avg(s), avg(a), avg(b) FROM vector_arithmetic_test;
+-- Separate packed INT4 pipeline: NULL handling, builtins and arithmetic errors.
+SELECT sum(a), avg(a), min(a), max(a) FROM vector_arithmetic_test;
+SELECT sum(a + 1) FROM vector_arithmetic_test;
+SELECT sum(a * 2) FROM vector_arithmetic_test;
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
        stddev_pop(id::int2), stddev_samp(id::int2)

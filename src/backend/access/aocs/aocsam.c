@@ -1635,7 +1635,6 @@ aocs_bulk_fill_dense(DatumStreamBlockRead *dsr, VectorColumn *column,
 	for (row = 0; row < n; row++)
 	{
 		int			idx = start + row;
-		uint64		mask = (uint64) 1 << (idx % 64);
 		Datum		value = 0;
 		bool		isnull = false;
 
@@ -1802,11 +1801,7 @@ aocs_bulk_fill_dense(DatumStreamBlockRead *dsr, VectorColumn *column,
 			}
 		}
 
-		column->values[idx] = value;
-		if (isnull)
-			column->nulls[idx / 64] |= mask;
-		else
-			column->nulls[idx / 64] &= ~mask;
+		VectorColumnSetDatum(column, idx, value, isnull);
 	}
 }
 
@@ -2016,25 +2011,26 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 			}
 
 			if (isnull)
-				column->values[idx] = (Datum) 0;
+				VectorColumnSetDatum(column, idx, (Datum) 0, true);
 			else
 			{
 				switch (datumlen)
 				{
 					case 1:
-						column->values[idx] = (Datum) *(uint8 *) (src + phys);
+						VectorColumnSetDatum(column, idx,
+							(Datum) *(uint8 *) (src + phys), false);
 						break;
 					case 2:
-						column->values[idx] = Int16GetDatum(
-							*((int16 *) (src + phys * 2)));
+						VectorColumnSetDatum(column, idx,
+							Int16GetDatum(*((int16 *) (src + phys * 2))), false);
 						break;
 					case 4:
-						column->values[idx] = Int32GetDatum(
-							*((int32 *) (src + phys * 4)));
+						VectorColumnSetDatum(column, idx,
+							Int32GetDatum(*((int32 *) (src + phys * 4))), false);
 						break;
 					default:
-						column->values[idx] = Int64GetDatum(
-							*((int64 *) (src + phys * 8)));
+						VectorColumnSetDatum(column, idx,
+							Int64GetDatum(*((int64 *) (src + phys * 8))), false);
 						break;
 				}
 				phys++;
@@ -2077,7 +2073,10 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 				uint64		smask = (uint64) 1 << (from % 64);
 				uint64		dmask = (uint64) 1 << (dst % 64);
 
-				column->values[dst] = column->values[from];
+				if (column->i32_values != NULL)
+					column->i32_values[dst] = column->i32_values[from];
+				else
+					column->values[dst] = column->values[from];
 				if (column->nulls[from / 64] & smask)
 					column->nulls[dst / 64] |= dmask;
 				else

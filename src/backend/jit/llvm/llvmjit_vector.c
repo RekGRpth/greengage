@@ -73,12 +73,23 @@ emit_node(LLVMBuilderRef b, LLVMModuleRef mod, VectorJitNode *node,
 	{
 		case VECTOR_JIT_VAR:
 			{
-				LLVMValueRef values = l_ptr_const(node->values, l_ptr(i64));
 				LLVMValueRef nulls = l_ptr_const(node->nulls, l_ptr(i64));
-				LLVMValueRef ptr = l_gep(b, i64, values, &row, 1, "");
-				LLVMValueRef datum = l_load(b, i64, ptr, "");
 
-				result.value = LLVMBuildTrunc(b, datum, i32, "");
+				if (node->i32_values != NULL)
+				{
+					LLVMValueRef values = l_ptr_const(node->i32_values, l_ptr(i32));
+					LLVMValueRef ptr = l_gep(b, i32, values, &row, 1, "");
+
+					result.value = l_load(b, i32, ptr, "");
+				}
+				else
+				{
+					LLVMValueRef values = l_ptr_const(node->values, l_ptr(i64));
+					LLVMValueRef ptr = l_gep(b, i64, values, &row, 1, "");
+					LLVMValueRef datum = l_load(b, i64, ptr, "");
+
+					result.value = LLVMBuildTrunc(b, datum, i32, "");
+				}
 				result.isnull = emit_null_bit(b, nulls, row);
 				return result;
 			}
@@ -233,12 +244,15 @@ emit_node(LLVMBuilderRef b, LLVMModuleRef mod, VectorJitNode *node,
 
 static void
 emit_result_store(LLVMBuilderRef b, LLVMValueRef out_values,
-				  LLVMValueRef out_nulls, LLVMValueRef row,
-				  JitResult result, bool deferred, LLVMValueRef expr)
+				  LLVMValueRef out_i32, LLVMValueRef out_nulls,
+				  LLVMValueRef row, JitResult result, bool deferred,
+				  bool packed, LLVMValueRef expr)
 {
 	LLVMContextRef lc = LLVMGetTypeContext(LLVMTypeOf(row));
 	LLVMTypeRef i64 = LLVMInt64TypeInContext(lc);
-	LLVMValueRef valueptr = l_gep(b, i64, out_values, &row, 1, "");
+	LLVMValueRef valueptr = !deferred && packed ?
+		l_gep(b, LLVMInt32TypeInContext(lc), out_i32, &row, 1, "") :
+		l_gep(b, i64, out_values, &row, 1, "");
 	LLVMValueRef value64 = deferred ? l_int64_const(lc, 0) :
 		LLVMBuildSExt(b, result.value, i64, "");
 	LLVMValueRef wordidx = LLVMBuildLShr(b, row, l_int32_const(lc, 6), "");
@@ -252,7 +266,10 @@ emit_result_store(LLVMBuilderRef b, LLVMValueRef out_values,
 									 LLVMBuildNot(b, bit, ""), "");
 	LLVMValueRef updated = LLVMBuildSelect(b, result.isnull, set, clear, "");
 
-	LLVMBuildStore(b, value64, valueptr);
+	if (!deferred && packed)
+		LLVMBuildStore(b, result.value, valueptr);
+	else
+		LLVMBuildStore(b, value64, valueptr);
 	LLVMBuildStore(b, updated, wordptr);
 	if (deferred)
 	{
@@ -291,6 +308,7 @@ llvm_compile_vector_expr(struct VectorExprState *state)
 	LLVMValueRef nselected;
 	LLVMValueRef gen;
 	LLVMValueRef out_values;
+	LLVMValueRef out_i32;
 	LLVMValueRef out_nulls;
 	LLVMValueRef expr;
 	LLVMValueRef batch;
@@ -347,6 +365,8 @@ llvm_compile_vector_expr(struct VectorExprState *state)
 					offsetof(VectorExprJitRuntime, gen), "gen");
 	out_values = rt_load(b, rt, l_ptr(LLVMInt64TypeInContext(lc)),
 						 offsetof(VectorExprJitRuntime, out_values), "out_values");
+	out_i32 = rt_load(b, rt, l_ptr(LLVMInt32TypeInContext(lc)),
+						 offsetof(VectorExprJitRuntime, out_i32), "out_i32");
 	out_nulls = rt_load(b, rt, l_ptr(LLVMInt64TypeInContext(lc)),
 						offsetof(VectorExprJitRuntime, out_nulls), "out_nulls");
 	expr = rt_load(b, rt, l_ptr(LLVMInt8TypeInContext(lc)),
@@ -392,7 +412,8 @@ llvm_compile_vector_expr(struct VectorExprState *state)
 	LLVMBuildBr(b, next);
 
 	LLVMPositionBuilderAtEnd(b, store);
-	emit_result_store(b, out_values, out_nulls, row, result, deferred, expr);
+	emit_result_store(b, out_values, out_i32, out_nulls, row, result, deferred,
+					  VectorExprJitPacked(state), expr);
 	LLVMBuildBr(b, next);
 
 	LLVMPositionBuilderAtEnd(b, next);

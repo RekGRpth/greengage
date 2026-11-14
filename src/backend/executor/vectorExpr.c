@@ -150,6 +150,7 @@ typedef struct VectorValue
 	int16		typlen;
 	bool		typbyval;
 	Datum	   *values;
+	int32	   *i32_values;
 	uint64	   *nulls;
 } VectorValue;
 
@@ -311,6 +312,34 @@ value_is_null(VectorValue *value, int row)
 	return (value->nulls[row / 64] & ((uint64) 1 << (row % 64))) != 0;
 }
 
+static inline Datum
+value_get(VectorValue *value, int row)
+{
+	if (value->i32_values != NULL)
+		return Int32GetDatum(value->i32_values[row]);
+	return value->values[row];
+}
+
+static inline int32
+value_get_int4(VectorValue *value, int row)
+{
+	if (value->i32_values != NULL)
+		return value->i32_values[row];
+	return DatumGetInt32(value->values[row]);
+}
+
+static inline void
+value_set_int4(VectorValue *value, int row, int32 datum, bool isnull)
+{
+	uint64		mask = (uint64) 1 << (row % 64);
+
+	value->i32_values[row] = datum;
+	if (isnull)
+		value->nulls[row / 64] |= mask;
+	else
+		value->nulls[row / 64] &= ~mask;
+}
+
 static inline void
 value_set(VectorValue *value, int row, Datum datum, bool isnull)
 {
@@ -325,14 +354,17 @@ value_set(VectorValue *value, int row, Datum datum, bool isnull)
 
 static void
 init_value(VectorValue *value, Oid typid, int32 typmod, int capacity,
-		   bool allocate)
+		   bool allocate, bool packed_int4)
 {
 	value->typid = typid;
 	value->typmod = typmod;
 	get_typlenbyval(typid, &value->typlen, &value->typbyval);
 	if (allocate)
 	{
-		value->values = palloc0(sizeof(Datum) * capacity);
+		if (packed_int4 && typid == INT4OID)
+			value->i32_values = palloc0(sizeof(int32) * capacity);
+		else
+			value->values = palloc0(sizeof(Datum) * capacity);
 		value->nulls = palloc0(sizeof(uint64) * VECTOR_BATCH_NULLWORDS(capacity));
 	}
 }
@@ -356,6 +388,34 @@ map_var_attno(Var *var, const VectorExprVarMap *vars)
 		var->varattno <= vars->outer_ncols)
 		return vars->outer_attnos[var->varattno - 1];
 	return 0;
+}
+
+bool
+VectorExprPackedInt4IsSupported(Expr *expr)
+{
+	ListCell   *lc;
+
+	if (IsA(expr, Var))
+		return ((Var *) expr)->vartype == INT4OID;
+	if (IsA(expr, Const))
+		return ((Const *) expr)->consttype == INT4OID;
+	if (!IsA(expr, OpExpr))
+		return false;
+	switch (((OpExpr *) expr)->opfuncid)
+	{
+		case F_INT4PL:
+		case F_INT4MI:
+		case F_INT4MUL:
+		case F_INT4DIV:
+		case F_INT4MOD:
+			break;
+		default:
+			return false;
+	}
+	foreach(lc, ((OpExpr *) expr)->args)
+		if (!VectorExprPackedInt4IsSupported((Expr *) lfirst(lc)))
+			return false;
+	return true;
 }
 
 bool
@@ -763,7 +823,7 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 	int			argno = 0;
 
 	step = alloc_step(VEC_FUNC, list_length(args), batch->capacity);
-	init_value(&step->value, resulttype, resulttypmod, batch->capacity, true);
+	init_value(&step->value, resulttype, resulttypmod, batch->capacity, true, batch->packed_int4);
 	fmgr_info(functionid, &step->u.func.fn);
 	step->u.func.fcinfo = palloc0(SizeForFunctionCallInfo(list_length(args)));
 	InitFunctionCallInfoData(*step->u.func.fcinfo, &step->u.func.fn,
@@ -802,7 +862,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				{
 					step = alloc_step(VEC_WHOLEVAR, 0, batch->capacity);
 					init_value(&step->value, var->vartype, var->vartypmod,
-							   batch->capacity, true);
+							   batch->capacity, true, batch->packed_int4);
 					step->u.wholevar.tupdesc = batch->tupdesc;
 					step->u.wholevar.values = palloc(sizeof(Datum) * batch->ncols);
 					step->u.wholevar.nulls = palloc(sizeof(bool) * batch->ncols);
@@ -818,6 +878,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->value.typlen = column->typlen;
 				step->value.typbyval = column->typbyval;
 				step->value.values = column->values;
+				step->value.i32_values = column->i32_values;
 				step->value.nulls = column->nulls;
 				return step;
 			}
@@ -828,9 +889,13 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 
 				step = alloc_step(VEC_CONST, 0, batch->capacity);
 				init_value(&step->value, c->consttype, c->consttypmod,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				for (row = 0; row < batch->capacity; row++)
-					value_set(&step->value, row, c->constvalue, c->constisnull);
+					if (step->value.i32_values != NULL)
+						value_set_int4(&step->value, row,
+									   DatumGetInt32(c->constvalue), c->constisnull);
+					else
+						value_set(&step->value, row, c->constvalue, c->constisnull);
 				return step;
 			}
 		case T_RelabelType:
@@ -881,7 +946,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step = alloc_step(VEC_MINMAX, list_length(mm->args),
 								  batch->capacity);
 				init_value(&step->value, mm->minmaxtype, -1,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				typentry = lookup_type_cache(mm->minmaxtype, TYPECACHE_CMP_PROC);
 				if (!OidIsValid(typentry->cmp_proc))
 					return NULL;
@@ -909,7 +974,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				if (test->argisrow)
 					return NULL;
 				step = alloc_step(VEC_NULLTEST, 1, batch->capacity);
-				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true, batch->packed_int4);
 				step->u.nulltesttype = test->nulltesttype;
 				step->args[0] = build_step(test->arg, batch, vars, case_test);
 				return step->args[0] ? step : NULL;
@@ -921,7 +986,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step = alloc_step(VEC_COALESCE, list_length(ce->args),
 								  batch->capacity);
 				init_value(&step->value, ce->coalescetype, -1,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				argno = 0;
 				foreach(lc, ce->args)
 				{
@@ -940,7 +1005,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				int			slot = 0;
 
 				step = alloc_step(VEC_CASE, 2 * nwhens + 1, batch->capacity);
-				init_value(&step->value, ce->casetype, -1, batch->capacity, true);
+				init_value(&step->value, ce->casetype, -1, batch->capacity, true, batch->packed_int4);
 				if (ce->arg != NULL)
 				{
 					step->case_operand = build_step(ce->arg, batch, vars, case_test);
@@ -983,7 +1048,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					return NULL;
 				step = alloc_step(VEC_ARRAY, nargs, batch->capacity);
 				init_value(&step->value, ae->array_typeid, -1,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				step->u.array_elems = palloc(sizeof(Datum) * Max(nargs, 1));
 				step->array_nulls = palloc(sizeof(bool) * Max(nargs, 1));
 				argno = 0;
@@ -1009,7 +1074,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				if (!OidIsValid(elemtype))
 					return NULL;
 				step = alloc_step(VEC_SAOP, 2, batch->capacity);
-				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true, batch->packed_int4);
 				get_typlenbyvalalign(elemtype, &elmlen, &elembyval, &elemalign);
 				step->u.saop.typlen = elmlen;
 				step->u.saop.typbyval = elembyval;
@@ -1042,7 +1107,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step = alloc_step(VEC_SUBSCRIPT, 1 + nupper + nlower,
 								  batch->capacity);
 				init_value(&step->value, exprType((Node *) expr), sr->reftypmod,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				step->u.subscript.attrlen = get_typlen(sr->refcontainertype);
 				get_typlenbyvalalign(sr->refelemtype,
 									 &step->u.subscript.elmlen,
@@ -1089,7 +1154,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				ConvertRowtypeExpr *ce = (ConvertRowtypeExpr *) expr;
 
 				step = alloc_step(VEC_CONVERTROWTYPE, 1, batch->capacity);
-				init_value(&step->value, ce->resulttype, -1, batch->capacity, true);
+				init_value(&step->value, ce->resulttype, -1, batch->capacity, true, batch->packed_int4);
 				step->u.convertrowtype.op = palloc0(sizeof(ExprEvalStep));
 				step->u.convertrowtype.op->resvalue = &step->u.convertrowtype.value;
 				step->u.convertrowtype.op->resnull = &step->u.convertrowtype.isnull;
@@ -1117,7 +1182,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					tupdesc = lookup_rowtype_tupdesc_copy(re->row_typeid, -1);
 				Assert(nargs <= tupdesc->natts);
 				step = alloc_step(VEC_ROW, nargs, batch->capacity);
-				init_value(&step->value, re->row_typeid, -1, batch->capacity, true);
+				init_value(&step->value, re->row_typeid, -1, batch->capacity, true, batch->packed_int4);
 				step->u.row.tupdesc = tupdesc;
 				step->u.row.nelems = Max(nargs, tupdesc->natts);
 				step->u.row.values = palloc(sizeof(Datum) * step->u.row.nelems);
@@ -1153,7 +1218,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 
 				step = alloc_step(VEC_FIELDSELECT, 1, batch->capacity);
 				init_value(&step->value, exprType((Node *) expr), -1,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				step->u.fieldselect.op = palloc0(sizeof(ExprEvalStep));
 				step->u.fieldselect.op->resvalue = &step->u.fieldselect.value;
 				step->u.fieldselect.op->resnull = &step->u.fieldselect.isnull;
@@ -1169,7 +1234,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 
 				step = alloc_step(VEC_ARRAYCOERCE, 1, batch->capacity);
 				init_value(&step->value, ac->resulttype, ac->resulttypmod,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				step->u.arraycoerce.resultelemtype = get_element_type(ac->resulttype);
 				step->u.arraycoerce.attrlen = get_typlen(ac->resulttype);
 				get_typlenbyvalalign(sourceelemtype,
@@ -1185,7 +1250,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					step->u.arraycoerce.case_step = alloc_step(VEC_CASETEST, 0,
 															 batch->capacity);
 					init_value(&step->u.arraycoerce.case_step->value,
-							   sourceelemtype, -1, batch->capacity, true);
+							   sourceelemtype, -1, batch->capacity, true, batch->packed_int4);
 					step->u.arraycoerce.elemstep = build_step(ac->elemexpr, batch, vars,
 													 step->u.arraycoerce.case_step);
 					if (step->u.arraycoerce.elemstep == NULL)
@@ -1263,7 +1328,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				}
 				step = alloc_step(VEC_SQLVALUE, 0, batch->capacity);
 				init_value(&step->value, svf->type, svf->typmod,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				for (row = 0; row < batch->capacity; row++)
 					value_set(&step->value, row, value, isnull);
 				return step;
@@ -1273,7 +1338,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				NextValueExpr *nve = (NextValueExpr *) expr;
 
 				step = alloc_step(VEC_NEXTVAL, 0, batch->capacity);
-				init_value(&step->value, nve->typeId, -1, batch->capacity, true);
+				init_value(&step->value, nve->typeId, -1, batch->capacity, true, batch->packed_int4);
 				step->u.nextval.seqid = nve->seqid;
 				step->u.nextval.seqtypid = nve->typeId;
 				return step;
@@ -1283,7 +1348,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				BooleanTest *bt = (BooleanTest *) expr;
 
 				step = alloc_step(VEC_BOOLTEST, 1, batch->capacity);
-				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true, batch->packed_int4);
 				step->u.booltesttype = bt->booltesttype;
 				step->args[0] = build_step(bt->arg, batch, vars, case_test);
 				return step->args[0] ? step : NULL;
@@ -1293,7 +1358,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				List	   *clauses = (List *) expr;
 
 				step = alloc_step(VEC_AND, list_length(clauses), batch->capacity);
-				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true, batch->packed_int4);
 				argno = 0;
 				foreach(lc, clauses)
 				{
@@ -1319,7 +1384,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					return NULL;
 
 				step = alloc_step(kind, list_length(b->args), batch->capacity);
-				init_value(&step->value, BOOLOID, -1, batch->capacity, true);
+				init_value(&step->value, BOOLOID, -1, batch->capacity, true, batch->packed_int4);
 				argno = 0;
 				foreach(lc, b->args)
 				{
@@ -1338,7 +1403,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					return NULL;
 				step = alloc_step(VEC_PARAM, 0, batch->capacity);
 				init_value(&step->value, param->paramtype, param->paramtypmod,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				step->u.param.estate = vars->estate;
 				step->u.param.paramid = param->paramid;
 				return step;
@@ -1368,7 +1433,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					 */
 					step = alloc_step(VEC_SUBPLAN, 0, batch->capacity);
 					init_value(&step->value, exprType((Node *) sp), -1,
-							   batch->capacity, true);
+							   batch->capacity, true, batch->packed_int4);
 				{
 					MemoryContext oldcontext = MemoryContextSwitchTo(
 						vars->estate->es_query_cxt);
@@ -1408,7 +1473,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					return NULL;
 				step = alloc_step(VEC_SUBPLAN, 0, batch->capacity);
 				init_value(&step->value, exprType((Node *) sp), -1,
-						   batch->capacity, true);
+						   batch->capacity, true, batch->packed_int4);
 				step->u.subplan.estate = vars->estate;
 				step->u.subplan.plan_id = sp->plan_id;
 				step->u.subplan.is_initplan = true;
@@ -1442,13 +1507,14 @@ jit_build_node(VectorExprStep *step, MemoryContext context)
 				return NULL;
 			node->kind = VECTOR_JIT_VAR;
 			node->values = step->value.values;
+			node->i32_values = step->value.i32_values;
 			node->nulls = step->value.nulls;
 			return node;
 		case VEC_CONST:
 			if (step->value.typid != INT4OID || value_is_null(&step->value, 0))
 				return NULL;
 			node->kind = VECTOR_JIT_CONST;
-			node->const_value = DatumGetInt32(step->value.values[0]);
+			node->const_value = value_get_int4(&step->value, 0);
 			return node;
 		case VEC_FUNC:
 			if (step->nargs != 2)
@@ -1515,7 +1581,7 @@ jit_build_numeric_node(VectorExprStep *step, MemoryContext context)
 			return node;
 		case VEC_CONST:
 			if (step->value.typid != NUMERICOID ||
-				!numeric_decode_fast_datum(step->value.values[0],
+				!numeric_decode_fast_datum(value_get(&step->value, 0),
 										  &node->mantissa, &scale, &dscale))
 				return NULL;
 			node->kind = VECTOR_JIT_NUMERIC_CONST;
@@ -1553,6 +1619,12 @@ EState *
 VectorExprJitEState(VectorExprState *state)
 {
 	return state->estate;
+}
+
+bool
+VectorExprJitPacked(VectorExprState *state)
+{
+	return state->root->value.i32_values != NULL;
 }
 
 void
@@ -1628,12 +1700,52 @@ numeric_compare_datums(Datum left, Datum right)
 }
 
 static void
+eval_compare_packed_int4(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		int32		l;
+		int32		r;
+		bool		result;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set(&step->value, row, (Datum) 0, true);
+			continue;
+		}
+		l = left->i32_values[row];
+		r = right->i32_values[row];
+		switch (step->u.func.compare)
+		{
+			case VEC_COMPARE_INT4_EQ: result = l == r; break;
+			case VEC_COMPARE_INT4_NE: result = l != r; break;
+			case VEC_COMPARE_INT4_LT: result = l < r; break;
+			case VEC_COMPARE_INT4_LE: result = l <= r; break;
+			case VEC_COMPARE_INT4_GT: result = l > r; break;
+			case VEC_COMPARE_INT4_GE: result = l >= r; break;
+			default: pg_unreachable();
+		}
+		value_set(&step->value, row, BoolGetDatum(result), false);
+	}
+}
+
+static void
 eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
 	VectorValue *right = &step->args[1]->value;
 	int			pos;
 
+	if (left->i32_values != NULL && right->i32_values != NULL)
+	{
+		eval_compare_packed_int4(step, selection, nselected);
+		return;
+	}
 	for (pos = 0; pos < nselected; pos++)
 	{
 		int			row = selection[pos];
@@ -2018,12 +2130,77 @@ eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 }
 
 static void
+eval_arithmetic_packed_int4(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		int32		arg1;
+		int32		arg2;
+		int32		result = 0;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set_int4(&step->value, row, 0, true);
+			continue;
+		}
+		arg1 = left->i32_values[row];
+		arg2 = right->i32_values[row];
+		switch (step->u.func.arithmetic)
+		{
+			case VEC_ARITHMETIC_INT4_ADD:
+				if (unlikely(pg_add_s32_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				break;
+			case VEC_ARITHMETIC_INT4_SUB:
+				if (unlikely(pg_sub_s32_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				break;
+			case VEC_ARITHMETIC_INT4_MUL:
+				if (unlikely(pg_mul_s32_overflow(arg1, arg2, &result)))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				break;
+			case VEC_ARITHMETIC_INT4_DIV:
+				if (unlikely(arg2 == 0))
+					ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+									errmsg("division by zero")));
+				if (unlikely(arg2 == -1 && arg1 == PG_INT32_MIN))
+					ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									errmsg("integer out of range")));
+				result = arg2 == -1 ? -arg1 : arg1 / arg2;
+				break;
+			case VEC_ARITHMETIC_INT4_MOD:
+				if (unlikely(arg2 == 0))
+					ereport(ERROR, (errcode(ERRCODE_DIVISION_BY_ZERO),
+									errmsg("division by zero")));
+				result = arg2 == -1 ? 0 : arg1 % arg2;
+				break;
+			default:
+				pg_unreachable();
+		}
+		value_set_int4(&step->value, row, result, false);
+	}
+}
+
+static void
 eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
 	VectorValue *right = &step->args[1]->value;
 	int			pos;
 
+	if (left->i32_values != NULL && right->i32_values != NULL)
+	{
+		eval_arithmetic_packed_int4(step, selection, nselected);
+		return;
+	}
 	for (pos = 0; pos < nselected; pos++)
 	{
 		int			row = selection[pos];
@@ -2722,7 +2899,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 							isnull = true;
 						else
 							step->u.subscript.upperindex[i] =
-								DatumGetInt32(step->args[1 + i]->value.values[row]);
+								value_get_int4(&step->args[1 + i]->value, row);
 					}
 					for (i = 0; i < nlower && !isnull; i++)
 					{
@@ -2732,7 +2909,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 							isnull = true;
 						else
 							step->u.subscript.lowerindex[i] =
-								DatumGetInt32(step->args[1 + nupper + i]->value.values[row]);
+								value_get_int4(&step->args[1 + nupper + i]->value, row);
 					}
 					if (isnull)
 					{
@@ -2812,7 +2989,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 
 				for (col = 0; col < batch->ncols; col++)
 				{
-					step->u.wholevar.values[col] = batch->columns[col].values[row];
+					step->u.wholevar.values[col] = VectorBatchGetDatum(batch, col, row);
 					step->u.wholevar.nulls[col] =
 						TupleDescAttr(step->u.wholevar.tupdesc, col)->attisdropped ||
 						VectorBatchIsNull(batch, col, row);
@@ -2956,7 +3133,7 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 
 						if (attno > 0)
 						{
-							slot->tts_values[col] = batch->columns[attno - 1].values[row];
+							slot->tts_values[col] = VectorBatchGetDatum(batch, attno - 1, row);
 							slot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
 						}
 						else
@@ -3046,6 +3223,7 @@ VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
 		state->jit_rt.nselected = nselected;
 		state->jit_rt.gen = batch->gen;
 		state->jit_rt.out_values = state->root->value.values;
+		state->jit_rt.out_i32 = state->root->value.i32_values;
 		state->jit_rt.out_nulls = state->root->value.nulls;
 		state->jit_rt.defer_mant = state->root->defer_mant;
 		state->jit_rt.defer_dscale = state->root->defer_dscale;
@@ -3061,7 +3239,13 @@ Datum
 VectorExprGetValue(VectorExprState *state, int row, bool *isnull)
 {
 	*isnull = value_is_null(&state->root->value, row);
-	return state->root->value.values[row];
+	return value_get(&state->root->value, row);
+}
+
+int32 *
+VectorExprRootInt4(VectorExprState *state)
+{
+	return state->root->value.i32_values;
 }
 
 /*
@@ -3175,7 +3359,7 @@ VectorExprFilter(VectorBatch *batch, VectorExprState *state)
 		int			row = batch->selection[pos];
 
 		if (!value_is_null(&state->root->value, row) &&
-			DatumGetBool(state->root->value.values[row]))
+			DatumGetBool(value_get(&state->root->value, row)))
 			batch->selection[write++] = row;
 	}
 	batch->nselected = write;

@@ -33,6 +33,7 @@ typedef struct VectorJitNode
 	struct VectorJitNode *left;
 	struct VectorJitNode *right;
 	Datum	   *values;
+	int32	   *i32_values;
 	uint64	   *nulls;
 	int32		const_value;
 	struct VectorExprStep *step;
@@ -49,6 +50,7 @@ typedef struct VectorExprJitRuntime
 	int			nselected;
 	uint32		gen;
 	Datum	   *out_values;
+	int32	   *out_i32;
 	uint64	   *out_nulls;
 	int64	   *defer_mant;
 	int16	   *defer_dscale;
@@ -76,6 +78,7 @@ typedef struct VectorExprVarMap
 } VectorExprVarMap;
 
 extern bool VectorExprIsSupported(Expr *expr, const VectorExprVarMap *vars);
+extern bool VectorExprPackedInt4IsSupported(Expr *expr);
 extern VectorExprState *VectorExprCompile(MemoryContext parent, Expr *expr,
 										  VectorBatch *batch,
 										  const VectorExprVarMap *vars);
@@ -86,12 +89,14 @@ extern void VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
 extern Datum VectorExprGetValue(VectorExprState *state, int row, bool *isnull);
 extern void VectorExprRootValue(VectorExprState *state, Datum **values,
 								uint64 **null_words);
+extern int32 *VectorExprRootInt4(VectorExprState *state);
 extern bool VectorExprDeferNumericResult(VectorExprState *state);
 extern bool VectorExprGetDeferredNumeric(VectorExprState *state, int row,
 										 int64 *mant, int *dscale);
 extern void VectorExprFilter(VectorBatch *batch, VectorExprState *state);
 extern VectorJitNode *VectorExprJitGetTree(VectorExprState *state);
 extern EState *VectorExprJitEState(VectorExprState *state);
+extern bool VectorExprJitPacked(VectorExprState *state);
 extern void VectorExprEvalRowFallback(VectorExprState *state,
 									  VectorBatch *batch, int32 row);
 extern bool VectorExprNumericArgDecode(struct VectorExprStep *arg, int row,

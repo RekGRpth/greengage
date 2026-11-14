@@ -116,7 +116,7 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 	{
 		AttrNumber	attno = state->outer_attnos[col];
 
-		outer->tts_values[col] = batch->columns[attno - 1].values[row];
+		outer->tts_values[col] = VectorBatchGetDatum(batch, attno - 1, row);
 		outer->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
 	}
 	outer->tts_nvalid = state->outer_ncols;

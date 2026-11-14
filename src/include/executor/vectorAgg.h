@@ -14,6 +14,7 @@
 typedef struct VectorAggState VectorAggState;
 
 extern bool VectorAggPlanIsSupported(Agg *agg);
+extern bool VectorAggPackedInt4IsSupported(AggState *agg);
 extern VectorAggState *VectorAggCreate(MemoryContext parent, AggState *agg,
 									   VectorBatch *batch);
 extern void VectorAggDestroy(VectorAggState *state);

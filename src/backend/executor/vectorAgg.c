@@ -78,6 +78,7 @@ typedef enum VectorAggBuiltin
 struct VectorAggState
 {
 	MemoryContext context;
+	bool		packed_int4;
 	AggState   *agg;
 	VectorExprVarMap vars;
 	VectorExprState ***args;
@@ -86,6 +87,7 @@ struct VectorAggState
 	Datum	  **filter_values;	/* per transno: root arrays of the filter */
 	uint64	 **filter_nulls;
 	Datum	 ***arg_values;		/* per transno/argno: root value arrays */
+	int32	  ***arg_i32;		/* packed INT4 root, when present */
 	uint64	***arg_nulls;
 	int32	   *filtered_selection;
 	Datum	  **values;
@@ -114,6 +116,36 @@ struct VectorAggState
 	Tuplesortstate **phase_sorts;	/* per phase >= 2: next-phase sort input */
 	Tuplestorestate **phase_stores;	/* plain phases need no ordering */
 };
+
+bool
+VectorAggPackedInt4IsSupported(AggState *agg)
+{
+	int			transno;
+
+	if (agg->aggstrategy != AGG_PLAIN || agg->numtrans == 0)
+		return false;
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &agg->pertrans[transno];
+		Oid			fnoid = pertrans->aggref->aggfnoid;
+
+		if (pertrans->numSortCols != 0 || pertrans->aggref->aggfilter != NULL ||
+			pertrans->aggref->aggdistinct)
+			return false;
+		if (fnoid != VEC_AGG_SUM_INT4 && fnoid != VEC_AGG_AVG_INT4 &&
+			fnoid != VEC_AGG_MIN_INT4 && fnoid != VEC_AGG_MAX_INT4)
+			return false;
+		{
+			ListCell   *lc;
+
+			foreach(lc, pertrans->aggref->args)
+				if (!VectorExprPackedInt4IsSupported(
+					((TargetEntry *) lfirst(lc))->expr))
+					return false;
+		}
+	}
+	return true;
+}
 
 static bool
 build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
@@ -482,6 +514,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 										 ALLOCSET_DEFAULT_INITSIZE,
 										 ALLOCSET_DEFAULT_MAXSIZE);
 	state->agg = agg;
+	state->packed_int4 = batch->packed_int4;
 	oldcontext = MemoryContextSwitchTo(state->context);
 	if (!build_var_map((Agg *) agg->ss.ps.plan, state->context, &state->vars))
 	{
@@ -498,6 +531,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 	state->filter_values = palloc0(sizeof(Datum *) * agg->numtrans);
 	state->filter_nulls = palloc0(sizeof(uint64 *) * agg->numtrans);
 	state->arg_values = palloc0(sizeof(Datum **) * agg->numtrans);
+	state->arg_i32 = palloc0(sizeof(int32 **) * agg->numtrans);
 	state->arg_nulls = palloc0(sizeof(uint64 **) * agg->numtrans);
 	state->filtered_selection = palloc(sizeof(int32) * batch->capacity);
 	state->values = palloc0(sizeof(Datum *) * agg->numtrans);
@@ -511,6 +545,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 
 		state->args[transno] = palloc0(sizeof(VectorExprState *) * Max(nargs, 1));
 		state->arg_values[transno] = palloc0(sizeof(Datum *) * Max(nargs, 1));
+		state->arg_i32[transno] = palloc0(sizeof(int32 *) * Max(nargs, 1));
 		state->arg_nulls[transno] = palloc0(sizeof(uint64 *) * Max(nargs, 1));
 		state->values[transno] = palloc(sizeof(Datum) * Max(nargs, 1));
 		state->nulls[transno] = palloc(sizeof(bool) * Max(nargs, 1));
@@ -667,6 +702,8 @@ eval_arguments(VectorAggState *state, VectorBatch *batch)
 			VectorExprRootValue(state->args[transno][argno],
 								&state->arg_values[transno][argno],
 								&state->arg_nulls[transno][argno]);
+			state->arg_i32[transno][argno] =
+				VectorExprRootInt4(state->args[transno][argno]);
 		}
 	}
 }
@@ -683,7 +720,7 @@ fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
 	{
 		AttrNumber	attno = state->vars.outer_attnos[col];
 
-		slot->tts_values[col] = batch->columns[attno - 1].values[row];
+		slot->tts_values[col] = VectorBatchGetDatum(batch, attno - 1, row);
 		slot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
 	}
 	ExecStoreVirtualTuple(slot);
@@ -722,7 +759,7 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 
 			if (isnull != state->group_key_nulls[col] ||
 				(!isnull &&
-				 !datumIsEqual(state->group_keys[col], column->values[row],
+				 !datumIsEqual(state->group_keys[col], VectorColumnGetDatum(column, row),
 							   column->typbyval, column->typlen)))
 			{
 				hit = false;
@@ -739,7 +776,7 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 		int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
 		AttrNumber	attno = state->vars.outer_attnos[inputcol];
 
-		hashslot->tts_values[col] = batch->columns[attno - 1].values[row];
+		hashslot->tts_values[col] = VectorBatchGetDatum(batch, attno - 1, row);
 		hashslot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
 	}
 	ExecStoreVirtualTuple(hashslot);
@@ -806,7 +843,7 @@ lookup_group_mixed(VectorAggState *state, VectorBatch *batch, int row,
 		int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
 		AttrNumber	attno = state->vars.outer_attnos[inputcol];
 
-		hashslot->tts_values[col] = batch->columns[attno - 1].values[row];
+		hashslot->tts_values[col] = VectorBatchGetDatum(batch, attno - 1, row);
 		hashslot->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
 	}
 	ExecStoreVirtualTuple(hashslot);
@@ -1128,10 +1165,69 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 }
 
 static void
+advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
+{
+	AggState   *agg = state->agg;
+	int			transno;
+
+	for (transno = 0; transno < agg->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &agg->pertrans[transno];
+		AggStatePerGroup pergroupstate = &pergroup[transno];
+		int32		value;
+
+		if ((state->arg_nulls[transno][0][row / 64] >> (row % 64)) & 1)
+			continue;
+		value = state->arg_i32[transno][0][row];
+		switch (pertrans->aggref->aggfnoid)
+		{
+			case VEC_AGG_AVG_INT4:
+			{
+				Int8TransTypeData *transdata;
+
+				Assert(!pergroupstate->transValueIsNull);
+				transdata = (Int8TransTypeData *)
+					ARR_DATA_PTR((ArrayType *) DatumGetPointer(pergroupstate->transValue));
+				transdata->count++;
+				transdata->sum += value;
+				break;
+			}
+			case VEC_AGG_SUM_INT4:
+				pergroupstate->transValue += value;
+				pergroupstate->noTransValue = false;
+				pergroupstate->transValueIsNull = false;
+				break;
+			case VEC_AGG_MAX_INT4:
+				if (pergroupstate->noTransValue ||
+					DatumGetInt32(pergroupstate->transValue) < value)
+					pergroupstate->transValue = Int32GetDatum(value);
+				pergroupstate->noTransValue = false;
+				pergroupstate->transValueIsNull = false;
+				break;
+			case VEC_AGG_MIN_INT4:
+				if (pergroupstate->noTransValue ||
+					DatumGetInt32(pergroupstate->transValue) > value)
+					pergroupstate->transValue = Int32GetDatum(value);
+				pergroupstate->noTransValue = false;
+				pergroupstate->transValueIsNull = false;
+				break;
+			default:
+				pg_unreachable();
+		}
+	}
+}
+
+static void
 advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 {
 	AggState   *agg = state->agg;
 	int			transno;
+
+	if (state->packed_int4)
+	{
+		advance_packed_row(state, pergroup, row);
+		return;
+	}
 
 	for (transno = 0; transno < agg->numtrans; transno++)
 	{

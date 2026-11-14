@@ -26,6 +26,7 @@ typedef struct VectorColumn
 	int16		typlen;
 	bool		typbyval;
 	Datum	   *values;
+	int32	   *i32_values;	/* packed storage when typid == INT4OID */
 	uint64	   *nulls;
 
 	/*
@@ -50,12 +51,14 @@ typedef struct VectorBatch
 	uint32		gen;		/* batch generation, bumped on every reset */
 	VectorColumn *columns;
 	int32	   *selection;
+	bool		packed_int4;
 	TupleDesc	tupdesc;
 	MemoryContext varlena_context;
 } VectorBatch;
 
 extern VectorBatch *VectorBatchCreate(MemoryContext parent,
-									  TupleDesc tupdesc, int capacity);
+									  TupleDesc tupdesc, int capacity,
+									  bool packed_int4);
 extern void VectorBatchDestroy(VectorBatch *batch);
 extern void VectorBatchReset(VectorBatch *batch);
 extern void VectorBatchSetRowCount(VectorBatch *batch, int nrows);
@@ -65,6 +68,35 @@ extern Datum VectorBatchCopyDatum(VectorBatch *batch, int col, Datum value,
 								  bool isnull);
 extern void VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
 								   const int *dstcol);
+
+static inline Datum
+VectorColumnGetDatum(const VectorColumn *column, int row)
+{
+	if (column->i32_values != NULL)
+		return Int32GetDatum(column->i32_values[row]);
+	return column->values[row];
+}
+
+static inline void
+VectorColumnSetDatum(VectorColumn *column, int row, Datum value, bool isnull)
+{
+	uint64		mask = (uint64) 1 << (row % 64);
+
+	if (column->i32_values != NULL)
+		column->i32_values[row] = DatumGetInt32(value);
+	else
+		column->values[row] = value;
+	if (isnull)
+		column->nulls[row / 64] |= mask;
+	else
+		column->nulls[row / 64] &= ~mask;
+}
+
+static inline Datum
+VectorBatchGetDatum(const VectorBatch *batch, int col, int row)
+{
+	return VectorColumnGetDatum(&batch->columns[col], row);
+}
 
 static inline bool
 VectorBatchIsNull(const VectorBatch *batch, int col, int row)
