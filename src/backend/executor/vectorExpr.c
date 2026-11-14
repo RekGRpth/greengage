@@ -73,6 +73,12 @@ typedef enum VectorExprKind
 typedef enum VectorCompareOp
 {
 	VEC_COMPARE_NONE,
+	VEC_COMPARE_INT2_EQ,
+	VEC_COMPARE_INT2_NE,
+	VEC_COMPARE_INT2_LT,
+	VEC_COMPARE_INT2_LE,
+	VEC_COMPARE_INT2_GT,
+	VEC_COMPARE_INT2_GE,
 	VEC_COMPARE_INT4_EQ,
 	VEC_COMPARE_INT4_NE,
 	VEC_COMPARE_INT4_LT,
@@ -151,6 +157,7 @@ typedef struct VectorValue
 	bool		typbyval;
 	Datum	   *values;
 	int32	   *i32_values;
+	int16	   *i16_values;
 	uint64	   *nulls;
 } VectorValue;
 
@@ -315,6 +322,8 @@ value_is_null(VectorValue *value, int row)
 static inline Datum
 value_get(VectorValue *value, int row)
 {
+	if (value->i16_values != NULL)
+		return Int16GetDatum(value->i16_values[row]);
 	if (value->i32_values != NULL)
 	{
 		if (value->typid == FLOAT4OID)
@@ -336,6 +345,18 @@ value_get_int4(VectorValue *value, int row)
 	if (value->i32_values != NULL)
 		return value->i32_values[row];
 	return DatumGetInt32(value->values[row]);
+}
+
+static inline void
+value_set_int2(VectorValue *value, int row, int16 datum, bool isnull)
+{
+	uint64		mask = (uint64) 1 << (row % 64);
+
+	value->i16_values[row] = datum;
+	if (isnull)
+		value->nulls[row / 64] |= mask;
+	else
+		value->nulls[row / 64] &= ~mask;
 }
 
 static inline void
@@ -385,7 +406,9 @@ init_value(VectorValue *value, Oid typid, int32 typmod, int capacity,
 	get_typlenbyval(typid, &value->typlen, &value->typbyval);
 	if (allocate)
 	{
-		if (packed_i32 && (typid == INT4OID || typid == DATEOID ||
+		if (packed_i32 && typid == INT2OID)
+			value->i16_values = palloc0(sizeof(int16) * capacity);
+		else if (packed_i32 && (typid == INT4OID || typid == DATEOID ||
 						   typid == FLOAT4OID))
 			value->i32_values = palloc0(sizeof(int32) * capacity);
 		else
@@ -421,11 +444,13 @@ VectorExprPackedI32IsSupported(Expr *expr)
 	ListCell   *lc;
 
 	if (IsA(expr, Var))
-		return ((Var *) expr)->vartype == INT4OID ||
+		return ((Var *) expr)->vartype == INT2OID ||
+			((Var *) expr)->vartype == INT4OID ||
 			((Var *) expr)->vartype == DATEOID ||
 			((Var *) expr)->vartype == FLOAT4OID;
 	if (IsA(expr, Const))
-		return ((Const *) expr)->consttype == INT4OID ||
+		return ((Const *) expr)->consttype == INT2OID ||
+			((Const *) expr)->consttype == INT4OID ||
 			((Const *) expr)->consttype == DATEOID ||
 			((Const *) expr)->consttype == FLOAT4OID;
 	if (!IsA(expr, OpExpr))
@@ -467,6 +492,12 @@ VectorExprPackedI32QualIsSupported(Expr *expr)
 		return false;
 	switch (((OpExpr *) expr)->opfuncid)
 	{
+		case F_INT2EQ:
+		case F_INT2NE:
+		case F_INT2LT:
+		case F_INT2LE:
+		case F_INT2GT:
+		case F_INT2GE:
 		case F_INT4EQ:
 		case F_INT4NE:
 		case F_INT4LT:
@@ -737,6 +768,18 @@ vector_compare_op(Oid functionid)
 {
 	switch (functionid)
 	{
+		case F_INT2EQ:
+			return VEC_COMPARE_INT2_EQ;
+		case F_INT2NE:
+			return VEC_COMPARE_INT2_NE;
+		case F_INT2LT:
+			return VEC_COMPARE_INT2_LT;
+		case F_INT2LE:
+			return VEC_COMPARE_INT2_LE;
+		case F_INT2GT:
+			return VEC_COMPARE_INT2_GT;
+		case F_INT2GE:
+			return VEC_COMPARE_INT2_GE;
 		case F_INT4EQ:
 			return VEC_COMPARE_INT4_EQ;
 		case F_INT4NE:
@@ -956,6 +999,7 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->value.typbyval = column->typbyval;
 				step->value.values = column->values;
 				step->value.i32_values = column->i32_values;
+				step->value.i16_values = column->i16_values;
 				step->value.nulls = column->nulls;
 				return step;
 			}
@@ -968,7 +1012,10 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				init_value(&step->value, c->consttype, c->consttypmod,
 						   batch->capacity, true, batch->packed_i32);
 				for (row = 0; row < batch->capacity; row++)
-					if (step->value.i32_values != NULL)
+					if (step->value.i16_values != NULL)
+						value_set_int2(&step->value, row,
+									   DatumGetInt16(c->constvalue), c->constisnull);
+					else if (step->value.i32_values != NULL)
 						value_set_int4(&step->value, row,
 									   DatumGetInt32(c->constvalue), c->constisnull);
 					else
@@ -1777,6 +1824,41 @@ numeric_compare_datums(Datum left, Datum right)
 }
 
 static void
+eval_compare_packed_int2(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		int16		l;
+		int16		r;
+		bool		result;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set(&step->value, row, (Datum) 0, true);
+			continue;
+		}
+		l = left->i16_values[row];
+		r = right->i16_values[row];
+		switch (step->u.func.compare)
+		{
+			case VEC_COMPARE_INT2_EQ: result = l == r; break;
+			case VEC_COMPARE_INT2_NE: result = l != r; break;
+			case VEC_COMPARE_INT2_LT: result = l < r; break;
+			case VEC_COMPARE_INT2_LE: result = l <= r; break;
+			case VEC_COMPARE_INT2_GT: result = l > r; break;
+			case VEC_COMPARE_INT2_GE: result = l >= r; break;
+			default: pg_unreachable();
+		}
+		value_set(&step->value, row, BoolGetDatum(result), false);
+	}
+}
+
+static void
 eval_compare_packed_float4(VectorExprStep *step, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
@@ -1865,9 +1947,13 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 	VectorValue *right = &step->args[1]->value;
 	int			pos;
 
-	if (left->i32_values != NULL && right->i32_values != NULL)
+	if ((left->i32_values != NULL && right->i32_values != NULL) ||
+		(left->i16_values != NULL && right->i16_values != NULL))
 	{
-		if (step->u.func.compare >= VEC_COMPARE_FLOAT4_EQ &&
+		if (step->u.func.compare >= VEC_COMPARE_INT2_EQ &&
+			step->u.func.compare <= VEC_COMPARE_INT2_GE)
+			eval_compare_packed_int2(step, selection, nselected);
+		else if (step->u.func.compare >= VEC_COMPARE_FLOAT4_EQ &&
 			step->u.func.compare <= VEC_COMPARE_FLOAT4_GE)
 			eval_compare_packed_float4(step, selection, nselected);
 		else
@@ -1887,6 +1973,24 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 
 		switch (step->u.func.compare)
 		{
+			case VEC_COMPARE_INT2_EQ:
+				result = DatumGetInt16(left->values[row]) == DatumGetInt16(right->values[row]);
+				break;
+			case VEC_COMPARE_INT2_NE:
+				result = DatumGetInt16(left->values[row]) != DatumGetInt16(right->values[row]);
+				break;
+			case VEC_COMPARE_INT2_LT:
+				result = DatumGetInt16(left->values[row]) < DatumGetInt16(right->values[row]);
+				break;
+			case VEC_COMPARE_INT2_LE:
+				result = DatumGetInt16(left->values[row]) <= DatumGetInt16(right->values[row]);
+				break;
+			case VEC_COMPARE_INT2_GT:
+				result = DatumGetInt16(left->values[row]) > DatumGetInt16(right->values[row]);
+				break;
+			case VEC_COMPARE_INT2_GE:
+				result = DatumGetInt16(left->values[row]) >= DatumGetInt16(right->values[row]);
+				break;
 			case VEC_COMPARE_INT4_EQ:
 				result = DatumGetInt32(left->values[row]) == DatumGetInt32(right->values[row]);
 				break;
@@ -3415,6 +3519,12 @@ int32 *
 VectorExprRootInt4(VectorExprState *state)
 {
 	return state->root->value.i32_values;
+}
+
+int16 *
+VectorExprRootInt2(VectorExprState *state)
+{
+	return state->root->value.i16_values;
 }
 
 /*

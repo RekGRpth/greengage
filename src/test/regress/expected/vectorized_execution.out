@@ -859,6 +859,29 @@ GROUP BY a ORDER BY a NULLS LAST;
              |             |                      |             |            
 (4 rows)
 
+-- Packed INT2: no arithmetic, only comparisons, builtins and grouping.
+SELECT sum(s), avg(s), min(s), max(s) FROM vector_arithmetic_test;
+ sum |        avg         |  min   |  max  
+-----+--------------------+--------+-------
+  11 | 3.6666666666666667 | -32768 | 32767
+(1 row)
+
+SELECT sum(s), avg(s) FROM vector_arithmetic_test WHERE s > 0 AND s < 100;
+ sum |         avg         
+-----+---------------------
+  12 | 12.0000000000000000
+(1 row)
+
+SELECT s, sum(s), avg(s), min(s), max(s) FROM vector_arithmetic_test
+GROUP BY s ORDER BY s NULLS LAST;
+   s    |  sum   |         avg         |  min   |  max   
+--------+--------+---------------------+--------+--------
+ -32768 | -32768 | -32768.000000000000 | -32768 | -32768
+     12 |     12 | 12.0000000000000000 |     12 |     12
+  32767 |  32767 |  32767.000000000000 |  32767 |  32767
+        |        |                     |        |       
+(4 rows)
+
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
  avg 
 -----

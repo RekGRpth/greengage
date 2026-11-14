@@ -47,7 +47,9 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity,
 		column->typmod = attr->atttypmod;
 		column->typlen = attr->attlen;
 		column->typbyval = attr->attbyval;
-		if (packed_i32 &&
+		if (packed_i32 && column->typid == INT2OID)
+			column->i16_values = palloc0(sizeof(int16) * capacity);
+		else if (packed_i32 &&
 			(column->typid == INT4OID || column->typid == DATEOID ||
 			 column->typid == FLOAT4OID))
 			column->i32_values = palloc0(sizeof(int32) * capacity);
@@ -81,7 +83,9 @@ VectorBatchDestroy(VectorBatch *batch)
 	MemoryContextDelete(batch->varlena_context);
 	for (col = 0; col < batch->ncols; col++)
 	{
-		if (batch->columns[col].i32_values != NULL)
+		if (batch->columns[col].i16_values != NULL)
+			pfree(batch->columns[col].i16_values);
+		else if (batch->columns[col].i32_values != NULL)
 			pfree(batch->columns[col].i32_values);
 		else
 			pfree(batch->columns[col].values);
@@ -185,7 +189,9 @@ VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
 		if (d < 0)
 			continue;
 		dc = &dst->columns[d];
-		if (dc->i32_values != NULL)
+		if (dc->i16_values != NULL)
+			memcpy(dc->i16_values, sc->i16_values, sizeof(int16) * src->nrows);
+		else if (dc->i32_values != NULL)
 			memcpy(dc->i32_values, sc->i32_values, sizeof(int32) * src->nrows);
 		else
 			memcpy(dc->values, sc->values, sizeof(Datum) * src->nrows);

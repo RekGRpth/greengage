@@ -400,6 +400,11 @@ SELECT sum(a * 2) FROM vector_arithmetic_test;
 SELECT sum(a), avg(a) FROM vector_arithmetic_test WHERE a > 0 AND a < 100;
 SELECT a, sum(a), avg(a), min(a), max(a) FROM vector_arithmetic_test
 GROUP BY a ORDER BY a NULLS LAST;
+-- Packed INT2: no arithmetic, only comparisons, builtins and grouping.
+SELECT sum(s), avg(s), min(s), max(s) FROM vector_arithmetic_test;
+SELECT sum(s), avg(s) FROM vector_arithmetic_test WHERE s > 0 AND s < 100;
+SELECT s, sum(s), avg(s), min(s), max(s) FROM vector_arithmetic_test
+GROUP BY s ORDER BY s NULLS LAST;
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
        stddev_pop(id::int2), stddev_samp(id::int2)

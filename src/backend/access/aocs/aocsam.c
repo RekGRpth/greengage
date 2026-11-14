@@ -2073,7 +2073,9 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 				uint64		smask = (uint64) 1 << (from % 64);
 				uint64		dmask = (uint64) 1 << (dst % 64);
 
-				if (column->i32_values != NULL)
+				if (column->i16_values != NULL)
+					column->i16_values[dst] = column->i16_values[from];
+				else if (column->i32_values != NULL)
 					column->i32_values[dst] = column->i32_values[from];
 				else
 					column->values[dst] = column->values[from];

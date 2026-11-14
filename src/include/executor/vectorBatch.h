@@ -28,7 +28,8 @@ typedef struct VectorColumn
 	int16		typlen;
 	bool		typbyval;
 	Datum	   *values;
-	int32	   *i32_values;	/* packed storage when typid == INT4OID */
+	int32	   *i32_values;	/* packed storage for INT4/DATE/FLOAT4 */
+	int16	   *i16_values;	/* packed storage for INT2 */
 	uint64	   *nulls;
 
 	/*
@@ -74,6 +75,8 @@ extern void VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
 static inline Datum
 VectorColumnGetDatum(const VectorColumn *column, int row)
 {
+	if (column->i16_values != NULL)
+		return Int16GetDatum(column->i16_values[row]);
 	if (column->i32_values != NULL)
 	{
 		if (column->typid == FLOAT4OID)
@@ -94,7 +97,9 @@ VectorColumnSetDatum(VectorColumn *column, int row, Datum value, bool isnull)
 {
 	uint64		mask = (uint64) 1 << (row % 64);
 
-	if (column->i32_values != NULL)
+	if (column->i16_values != NULL)
+		column->i16_values[row] = DatumGetInt16(value);
+	else if (column->i32_values != NULL)
 	{
 		if (column->typid == FLOAT4OID)
 		{
