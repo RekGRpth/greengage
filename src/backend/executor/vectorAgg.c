@@ -139,7 +139,8 @@ VectorAggPackedI32IsSupported(AggState *agg)
 
 			if (te == NULL || !IsA(te->expr, Var) ||
 				(((Var *) te->expr)->vartype != INT4OID &&
-				 ((Var *) te->expr)->vartype != DATEOID))
+				 ((Var *) te->expr)->vartype != DATEOID &&
+				 ((Var *) te->expr)->vartype != FLOAT4OID))
 				return false;
 		}
 	}
@@ -153,7 +154,9 @@ VectorAggPackedI32IsSupported(AggState *agg)
 			return false;
 		if (fnoid != VEC_AGG_SUM_INT4 && fnoid != VEC_AGG_AVG_INT4 &&
 			fnoid != VEC_AGG_MIN_INT4 && fnoid != VEC_AGG_MAX_INT4 &&
-			fnoid != VEC_AGG_MIN_DATE && fnoid != VEC_AGG_MAX_DATE)
+			fnoid != VEC_AGG_MIN_DATE && fnoid != VEC_AGG_MAX_DATE &&
+			fnoid != VEC_AGG_SUM_FLOAT4 && fnoid != VEC_AGG_MIN_FLOAT4 &&
+			fnoid != VEC_AGG_MAX_FLOAT4)
 			return false;
 		{
 			ListCell   *lc;
@@ -1184,6 +1187,16 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 	}
 }
 
+static inline float4
+packed_float4(int32 value)
+{
+	uint32		bits = (uint32) value;
+	float4		result;
+
+	memcpy(&result, &bits, sizeof(result));
+	return result;
+}
+
 static void
 advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 {
@@ -1230,6 +1243,35 @@ advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 				if (pergroupstate->noTransValue ||
 					DatumGetInt32(pergroupstate->transValue) > value)
 					pergroupstate->transValue = Int32GetDatum(value);
+				pergroupstate->noTransValue = false;
+				pergroupstate->transValueIsNull = false;
+				break;
+			case VEC_AGG_SUM_FLOAT4:
+			{
+				float4		input = packed_float4(value);
+
+				if (pergroupstate->noTransValue)
+					pergroupstate->transValue = Float8GetDatum((float8) input);
+				else
+					pergroupstate->transValue = Float8GetDatum(
+						DatumGetFloat8(pergroupstate->transValue) + (float8) input);
+				pergroupstate->noTransValue = false;
+				pergroupstate->transValueIsNull = false;
+				break;
+			}
+			case VEC_AGG_MAX_FLOAT4:
+				if (pergroupstate->noTransValue ||
+					float4_cmp_internal(DatumGetFloat4(pergroupstate->transValue),
+						packed_float4(value)) < 0)
+					pergroupstate->transValue = Float4GetDatum(packed_float4(value));
+				pergroupstate->noTransValue = false;
+				pergroupstate->transValueIsNull = false;
+				break;
+			case VEC_AGG_MIN_FLOAT4:
+				if (pergroupstate->noTransValue ||
+					float4_cmp_internal(DatumGetFloat4(pergroupstate->transValue),
+						packed_float4(value)) > 0)
+					pergroupstate->transValue = Float4GetDatum(packed_float4(value));
 				pergroupstate->noTransValue = false;
 				pergroupstate->transValueIsNull = false;
 				break;

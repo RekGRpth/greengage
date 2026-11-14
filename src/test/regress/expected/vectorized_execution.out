@@ -1059,6 +1059,32 @@ FROM vector_float_test WHERE id BETWEEN 2 AND 5;
  NaN | Infinity
 (1 row)
 
+-- Packed FLOAT4: arithmetic, NaN/Inf/-0 comparisons and hashed grouping.
+SELECT sum(f4 * 2), min(f4), max(f4) FROM vector_float_test;
+ sum |    min    | max 
+-----+-----------+-----
+ NaN | -Infinity | NaN
+(1 row)
+
+SELECT sum(f4 * 2), min(f4), max(f4) FROM vector_float_test
+WHERE f4 > 0.0 AND f4 < 'Infinity';
+ sum | min | max 
+-----+-----+-----
+   3 | 1.5 | 1.5
+(1 row)
+
+SELECT f4, min(f4), max(f4) FROM vector_float_test
+GROUP BY f4 ORDER BY f4 NULLS LAST;
+    f4     |    min    |    max    
+-----------+-----------+-----------
+ -Infinity | -Infinity | -Infinity
+        -0 |        -0 |        -0
+       1.5 |       1.5 |       1.5
+  Infinity |  Infinity |  Infinity
+       NaN |       NaN |       NaN
+           |           |          
+(6 rows)
+
 SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
 ERROR:  division by zero
 SELECT f4 / 0 FROM vector_float_test WHERE id = 4;

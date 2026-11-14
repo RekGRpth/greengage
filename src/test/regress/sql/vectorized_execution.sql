@@ -446,6 +446,12 @@ SELECT id, f4 + f4, f4 - f4, f4 * f4, f4 / f4
 FROM vector_float_test WHERE id IN (1, 2, 4, 5, 8) ORDER BY id;
 SELECT sum(f8 * 2 - f8), avg(f4 + f4)
 FROM vector_float_test WHERE id BETWEEN 2 AND 5;
+-- Packed FLOAT4: arithmetic, NaN/Inf/-0 comparisons and hashed grouping.
+SELECT sum(f4 * 2), min(f4), max(f4) FROM vector_float_test;
+SELECT sum(f4 * 2), min(f4), max(f4) FROM vector_float_test
+WHERE f4 > 0.0 AND f4 < 'Infinity';
+SELECT f4, min(f4), max(f4) FROM vector_float_test
+GROUP BY f4 ORDER BY f4 NULLS LAST;
 SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
 SELECT f4 / 0 FROM vector_float_test WHERE id = 4;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;

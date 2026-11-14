@@ -48,7 +48,8 @@ VectorBatchCreate(MemoryContext parent, TupleDesc tupdesc, int capacity,
 		column->typlen = attr->attlen;
 		column->typbyval = attr->attbyval;
 		if (packed_i32 &&
-			(column->typid == INT4OID || column->typid == DATEOID))
+			(column->typid == INT4OID || column->typid == DATEOID ||
+			 column->typid == FLOAT4OID))
 			column->i32_values = palloc0(sizeof(int32) * capacity);
 		else
 			column->values = palloc0(sizeof(Datum) * capacity);

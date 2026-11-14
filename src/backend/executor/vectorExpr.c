@@ -316,7 +316,17 @@ static inline Datum
 value_get(VectorValue *value, int row)
 {
 	if (value->i32_values != NULL)
+	{
+		if (value->typid == FLOAT4OID)
+		{
+			uint32		bits = (uint32) value->i32_values[row];
+			float4		result;
+
+			memcpy(&result, &bits, sizeof(result));
+			return Float4GetDatum(result);
+		}
 		return Int32GetDatum(value->i32_values[row]);
+	}
 	return value->values[row];
 }
 
@@ -334,6 +344,20 @@ value_set_int4(VectorValue *value, int row, int32 datum, bool isnull)
 	uint64		mask = (uint64) 1 << (row % 64);
 
 	value->i32_values[row] = datum;
+	if (isnull)
+		value->nulls[row / 64] |= mask;
+	else
+		value->nulls[row / 64] &= ~mask;
+}
+
+static inline void
+value_set_float4(VectorValue *value, int row, float4 datum, bool isnull)
+{
+	uint64		mask = (uint64) 1 << (row % 64);
+	uint32		bits;
+
+	memcpy(&bits, &datum, sizeof(bits));
+	value->i32_values[row] = (int32) bits;
 	if (isnull)
 		value->nulls[row / 64] |= mask;
 	else
@@ -361,7 +385,8 @@ init_value(VectorValue *value, Oid typid, int32 typmod, int capacity,
 	get_typlenbyval(typid, &value->typlen, &value->typbyval);
 	if (allocate)
 	{
-		if (packed_i32 && (typid == INT4OID || typid == DATEOID))
+		if (packed_i32 && (typid == INT4OID || typid == DATEOID ||
+						   typid == FLOAT4OID))
 			value->i32_values = palloc0(sizeof(int32) * capacity);
 		else
 			value->values = palloc0(sizeof(Datum) * capacity);
@@ -397,10 +422,12 @@ VectorExprPackedI32IsSupported(Expr *expr)
 
 	if (IsA(expr, Var))
 		return ((Var *) expr)->vartype == INT4OID ||
-			((Var *) expr)->vartype == DATEOID;
+			((Var *) expr)->vartype == DATEOID ||
+			((Var *) expr)->vartype == FLOAT4OID;
 	if (IsA(expr, Const))
 		return ((Const *) expr)->consttype == INT4OID ||
-			((Const *) expr)->consttype == DATEOID;
+			((Const *) expr)->consttype == DATEOID ||
+			((Const *) expr)->consttype == FLOAT4OID;
 	if (!IsA(expr, OpExpr))
 		return false;
 	switch (((OpExpr *) expr)->opfuncid)
@@ -410,6 +437,10 @@ VectorExprPackedI32IsSupported(Expr *expr)
 		case F_INT4MUL:
 		case F_INT4DIV:
 		case F_INT4MOD:
+		case F_FLOAT4PL:
+		case F_FLOAT4MI:
+		case F_FLOAT4MUL:
+		case F_FLOAT4DIV:
 			break;
 		default:
 			return false;
@@ -448,6 +479,12 @@ VectorExprPackedI32QualIsSupported(Expr *expr)
 		case F_DATE_LE:
 		case F_DATE_GT:
 		case F_DATE_GE:
+		case F_FLOAT4EQ:
+		case F_FLOAT4NE:
+		case F_FLOAT4LT:
+		case F_FLOAT4LE:
+		case F_FLOAT4GT:
+		case F_FLOAT4GE:
 			break;
 		default:
 			return false;
@@ -1740,6 +1777,47 @@ numeric_compare_datums(Datum left, Datum right)
 }
 
 static void
+eval_compare_packed_float4(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		uint32		lbits;
+		uint32		rbits;
+		float4		l;
+		float4		r;
+		int			cmp;
+		bool		result;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set(&step->value, row, (Datum) 0, true);
+			continue;
+		}
+		lbits = (uint32) left->i32_values[row];
+		rbits = (uint32) right->i32_values[row];
+		memcpy(&l, &lbits, sizeof(l));
+		memcpy(&r, &rbits, sizeof(r));
+		cmp = float4_cmp_internal(l, r);
+		switch (step->u.func.compare)
+		{
+			case VEC_COMPARE_FLOAT4_EQ: result = cmp == 0; break;
+			case VEC_COMPARE_FLOAT4_NE: result = cmp != 0; break;
+			case VEC_COMPARE_FLOAT4_LT: result = cmp < 0; break;
+			case VEC_COMPARE_FLOAT4_LE: result = cmp <= 0; break;
+			case VEC_COMPARE_FLOAT4_GT: result = cmp > 0; break;
+			case VEC_COMPARE_FLOAT4_GE: result = cmp >= 0; break;
+			default: pg_unreachable();
+		}
+		value_set(&step->value, row, BoolGetDatum(result), false);
+	}
+}
+
+static void
 eval_compare_packed_i32(VectorExprStep *step, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
@@ -1789,7 +1867,11 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 
 	if (left->i32_values != NULL && right->i32_values != NULL)
 	{
-		eval_compare_packed_i32(step, selection, nselected);
+		if (step->u.func.compare >= VEC_COMPARE_FLOAT4_EQ &&
+			step->u.func.compare <= VEC_COMPARE_FLOAT4_GE)
+			eval_compare_packed_float4(step, selection, nselected);
+		else
+			eval_compare_packed_i32(step, selection, nselected);
 		return;
 	}
 	for (pos = 0; pos < nselected; pos++)
@@ -2236,6 +2318,43 @@ eval_arithmetic_packed_i32(VectorExprStep *step, int32 *selection, int nselected
 }
 
 static void
+eval_arithmetic_packed_float4(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *left = &step->args[0]->value;
+	VectorValue *right = &step->args[1]->value;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		uint32		lbits;
+		uint32		rbits;
+		float4		l;
+		float4		r;
+		float4		result;
+
+		if (value_is_null(left, row) || value_is_null(right, row))
+		{
+			value_set_float4(&step->value, row, 0, true);
+			continue;
+		}
+		lbits = (uint32) left->i32_values[row];
+		rbits = (uint32) right->i32_values[row];
+		memcpy(&l, &lbits, sizeof(l));
+		memcpy(&r, &rbits, sizeof(r));
+		switch (step->u.func.arithmetic)
+		{
+			case VEC_ARITHMETIC_FLOAT4_ADD: result = float4_pl(l, r); break;
+			case VEC_ARITHMETIC_FLOAT4_SUB: result = float4_mi(l, r); break;
+			case VEC_ARITHMETIC_FLOAT4_MUL: result = float4_mul(l, r); break;
+			case VEC_ARITHMETIC_FLOAT4_DIV: result = float4_div(l, r); break;
+			default: pg_unreachable();
+		}
+		value_set_float4(&step->value, row, result, false);
+	}
+}
+
+static void
 eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselected)
 {
 	VectorValue *left = &step->args[0]->value;
@@ -2244,7 +2363,11 @@ eval_arithmetic(VectorExprStep *step, VectorBatch *batch, int32 *selection, int 
 
 	if (left->i32_values != NULL && right->i32_values != NULL)
 	{
-		eval_arithmetic_packed_i32(step, selection, nselected);
+		if (step->u.func.arithmetic >= VEC_ARITHMETIC_FLOAT4_ADD &&
+			step->u.func.arithmetic <= VEC_ARITHMETIC_FLOAT4_DIV)
+			eval_arithmetic_packed_float4(step, selection, nselected);
+		else
+			eval_arithmetic_packed_i32(step, selection, nselected);
 		return;
 	}
 	for (pos = 0; pos < nselected; pos++)

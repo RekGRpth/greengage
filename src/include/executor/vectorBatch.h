@@ -14,7 +14,9 @@
 #define VECTORBATCH_H
 
 #include "access/tupdesc.h"
+#include "catalog/pg_type_d.h"
 #include "utils/memutils.h"
+#include "utils/float.h"
 
 #define VECTOR_BATCH_DEFAULT_CAPACITY	2048
 #define VECTOR_BATCH_NULLWORDS(capacity) (((capacity) + 63) / 64)
@@ -73,7 +75,17 @@ static inline Datum
 VectorColumnGetDatum(const VectorColumn *column, int row)
 {
 	if (column->i32_values != NULL)
+	{
+		if (column->typid == FLOAT4OID)
+		{
+			uint32		bits = (uint32) column->i32_values[row];
+			float4		value;
+
+			memcpy(&value, &bits, sizeof(value));
+			return Float4GetDatum(value);
+		}
 		return Int32GetDatum(column->i32_values[row]);
+	}
 	return column->values[row];
 }
 
@@ -83,7 +95,18 @@ VectorColumnSetDatum(VectorColumn *column, int row, Datum value, bool isnull)
 	uint64		mask = (uint64) 1 << (row % 64);
 
 	if (column->i32_values != NULL)
-		column->i32_values[row] = DatumGetInt32(value);
+	{
+		if (column->typid == FLOAT4OID)
+		{
+			float4		float_value = DatumGetFloat4(value);
+			uint32		bits;
+
+			memcpy(&bits, &float_value, sizeof(bits));
+			column->i32_values[row] = (int32) bits;
+		}
+		else
+			column->i32_values[row] = DatumGetInt32(value);
+	}
 	else
 		column->values[row] = value;
 	if (isnull)
