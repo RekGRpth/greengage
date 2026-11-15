@@ -8,10 +8,12 @@
 #include "postgres.h"
 
 #include "executor/vectorHashJoin.h"
+#include "utils/datum.h"
 
 struct VectorHashJoinState
 {
 	MemoryContext context;
+	MemoryContext outer_values;
 	HashJoinState *hj;
 	AttrNumber *outer_attnos;
 	int			outer_ncols;
@@ -59,6 +61,11 @@ VectorHashJoinCreate(MemoryContext parent, HashJoinState *hj)
 
 	state = MemoryContextAllocZero(parent, sizeof(VectorHashJoinState));
 	state->context = AllocSetContextCreate(parent, "Vector Hash Join",
+										 ALLOCSET_DEFAULT_MINSIZE,
+										 ALLOCSET_DEFAULT_INITSIZE,
+										 ALLOCSET_DEFAULT_MAXSIZE);
+	state->outer_values = AllocSetContextCreate(state->context,
+										 "Vector Hash Join Outer Values",
 										 ALLOCSET_DEFAULT_MINSIZE,
 										 ALLOCSET_DEFAULT_INITSIZE,
 										 ALLOCSET_DEFAULT_MAXSIZE);
@@ -111,13 +118,24 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 		state->built = true;
 	}
 
+	MemoryContextReset(state->outer_values);
 	ExecClearTuple(outer);
 	for (col = 0; col < state->outer_ncols; col++)
 	{
 		AttrNumber	attno = state->outer_attnos[col];
 
-		outer->tts_values[col] = VectorBatchGetDatum(batch, attno - 1, row);
-		outer->tts_isnull[col] = VectorBatchIsNull(batch, attno - 1, row);
+		Datum		value = VectorBatchGetDatum(batch, attno - 1, row);
+		bool		isnull = VectorBatchIsNull(batch, attno - 1, row);
+
+		if (!isnull && !batch->columns[attno - 1].typbyval)
+		{
+			MemoryContext oldcontext = MemoryContextSwitchTo(state->outer_values);
+
+			value = datumCopy(value, false, batch->columns[attno - 1].typlen);
+			MemoryContextSwitchTo(oldcontext);
+		}
+		outer->tts_values[col] = value;
+		outer->tts_isnull[col] = isnull;
 	}
 	outer->tts_nvalid = state->outer_ncols;
 	ExecStoreVirtualTuple(outer);
@@ -162,6 +180,7 @@ void
 VectorHashJoinReset(VectorHashJoinState *state)
 {
 	ExecReScanHashJoin(state->hj);
+	MemoryContextReset(state->outer_values);
 	state->built = state->hj->hj_HashTable != NULL;
 	state->outer_in_progress = false;
 }

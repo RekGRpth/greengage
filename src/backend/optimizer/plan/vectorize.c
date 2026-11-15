@@ -492,36 +492,97 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 	return true;
 }
 
-/*
- * Ruleutils needs a real Aggref for a combining aggregate, but its OUTER_VAR
- * arguments must resolve to the original input targetlist, not to the region's
- * synthetic INDEX_VAR output.
- */
+typedef struct DisplayCtx
+{
+	Plan	   *child;
+	List	   *rtable;
+	int			rteidx;
+	List	  **colnames;
+	List	  **coltypes;
+	List	  **coltypmods;
+	List	  **colcollations;
+} DisplayCtx;
+
 static Node *
 display_var_mutator(Node *node, void *context)
 {
-	Plan	   *outer = (Plan *) context;
+	DisplayCtx *dctx = (DisplayCtx *) context;
 	Var		   *var = (Var *) node;
+	Var		   *nv;
+	char	   *name = NULL;
+	int			attno;
 
 	if (node == NULL)
 		return NULL;
-	if (!IsA(node, Var) || var->varno != OUTER_VAR || !IsA(outer, SeqScan))
-		return expression_tree_mutator(node, display_var_mutator, context);
+	if (IsA(node, Var))
 	{
-		Var		   *copy = copyObject(var);
+		if (var->varno == OUTER_VAR && dctx->child != NULL &&
+			var->varattno >= 1 && var->varattno <= list_length(dctx->child->targetlist))
+		{
+			TargetEntry *te = list_nth(dctx->child->targetlist, var->varattno - 1);
 
-		copy->varno = ((SeqScan *) outer)->scanrelid;
-		return (Node *) copy;
+			if (te->resname)
+				name = pstrdup(te->resname);
+			else if (IsA(te->expr, Var))
+			{
+				Var		   *cv = (Var *) te->expr;
+
+				if (cv->varno > 0 && cv->varno <= list_length(dctx->rtable) &&
+					cv->varattno > 0)
+				{
+					RangeTblEntry *rte = rt_fetch(cv->varno, dctx->rtable);
+
+					if (rte->rtekind == RTE_RELATION)
+						name = get_attname(rte->relid, cv->varattno, true);
+					else if (rte->eref && cv->varattno <= list_length(rte->eref->colnames))
+						name = pstrdup(strVal(list_nth(rte->eref->colnames, cv->varattno - 1)));
+				}
+			}
+		}
+		if (name == NULL)
+			name = psprintf("in%d", var->varattno);
+		*dctx->colnames = lappend(*dctx->colnames, makeString(name));
+		*dctx->coltypes = lappend_oid(*dctx->coltypes, var->vartype);
+		*dctx->coltypmods = lappend_int(*dctx->coltypmods, var->vartypmod);
+		*dctx->colcollations = lappend_oid(*dctx->colcollations, var->varcollid);
+		attno = list_length(*dctx->colnames);
+		nv = makeVar(dctx->rteidx, attno, var->vartype, var->vartypmod,
+					 var->varcollid, 0);
+		return (Node *) nv;
 	}
+	return expression_tree_mutator(node, display_var_mutator, context);
 }
 
-static Expr *
-display_aggref(Aggref *aggref, Plan *outer)
+/* Find an aggregate output through pass-through Vars, not a final phase. */
+static Aggref *
+find_output_aggref(Plan *plan, int attno, Plan **child)
 {
-	Aggref	   *display = copyObject(aggref);
+	int			depth;
 
-	display->args = (List *) display_var_mutator((Node *) display->args, outer);
-	return (Expr *) display;
+	for (depth = 0; plan != NULL && depth < 8; depth++)
+	{
+		TargetEntry *te;
+		Node	   *expr;
+
+		if (attno < 1 || attno > list_length(plan->targetlist))
+			return NULL;
+		te = (TargetEntry *) list_nth(plan->targetlist, attno - 1);
+		expr = (Node *) te->expr;
+		if (IsA(expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) expr;
+
+			if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL || !IsA(plan, Agg))
+				return NULL;
+			*child = plan->lefttree;
+			return agg;
+		}
+		if (!IsA(expr, Var) || ((Var *) expr)->varno != OUTER_VAR)
+			return NULL;
+		attno = ((Var *) expr)->varattno;
+		plan = plan->lefttree;
+	}
+	return NULL;
 }
 
 /*
@@ -555,8 +616,24 @@ make_region(VectorizeContext *ctx, Plan *root)
 								   exprCollation(expr), 0);
 		Expr	   *scanexpr = (Expr *) scanvar;
 
-		if (IsA(expr, Aggref))
-			scanexpr = display_aggref((Aggref *) expr, outerPlan(root));
+		{
+			Plan	   *child = NULL;
+			Aggref	   *agg = find_output_aggref(root, k, &child);
+
+			if (agg != NULL)
+			{
+				DisplayCtx	dctx;
+
+				dctx.child = child;
+				dctx.rtable = ctx->stmt->rtable;
+				dctx.rteidx = rteidx;
+				dctx.colnames = &colnames;
+				dctx.coltypes = &coltypes;
+				dctx.coltypmods = &coltypmods;
+				dctx.colcollations = &colcollations;
+				scanexpr = (Expr *) display_var_mutator((Node *) copyObject(agg), &dctx);
+			}
+		}
 
 		colnames = lappend(colnames, makeString(name));
 		coltypes = lappend_oid(coltypes, exprType(expr));

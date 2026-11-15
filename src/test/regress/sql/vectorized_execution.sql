@@ -956,6 +956,15 @@ WHERE t.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id
 SELECT count(*) FROM
 (SELECT id, v FROM vector_union_a UNION ALL SELECT id, v FROM vector_union_b) t
 WHERE t.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id) > 0;
+-- EXPLAIN resolves motion keys through custom_ps and the Agg display chain.
+EXPLAIN (COSTS OFF)
+SELECT l.id, sum(r.id) FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+GROUP BY l.id ORDER BY l.id;
+SELECT l.id, sum(r.id) FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+GROUP BY l.id ORDER BY l.id;
+-- By-ref values survive HashJoin until the aggregate expression consumes them.
+SELECT sum(CASE WHEN r.r LIKE 'r3%' THEN length(l.l) ELSE 0 END)
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id;
 SET gp_vectorized_execution = auto;
 SET gp_vectorized_min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM vector_aoco_small;

@@ -2232,11 +2232,11 @@ FROM vector_numeric_batch_test GROUP BY GROUPING SETS ((a, b), (a), (b), ());
                                                        QUERY PLAN                                                       
 ------------------------------------------------------------------------------------------------------------------------
  Finalize GroupAggregate
-   Group Key: vector_region.c1, vector_region.c2, vector_region.c6
+   Group Key: vector_region.c1, vector_region.c2, vector_region.c5
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         Merge Key: vector_region.c1, vector_region.c2, vector_region.c6
+         Merge Key: vector_region.c1, vector_region.c2, vector_region.c5
          ->  Sort
-               Sort Key: vector_region.c1, vector_region.c2, vector_region.c6
+               Sort Key: vector_region.c1, vector_region.c2, vector_region.c5
                ->  Custom Scan (VectorRegion)
                      ->  Partial GroupAggregate
                            Group Key: ((vector_numeric_batch_test.id % 20)), ((vector_numeric_batch_test.id % 10))
@@ -4145,6 +4145,42 @@ WHERE t.id < 100 AND (SELECT count(*) FROM vector_aoco_small s WHERE s.id = t.id
  count 
 -------
     10
+(1 row)
+
+-- EXPLAIN resolves motion keys through custom_ps and the Agg display chain.
+EXPLAIN (COSTS OFF)
+SELECT l.id, sum(r.id) FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+GROUP BY l.id ORDER BY l.id;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: vector_region.id
+   ->  Custom Scan (VectorRegion)
+         ->  GroupAggregate
+               Group Key: l.id
+               ->  Sort
+                     Sort Key: l.id
+                     ->  Hash Join
+                           Hash Cond: (l.id = r.id)
+                           ->  Seq Scan on vector_join_l l
+                           ->  Hash
+                                 ->  Seq Scan on vector_join_r r
+(13 rows)
+
+SELECT l.id, sum(r.id) FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id
+GROUP BY l.id ORDER BY l.id;
+ id | sum 
+----+-----
+  3 |   6
+  4 |   4
+(2 rows)
+
+-- By-ref values survive HashJoin until the aggregate expression consumes them.
+SELECT sum(CASE WHEN r.r LIKE 'r3%' THEN length(l.l) ELSE 0 END)
+FROM vector_join_l l JOIN vector_join_r r ON l.id = r.id;
+ sum 
+-----
+   4
 (1 row)
 
 SET gp_vectorized_execution = auto;
