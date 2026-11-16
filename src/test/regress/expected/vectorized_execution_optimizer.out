@@ -1863,19 +1863,20 @@ JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
          ->  Partial Aggregate
                ->  Custom Scan (VectorRegion)
                      ->  Hash Join
-                           Hash Cond: ((l.id % 10) = vector_region.g)
+                           Hash Cond: ((l.id % 10) = vector_region_1.g)
                            ->  Seq Scan on vector_aoco_test l
                            ->  Hash
                                  ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                        ->  Custom Scan (VectorRegion)
                                              ->  GroupAggregate
-                                                   Group Key: ((vector_aoco_small.id % 10))
+                                                   Group Key: vector_region.g
                                                    ->  Sort
-                                                         Sort Key: ((vector_aoco_small.id % 10))
+                                                         Sort Key: vector_region.g
                                                          ->  Redistribute Motion 3:3  (slice3; segments: 3)
-                                                               Hash Key: ((vector_aoco_small.id % 10))
-                                                               ->  Seq Scan on vector_aoco_small
-(18 rows)
+                                                               Hash Key: vector_region.g
+                                                               ->  Custom Scan (VectorRegion)
+                                                                     ->  Seq Scan on vector_aoco_small
+(19 rows)
 
 SELECT count(*) FROM vector_aoco_test l
 JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
@@ -2072,16 +2073,17 @@ FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
                                QUERY PLAN                               
 ------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: vector_region.g
+   Merge Key: vector_region_1.g
    ->  Custom Scan (VectorRegion)
          ->  GroupAggregate
-               Group Key: ((vector_aoco_small.id % 3))
+               Group Key: vector_region.g
                ->  Sort
-                     Sort Key: ((vector_aoco_small.id % 3))
+                     Sort Key: vector_region.g
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                           Hash Key: ((vector_aoco_small.id % 3))
-                           ->  Seq Scan on vector_aoco_small
-(11 rows)
+                           Hash Key: vector_region.g
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Seq Scan on vector_aoco_small
+(12 rows)
 
 SELECT id % 3 AS g, count(DISTINCT val), sum(DISTINCT id % 10)
 FROM vector_aoco_test GROUP BY 1 ORDER BY 1;

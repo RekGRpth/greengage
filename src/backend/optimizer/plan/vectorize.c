@@ -688,6 +688,34 @@ make_region(VectorizeContext *ctx, Plan *root)
 	return (Plan *) cs;
 }
 
+/*
+ * Capturing a region swallows the whole subtree below its root, so Motion
+ * producer subtrees hanging inside it never reach the top-down mutator.
+ * Vectorize them first: each Motion switches to its producer slice and the
+ * mutator wraps eligible joins and scans there as sibling regions under the
+ * Motion (initialized and executed by the Motion's own gang, exactly like
+ * the scan regions that already appear under Motions).
+ */
+static void
+vectorize_motion_subtrees(VectorizeContext *ctx, Plan *plan)
+{
+	if (plan == NULL || IsA(plan, CustomScan))
+		return;
+	if (IsA(plan, Motion))
+	{
+		Motion	   *motion = (Motion *) plan;
+		int			saved_slice = ctx->slice;
+
+		ctx->slice = motion->motionID;
+		outerPlan(motion) = (Plan *) vectorize_mutator((Node *) outerPlan(motion),
+													   ctx);
+		ctx->slice = saved_slice;
+		return;
+	}
+	vectorize_motion_subtrees(ctx, outerPlan(plan));
+	vectorize_motion_subtrees(ctx, innerPlan(plan));
+}
+
 static Node *
 vectorize_mutator(Node *node, VectorizeContext *ctx)
 {
@@ -792,7 +820,10 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		(!IsA(outerPlan(node), SeqScan) ||
 		 is_simple_scan(ctx, (SeqScan *) outerPlan(node))) &&
 		auto_allowed(ctx, (Plan *) node))
+	{
+		vectorize_motion_subtrees(ctx, outerPlan(node));
 		return (Node *) make_region(ctx, (Plan *) node);
+	}
 
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
 		/* an empty targetlist is worth wrapping while a qual filters rows */

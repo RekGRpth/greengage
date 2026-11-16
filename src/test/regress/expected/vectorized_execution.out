@@ -2069,15 +2069,16 @@ FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
                                QUERY PLAN                               
 ------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: vector_region.g
+   Merge Key: vector_region_1.g
    ->  Custom Scan (VectorRegion)
          ->  GroupAggregate
-               Group Key: ((vector_aoco_small.id % 3))
+               Group Key: vector_region.c1
                ->  Sort
-                     Sort Key: ((vector_aoco_small.id % 3))
+                     Sort Key: vector_region.c1
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                           Hash Key: ((vector_aoco_small.id % 3))
-                           ->  Seq Scan on vector_aoco_small
+                           Hash Key: vector_region.c1
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Seq Scan on vector_aoco_small
 (11 rows)
 
 SELECT id % 3 AS g, count(DISTINCT val), sum(DISTINCT id % 10)
