@@ -483,11 +483,23 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	}
 
 	if (state->agg != NULL && state->scan != NULL && state->append == NULL &&
-		VectorAggPackedI32IsSupported(state->agg) &&
 		(scan->plan.qual == NIL ||
-		 VectorExprPackedI32QualIsSupported((Expr *) scan->plan.qual)) &&
-		packed_i32_targetlist(scan->plan.targetlist))
-		state->packed_i32 = true;
+		 VectorExprPackedI32QualIsSupported((Expr *) scan->plan.qual)))
+	{
+		if (state->nested_batches)
+		{
+			/*
+			 * The join consumes the scan batch through widening accessors
+			 * and the aggregate consumes the (unpacked) join output, so
+			 * only the batch qual must be packed-capable; the scan
+			 * targetlist may hold any column types.
+			 */
+			state->packed_i32 = true;
+		}
+		else if (VectorAggPackedI32IsSupported(state->agg) &&
+				 packed_i32_targetlist(scan->plan.targetlist))
+			state->packed_i32 = true;
+	}
 	else if (state->sort != NULL && state->scan != NULL && state->append == NULL &&
 			 (scan->plan.qual == NIL ||
 			  VectorExprPackedI32QualIsSupported((Expr *) scan->plan.qual)) &&
@@ -877,7 +889,10 @@ VectorBuildScanCreate(VectorRegionState *region, SeqScanState *scan,
 	vs->scan = scan;
 	oldcontext = MemoryContextSwitchTo(vs->context);
 	vs->batch = VectorBatchCreate(vs->context, RelationGetDescr(relation),
-								  VECTOR_BATCH_DEFAULT_CAPACITY, false);
+								  VECTOR_BATCH_DEFAULT_CAPACITY,
+								  plan->plan.qual == NIL ||
+								  VectorExprPackedI32QualIsSupported(
+									  (Expr *) plan->plan.qual));
 
 	vs->read_attrs = MemoryContextAllocZero(vs->context, sizeof(bool) * natts);
 	pull_varattnos((Node *) plan->plan.targetlist, plan->scanrelid, &attrs);
