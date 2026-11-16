@@ -19,6 +19,14 @@ struct VectorHashJoinState
 	int			outer_ncols;
 	bool		built;
 	bool		outer_in_progress;
+	VectorHashJoinSourceNext next_outer;
+	void	   *outer_arg;
+	VectorHashJoinState *outer_join;
+	VectorBatch *outer_batch;
+	int			outer_position;
+	bool		outer_eof;
+	bool		done;
+	VectorBatch *output;
 };
 
 bool
@@ -55,7 +63,7 @@ VectorHashJoinState *
 VectorHashJoinCreate(MemoryContext parent, HashJoinState *hj)
 {
 	VectorHashJoinState *state;
-	SeqScan	   *outer = (SeqScan *) outerPlan(hj->js.ps.plan);
+	Plan	   *outer = outerPlan(hj->js.ps.plan);
 	ListCell   *lc;
 	int			col = 0;
 
@@ -70,10 +78,10 @@ VectorHashJoinCreate(MemoryContext parent, HashJoinState *hj)
 										 ALLOCSET_DEFAULT_INITSIZE,
 										 ALLOCSET_DEFAULT_MAXSIZE);
 	state->hj = hj;
-	state->outer_ncols = list_length(outer->plan.targetlist);
+	state->outer_ncols = list_length(outer->targetlist);
 	state->outer_attnos = MemoryContextAlloc(state->context,
 										  sizeof(AttrNumber) * Max(state->outer_ncols, 1));
-	foreach(lc, outer->plan.targetlist)
+	foreach(lc, outer->targetlist)
 	{
 		TargetEntry *te = (TargetEntry *) lfirst(lc);
 		Var		   *var;
@@ -83,8 +91,14 @@ VectorHashJoinCreate(MemoryContext parent, HashJoinState *hj)
 			VectorHashJoinDestroy(state);
 			return NULL;
 		}
+		if (!IsA(outer, SeqScan))
+		{
+			state->outer_attnos[col] = col + 1;
+			col++;
+			continue;
+		}
 		var = (Var *) te->expr;
-		if (var->varno != outer->scanrelid || var->varattno <= 0 ||
+		if (var->varno != ((SeqScan *) outer)->scanrelid || var->varattno <= 0 ||
 			var->varlevelsup != 0)
 		{
 			VectorHashJoinDestroy(state);
@@ -95,11 +109,133 @@ VectorHashJoinCreate(MemoryContext parent, HashJoinState *hj)
 	return state;
 }
 
+VectorHashJoinState *
+VectorHashJoinCreateBatch(MemoryContext parent, HashJoinState *hj,
+						  VectorHashJoinSourceNext next_outer, void *outer_arg,
+							  VectorHashJoinState *outer_join)
+{
+	VectorHashJoinState *state = VectorHashJoinCreate(parent, hj);
+
+	if (state == NULL)
+		return NULL;
+	state->next_outer = next_outer;
+	state->outer_arg = outer_arg;
+	state->outer_join = outer_join;
+	state->output = VectorBatchCreate(parent,
+									  hj->js.ps.ps_ResultTupleDesc,
+									  VECTOR_BATCH_DEFAULT_CAPACITY, false);
+	return state;
+}
+
+VectorBatch *
+VectorHashJoinOutput(VectorHashJoinState *state)
+{
+	return state->output;
+}
+
+static void
+VectorHashJoinCopyResult(VectorHashJoinState *state, TupleTableSlot *slot, int row)
+{
+	int			col;
+
+	slot_getallattrs(slot);
+	if (slot->tts_nvalid != state->output->ncols)
+		elog(ERROR, "hash join output shape changed during execution");
+	for (col = 0; col < state->output->ncols; col++)
+	{
+		Datum		value = slot->tts_values[col];
+		bool		isnull = slot->tts_isnull[col];
+
+		value = VectorBatchCopyDatum(state->output, col, value, isnull);
+		VectorBatchSetValue(state->output, col, row, value, isnull);
+	}
+}
+
+bool
+VectorHashJoinNextBatch(VectorHashJoinState *state)
+{
+	int			nrows;
+
+	if (state->done)
+		return false;
+	do
+	{
+		nrows = 0;
+		VectorBatchReset(state->output);
+		while (nrows < state->output->capacity && !state->done)
+		{
+			TupleTableSlot *result = NULL;
+
+			if (state->outer_in_progress)
+				result = VectorHashJoinContinue(state);
+			else if (state->outer_batch != NULL &&
+					 state->outer_position < state->outer_batch->nselected)
+				result = VectorHashJoinNextRow(state, state->outer_batch,
+											  state->outer_position++);
+			else if (state->outer_eof)
+				result = VectorHashJoinFinish(state);
+			else
+			{
+				state->outer_batch = NULL;
+				state->outer_position = 0;
+				if (state->next_outer(state->outer_arg, &state->outer_batch))
+				{
+					if (state->outer_batch->nselected == 0)
+						continue;
+					result = VectorHashJoinNextRow(state, state->outer_batch,
+												  state->outer_position++);
+				}
+				else
+				{
+					state->outer_eof = true;
+					continue;
+				}
+			}
+			if (result == NULL)
+			{
+				if (state->outer_eof)
+					state->done = true;
+				else
+					state->outer_in_progress = false;
+				continue;
+			}
+			VectorHashJoinCopyResult(state, result, nrows++);
+		}
+		VectorBatchSetRowCount(state->output, nrows);
+	} while (nrows == 0 && !state->done);
+	/*
+	 * A done chain with rows in the batch still reports true: the caller
+	 * consumes the final partial batch before the next call reports EOF.
+	 */
+	return !state->done || nrows > 0;
+}
+
+static void
+VectorHashJoinBatchReset(VectorHashJoinState *state)
+{
+	if (state == NULL)
+		return;
+	if (state->output != NULL)
+		VectorBatchReset(state->output);
+	state->outer_batch = NULL;
+	state->outer_position = 0;
+	state->outer_eof = false;
+	state->done = false;
+	state->built = state->hj->hj_HashTable != NULL;
+	state->outer_in_progress = false;
+	MemoryContextReset(state->outer_values);
+	VectorHashJoinBatchReset(state->outer_join);
+}
+
 void
 VectorHashJoinDestroy(VectorHashJoinState *state)
 {
 	if (state == NULL)
 		return;
+	if (state->outer_join != NULL)
+		VectorHashJoinDestroy(state->outer_join);
+	if (state->output != NULL)
+		VectorBatchDestroy(state->output);
 	MemoryContextDelete(state->context);
 	pfree(state);
 }
@@ -180,6 +316,7 @@ void
 VectorHashJoinReset(VectorHashJoinState *state)
 {
 	ExecReScanHashJoin(state->hj);
+	VectorHashJoinBatchReset(state);
 	MemoryContextReset(state->outer_values);
 	state->built = state->hj->hj_HashTable != NULL;
 	state->outer_in_progress = false;

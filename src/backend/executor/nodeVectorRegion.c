@@ -64,6 +64,9 @@ typedef struct VectorRegionState
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
 	VectorBatch *batch;
+	VectorBatch *join_batch;
+	bool		nested_batches;
+	int			join_position;	/* output cursor within join_batch */
 	VectorExprState **proj;		/* per output column; NULL for plain columns */
 	VectorExprState *qual;
 	int		   *output_attnos;
@@ -88,6 +91,9 @@ typedef struct VectorNestLoopProxy
 
 static TupleTableSlot *VectorRegionNestLoopOuter(PlanState *pstate);
 static TupleTableSlot *VectorRegionMaterialOuter(PlanState *pstate);
+static bool VectorRegionInitJoinChain(VectorRegionState *state);
+static bool VectorRegionNextScanBatch(VectorRegionState *state);
+static VectorBatch *VectorRegionInputBatch(VectorRegionState *state);
 static Node *VectorRegionCreateState(CustomScan *cscan);
 static void VectorRegionBegin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *VectorRegionExec(CustomScanState *node);
@@ -196,6 +202,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			state->scan = (SeqScanState *) outer;
 		else if (IsA(outer, AppendState))
 			state->append = (AppendState *) outer;
+		else if (IsA(outer, HashJoinState))
+			state->hj = (HashJoinState *) outer;
 		else
 			state->input = outer;
 	}
@@ -330,6 +338,18 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("vector region expects a scan, append, aggregate, sort, limit, unique, merge join, nest loop, material or hash join")));
+
+	/*
+	 * An aggregate over a hash join chain consumes join output batches;
+	 * an unsupported chain falls back to the row-wise input adapter.
+	 */
+	if (state->agg != NULL && state->hj != NULL &&
+		!VectorRegionInitJoinChain(state))
+	{
+		state->scan = NULL;
+		state->hj = NULL;
+		state->input = outerPlanState(state->agg);
+	}
 
 	if (state->append != NULL)
 	{
@@ -595,11 +615,11 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		if (state->agg != NULL)
 		{
 			state->vagg = VectorAggCreate(estate->es_query_cxt, state->agg,
-										  state->batch);
+										  VectorRegionInputBatch(state));
 			if (state->vagg == NULL)
 				elog(ERROR, "vector region could not initialize its aggregate");
 		}
-		if (state->hj != NULL)
+		if (state->hj != NULL && !state->nested_batches)
 		{
 			state->vhj = VectorHashJoinCreate(estate->es_query_cxt, state->hj);
 			if (state->vhj == NULL)
@@ -728,7 +748,98 @@ append_first_valid(VectorRegionState *state)
 }
 
 static bool
+VectorRegionLeafSource(void *arg, VectorBatch **batch)
+{
+	VectorRegionState *state = (VectorRegionState *) arg;
+
+	*batch = state->batch;
+	if (!VectorRegionNextScanBatch(state))
+		return false;
+	/* the join driver walks rows itself: mark the batch fully consumed */
+	state->position = state->batch->nselected;
+	return true;
+}
+
+static bool
+VectorHashJoinSourceNextBatch(void *arg, VectorBatch **batch)
+{
+	VectorHashJoinState *state = (VectorHashJoinState *) arg;
+
+	*batch = VectorHashJoinOutput(state);
+	return VectorHashJoinNextBatch(state);
+}
+
+static VectorHashJoinState *
+VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
+{
+	PlanState  *outer = outerPlanState(hj);
+	VectorHashJoinState *outer_join = NULL;
+	VectorHashJoinSourceNext source = VectorRegionLeafSource;
+	void	   *source_arg = region;
+	VectorHashJoinState *vhj;
+
+	if (!VectorHashJoinPlanIsSupported((HashJoin *) hj->js.ps.plan))
+		return NULL;
+	if (IsA(outer, HashJoinState))
+	{
+		outer_join = VectorRegionCreateJoinChain(region, (HashJoinState *) outer);
+		if (outer_join == NULL)
+			return NULL;
+		source = VectorHashJoinSourceNextBatch;
+		source_arg = outer_join;
+	}
+	else if (IsA(outer, SeqScanState))
+		region->scan = (SeqScanState *) outer;
+	else
+		return NULL;
+	vhj = VectorHashJoinCreateBatch(region->css.ss.ps.state->es_query_cxt,
+									hj, source, source_arg, outer_join);
+	if (vhj == NULL)
+		VectorHashJoinDestroy(outer_join);
+	return vhj;
+}
+
+static bool
+VectorRegionInitJoinChain(VectorRegionState *state)
+{
+	VectorHashJoinState *vhj = VectorRegionCreateJoinChain(state, state->hj);
+
+	if (vhj == NULL)
+		return false;
+	state->join_batch = VectorHashJoinOutput(vhj);
+	state->nested_batches = true;
+	state->vhj = vhj;
+	return true;
+}
+
+static VectorBatch *
+VectorRegionInputBatch(VectorRegionState *state)
+{
+	return state->nested_batches ? state->join_batch : state->batch;
+}
+
+static bool
 VectorRegionNextBatch(VectorRegionState *state)
+{
+	if (state->nested_batches)
+	{
+		if (state->join_position < state->join_batch->nselected)
+			return true;
+		/*
+		 * Reset the cursor only after a successful pull: the join chain has
+		 * reached EOF, and a stale zero cursor would replay the final batch
+		 * once per output row.
+		 */
+		if (!VectorHashJoinNextBatch(state->vhj))
+			return false;
+		state->join_position = 0;
+		return true;
+	}
+	return VectorRegionNextScanBatch(state);
+}
+
+static bool
+VectorRegionNextScanBatch(VectorRegionState *state)
 {
 	CustomScanState *node = &state->css;
 
@@ -892,7 +1003,7 @@ VectorRegionExec(CustomScanState *node)
 	int			row;
 	int			col;
 
-	if (state->hj != NULL)
+	if (state->hj != NULL && !state->nested_batches)
 	{
 		for (;;)
 		{
@@ -948,16 +1059,18 @@ VectorRegionExec(CustomScanState *node)
 	if (state->agg != NULL)
 	{
 		AggState   *agg = state->agg;
+		VectorBatch *input = VectorRegionInputBatch(state);
+		int		   *cursor = state->nested_batches ? &state->join_position : &state->position;
 
 		if (agg->aggstrategy == AGG_SORTED)
 		{
 			while (!agg->input_done &&
-				   (state->position < state->batch->nselected ||
+				   (*cursor < input->nselected ||
 					VectorRegionNextBatch(state)))
 			{
 				TupleTableSlot *result = VectorAggProcessBatchSorted(state->vagg,
-															 state->batch,
-															 &state->position);
+															 input,
+															 cursor);
 
 				if (result != NULL)
 					return result;
@@ -967,8 +1080,8 @@ VectorRegionExec(CustomScanState *node)
 		{
 			while (VectorRegionNextBatch(state))
 			{
-				VectorAggProcessBatch(state->vagg, state->batch);
-				state->position = state->batch->nselected;
+				VectorAggProcessBatch(state->vagg, input);
+				*cursor = input->nselected;
 			}
 		}
 		VectorAggFinish(state->vagg);
@@ -1096,6 +1209,7 @@ VectorRegionRescan(CustomScanState *node)
 	ListCell   *lc;
 
 	state->position = 0;
+	state->join_position = 0;
 	state->eof = false;
 	if (state->nestloop != NULL)
 		outerPlanState(state->nestloop) = state->nl_outer;
@@ -1105,9 +1219,9 @@ VectorRegionRescan(CustomScanState *node)
 		VectorBatchReset(state->batch);
 	if (state->vhj != NULL)
 		VectorHashJoinReset(state->vhj);
-	else if (state->vagg != NULL)
+	if (state->vagg != NULL)
 		VectorAggReset(state->vagg);
-	else
+	else if (state->vhj == NULL)
 	{
 		foreach(lc, node->custom_ps)
 			ExecReScan((PlanState *) lfirst(lc));

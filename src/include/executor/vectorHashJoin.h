@@ -12,10 +12,18 @@
 #include "executor/vectorBatch.h"
 
 typedef struct VectorHashJoinState VectorHashJoinState;
+typedef bool (*VectorHashJoinSourceNext)(void *arg, VectorBatch **batch);
 
 extern bool VectorHashJoinPlanIsSupported(HashJoin *join);
 extern VectorHashJoinState *VectorHashJoinCreate(MemoryContext parent,
 												 HashJoinState *hj);
+extern VectorHashJoinState *VectorHashJoinCreateBatch(MemoryContext parent,
+									HashJoinState *hj,
+									VectorHashJoinSourceNext next_outer,
+									void *outer_arg,
+									VectorHashJoinState *outer_join);
+extern VectorBatch *VectorHashJoinOutput(VectorHashJoinState *state);
+extern bool VectorHashJoinNextBatch(VectorHashJoinState *state);
 extern void VectorHashJoinDestroy(VectorHashJoinState *state);
 extern TupleTableSlot *VectorHashJoinNextRow(VectorHashJoinState *state,
 											 VectorBatch *batch, int position);
