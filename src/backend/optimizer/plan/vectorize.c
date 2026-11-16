@@ -81,6 +81,25 @@ slice_runs_on_segments(VectorizeContext *ctx)
 		slice->gangType == GANGTYPE_SINGLETON_READER;
 }
 
+/*
+ * A Motion probe leaf maps its output columns into batch columns
+ * positionally, so its targetlist must be a plain Var projection.
+ */
+static bool
+motion_probe_tlist_is_simple(Plan *motion)
+{
+	ListCell   *lc;
+
+	foreach(lc, motion->targetlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			return false;
+	}
+	return true;
+}
+
 static bool
 is_simple_scan(VectorizeContext *ctx, SeqScan *scan)
 {
@@ -741,13 +760,22 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 
 	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
 		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
-		IsA(outerPlan(node), SeqScan) &&
-		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
+		((IsA(outerPlan(node), SeqScan) &&
+		  is_simple_scan(ctx, (SeqScan *) outerPlan(node))) ||
+		 (IsA(outerPlan(node), Motion) &&
+		  motion_probe_tlist_is_simple(outerPlan(node)))) &&
 		/* the build side reads row-wise through the Hash node: any input */
 		IsA(innerPlan(node), Hash))
 	{
 		Plan	   *hash = innerPlan(node);
 
+		/*
+		 * A Motion probe leaf receives its rows from another slice: capture
+		 * swallows the producer subtree, so vectorize it first.  The region
+		 * converts the received rows into probe batches.
+		 */
+		if (IsA(outerPlan(node), Motion))
+			vectorize_motion_subtrees(ctx, outerPlan(node));
 		outerPlan(hash) = (Plan *) vectorize_mutator((Node *) outerPlan(hash), ctx);
 		if (auto_allowed(ctx, (Plan *) node))
 			return (Node *) make_region(ctx, (Plan *) node);

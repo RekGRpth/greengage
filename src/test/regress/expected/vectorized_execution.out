@@ -2440,6 +2440,45 @@ GROUP BY g ORDER BY g;
 
 RESET gp_eager_two_phase_agg;
 RESET enable_hashagg;
+-- A hash join whose probe side is a Redistribute Motion: the region feeds
+-- its probe batches from the received producer rows, and both scans keep
+-- the computed join keys in their targetlists.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
+  ON l.id % 1000 = w.id % 1000;
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Custom Scan (VectorRegion)
+                     ->  Hash Join
+                           Hash Cond: ((vector_region.c1 % 1000) = (vector_region_1.c1 % 1000))
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: (vector_region.c1 % 1000)
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on vector_aoco_wide w
+                           ->  Hash
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: (vector_region_1.c1 % 1000)
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Seq Scan on vector_aoco_test l
+(16 rows)
+
+SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
+  ON l.id % 1000 = w.id % 1000;
+ count 
+-------
+ 22775
+(1 row)
+
+SELECT count(*) FROM vector_aoco_test l LEFT JOIN vector_aoco_wide w
+  ON l.id % 1000 = w.id % 1000;
+ count 
+-------
+ 22775
+(1 row)
+
 -- Mixed aggregation (hashed grouping sets plus the plain empty set):
 -- every row advances every set in one pass, plain sets project first.
 SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,

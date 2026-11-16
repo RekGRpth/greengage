@@ -772,6 +772,16 @@ FROM vector_aoco_test l LEFT JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
 GROUP BY g ORDER BY g;
 RESET gp_eager_two_phase_agg;
 RESET enable_hashagg;
+-- A hash join whose probe side is a Redistribute Motion: the region feeds
+-- its probe batches from the received producer rows, and both scans keep
+-- the computed join keys in their targetlists.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
+  ON l.id % 1000 = w.id % 1000;
+SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
+  ON l.id % 1000 = w.id % 1000;
+SELECT count(*) FROM vector_aoco_test l LEFT JOIN vector_aoco_wide w
+  ON l.id % 1000 = w.id % 1000;
 -- Mixed aggregation (hashed grouping sets plus the plain empty set):
 -- every row advances every set in one pass, plain sets project first.
 SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,

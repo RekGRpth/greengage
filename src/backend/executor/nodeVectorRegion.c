@@ -361,7 +361,15 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	else if (IsA(child, HashJoinState))
 	{
 		state->hj = (HashJoinState *) child;
-		state->scan = (SeqScanState *) outerPlanState(state->hj);
+		/*
+		 * A Motion probe leaf (a producer join on another slice feeding this
+		 * join) is consumed through the row adapter: received rows convert
+		 * into the probe batches of the join chain.
+		 */
+		if (IsA(outerPlanState(state->hj), SeqScanState))
+			state->scan = (SeqScanState *) outerPlanState(state->hj);
+		else
+			state->input = outerPlanState(state->hj);
 	}
 	else if (IsA(child, AppendState))
 		state->append = (AppendState *) child;
@@ -555,7 +563,11 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		state->batch = VectorBatchCreate(estate->es_query_cxt,
 										 state->scan != NULL ?
 										 RelationGetDescr(relation) :
-										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+										 state->agg != NULL ?
+										 state->agg->ss.ss_ScanTupleSlot->tts_tupleDescriptor :
+										 /* a Motion probe leaf delivers its
+										  * producer's output columns as-is */
+										 ExecGetResultType(outerPlanState(state->hj)),
 										 VECTOR_BATCH_DEFAULT_CAPACITY,
 										 state->packed_i32);
 		if (state->scan != NULL &&
@@ -1130,12 +1142,16 @@ VectorRegionNextScanBatch(VectorRegionState *state)
 {
 	CustomScanState *node = &state->css;
 
-	if (state->input != NULL)
-		return VectorRegionReadAdapter(state);
-
-	/* EOF may be known while the final partial batch still has unread rows. */
+	/*
+	 * A batch already in hand must be finished first: the row-wise consumers
+	 * (the hash join driver) call this per row, and the adapter path must
+	 * not pull fresh input while rows of the current batch remain.
+	 */
 	if (state->position < state->batch->nselected)
 		return true;
+
+	if (state->input != NULL)
+		return VectorRegionReadAdapter(state);
 
 	for (;;)
 	{
