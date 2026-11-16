@@ -69,6 +69,9 @@ struct VectorHashJoinState
 	HashJoinTuple resume_cursor;
 	uint32		resume_hashvalue;
 	int			resume_row;
+	bool		fill_outer;		/* LEFT: emit null-filled unmatched rows */
+	bool		fill_inner;		/* RIGHT: mark matches for the finish phase */
+	bool		row_matched;	/* current probe row already emitted a match */
 };
 
 bool
@@ -219,7 +222,16 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 	int			out_ncols = 0;
 	int			maxkey = 0;
 
-	if (join->join.jointype != JOIN_INNER || join->join.plan.qual != NIL)
+	/*
+	 * INNER is the plain case.  LEFT fills unmatched probe rows with null
+	 * inner columns; RIGHT marks matched stored tuples and lets the normal
+	 * finish phase emit the unmatched inner rows.  Anything else stays on
+	 * the per-row path.
+	 */
+	if ((join->join.jointype != JOIN_INNER &&
+		 join->join.jointype != JOIN_LEFT &&
+		 join->join.jointype != JOIN_RIGHT) ||
+		join->join.plan.qual != NIL)
 		return false;
 
 	foreach(lc, join->hashclauses)
@@ -258,6 +270,8 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 	}
 	if (nkeys == 0)
 		return false;
+	state->fill_outer = (join->join.jointype == JOIN_LEFT);
+	state->fill_inner = (join->join.jointype == JOIN_RIGHT);
 
 	foreach(lc, join->join.plan.targetlist)
 	{
@@ -326,6 +340,7 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 		{
 			if (state->outer_position >= batch->nselected)
 				break;
+			state->row_matched = false;
 			row = VectorBatchSelectedRow(batch, state->outer_position);
 			state->outer_position++;
 
@@ -414,6 +429,9 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 			}
 			if (!matched)
 				continue;
+			/* the finish phase emits unmatched stored tuples only */
+			if (state->fill_inner)
+				HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(cursor));
 
 			for (c = 0; c < state->out_ncols; c++)
 			{
@@ -435,10 +453,48 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				VectorBatchSetValue(out, c, nrows, value, isnull);
 			}
 			nrows++;
+			state->row_matched = true;
 		}
 
 		if (resume_stopped)
 			break;
+
+		/*
+		 * LEFT join: a probe row with no matches emits a null-filled row.  If
+		 * the output batch is full, resume with an empty walk so the fill
+		 * row is emitted first in the next call.
+		 */
+		if (state->fill_outer && !state->row_matched)
+		{
+			int			c;
+
+			if (nrows >= out->capacity)
+			{
+				state->resume_active = true;
+				state->resume_bucket = bucketno;
+				state->resume_cursor = NULL;
+				state->resume_hashvalue = hashvalue;
+				state->resume_row = row;
+				resume_stopped = true;
+				break;
+			}
+			for (c = 0; c < state->out_ncols; c++)
+			{
+				Datum		value = 0;
+				bool		isnull = true;
+
+				if (state->out_is_outer[c])
+				{
+					value = VectorBatchGetDatum(batch,
+											   state->out_batch_col[c], row);
+					isnull = VectorBatchIsNull(batch,
+											   state->out_batch_col[c], row);
+				}
+				value = VectorBatchCopyDatum(out, c, value, isnull);
+				VectorBatchSetValue(out, c, nrows, value, isnull);
+			}
+			nrows++;
+		}
 		state->resume_active = false;
 	}
 
@@ -517,7 +573,9 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 											   &state->outer_batch))
 						{
 							state->outer_eof = true;
-							state->done = true;		/* inner: no fill rows */
+							/* RIGHT hands unmatched stored tuples to the
+							 * finish phase; INNER/LEFT have nothing left */
+							state->done = !state->fill_inner;
 							continue;
 						}
 					}
