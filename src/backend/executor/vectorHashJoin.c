@@ -7,12 +7,17 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "executor/executor.h"
+#include "executor/hashjoin.h"
 #include "executor/nodeHash.h"
 #include "executor/vectorHashJoin.h"
+#include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "utils/datum.h"
 #include "utils/faultinjector.h"
+#include "utils/lsyscache.h"
 
 /* same state-machine constants as nodeHashjoin.c */
 #define HJ_NEED_NEW_OUTER		2
@@ -40,6 +45,30 @@ struct VectorHashJoinState
 	VectorBatch *output;
 	VectorHashJoinSourceNext next_build;	/* batch feed for the hash build */
 	void	   *build_arg;
+	/*
+	 * Batch probe fast path: assemble matched rows straight into the output
+	 * batch without the per-row HashJoin state machine.  The outer slot is
+	 * only filled with the key columns; output columns are read from the
+	 * probe batch and the stored inner tuples directly.
+	 */
+	bool		fast_probe;		/* plan gate passed */
+	bool		fast_checked;	/* post-build gate evaluated */
+	int			hash_slot_nvalid;
+	TupleTableSlot *hash_slot;
+	int			nkeys;
+	int		   *outer_key_pos;	/* outer targetlist positions of the keys */
+	int		   *inner_key_attno;	/* stored-tuple attnos of the inner keys */
+	FmgrInfo   *eq_fns;
+	Oid		   *eq_collations;
+	int			out_ncols;
+	bool	   *out_is_outer;
+	int		   *out_src;		/* outer targetlist pos / inner tuple attno */
+	int		   *out_batch_col;	/* probe-batch column for outer outputs */
+	bool		resume_active;	/* capacity stop inside a bucket walk */
+	int			resume_bucket;
+	HashJoinTuple resume_cursor;
+	uint32		resume_hashvalue;
+	int			resume_row;
 };
 
 bool
@@ -70,6 +99,35 @@ VectorHashJoinPlanIsSupported(HashJoin *join)
 		default:
 			return false;
 	}
+}
+
+static bool VectorHashProbeFastGate(VectorHashJoinState *state);
+static int VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row);
+
+static void
+VectorHashJoinInitFastProbe(VectorHashJoinState *state)
+{
+	HashJoinState *hj = state->hj;
+	int			nclauses = list_length(((HashJoin *) hj->js.ps.plan)->hashclauses);
+	int			natts = hj->js.ps.ps_ResultTupleDesc->natts;
+
+	state->hash_slot = MakeSingleTupleTableSlot(
+		ExecGetResultType(outerPlanState(hj)), &TTSOpsVirtual);
+	state->outer_key_pos = MemoryContextAlloc(state->context,
+									   sizeof(int) * Max(nclauses, 1));
+	state->inner_key_attno = MemoryContextAlloc(state->context,
+									   sizeof(int) * Max(nclauses, 1));
+	state->eq_fns = MemoryContextAlloc(state->context,
+									   sizeof(FmgrInfo) * Max(nclauses, 1));
+	state->eq_collations = MemoryContextAlloc(state->context,
+									   sizeof(Oid) * Max(nclauses, 1));
+	state->out_is_outer = MemoryContextAlloc(state->context,
+									   sizeof(bool) * Max(natts, 1));
+	state->out_src = MemoryContextAlloc(state->context,
+									   sizeof(int) * Max(natts, 1));
+	state->out_batch_col = MemoryContextAlloc(state->context,
+									   sizeof(int) * Max(natts, 1));
+	state->fast_probe = VectorHashProbeFastGate(state);
 }
 
 VectorHashJoinState *
@@ -119,6 +177,7 @@ VectorHashJoinCreate(MemoryContext parent, HashJoinState *hj)
 		}
 		state->outer_attnos[col++] = var->varattno;
 	}
+	VectorHashJoinInitFastProbe(state);
 	return state;
 }
 
@@ -144,6 +203,246 @@ VectorBatch *
 VectorHashJoinOutput(VectorHashJoinState *state)
 {
 	return state->output;
+}
+
+/*
+ * Plan-time gate for the batch probe fast path.  Only the plain shape:
+ * an inner join with plain equality hash clauses and a plain positional
+ * targetlist over outer and inner columns, no extra quals.
+ */
+static bool
+VectorHashProbeFastGate(VectorHashJoinState *state)
+{
+	HashJoin   *join = (HashJoin *) state->hj->js.ps.plan;
+	ListCell   *lc;
+	int			nkeys = 0;
+	int			out_ncols = 0;
+	int			maxkey = 0;
+
+	if (join->join.jointype != JOIN_INNER || join->join.plan.qual != NIL)
+		return false;
+
+	foreach(lc, join->hashclauses)
+	{
+		OpExpr	   *op = lfirst_node(OpExpr, lc);
+		Var		   *ovar = NULL;
+		Var		   *ivar = NULL;
+		ListCell   *arglc;
+
+		if (list_length(op->args) != 2)
+			return false;
+		foreach(arglc, op->args)
+		{
+			Node	   *arg = lfirst(arglc);
+			Var		   *v;
+
+			if (!IsA(arg, Var))
+				return false;
+			v = (Var *) arg;
+			if (v->varno == OUTER_VAR)
+				ovar = v;
+			else if (v->varno == INNER_VAR)
+				ivar = v;
+			else
+				return false;
+		}
+		if (ovar == NULL || ivar == NULL ||
+			ovar->varattno <= 0 || ivar->varattno <= 0)
+			return false;
+		state->outer_key_pos[nkeys] = ovar->varattno;
+		state->inner_key_attno[nkeys] = ivar->varattno;
+		fmgr_info(get_opcode(op->opno), &state->eq_fns[nkeys]);
+		state->eq_collations[nkeys] = exprCollation((Node *) op);
+		nkeys++;
+		maxkey = Max(maxkey, ovar->varattno);
+	}
+	if (nkeys == 0)
+		return false;
+
+	foreach(lc, join->join.plan.targetlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Var		   *v = (Var *) te->expr;
+
+		if (te->resjunk)
+			continue;
+		if (!IsA(te->expr, Var))
+			return false;
+		if (v->varno == OUTER_VAR)
+		{
+			state->out_is_outer[out_ncols] = true;
+			state->out_src[out_ncols] = v->varattno;
+			state->out_batch_col[out_ncols] =
+				state->outer_attnos[v->varattno - 1] - 1;
+		}
+		else if (v->varno == INNER_VAR)
+		{
+			state->out_is_outer[out_ncols] = false;
+			state->out_src[out_ncols] = v->varattno;
+		}
+		else
+			return false;
+		out_ncols++;
+	}
+	if (out_ncols != state->hj->js.ps.ps_ResultTupleDesc->natts ||
+		state->hash_slot->tts_tupleDescriptor->natts < maxkey)
+		return false;
+	state->nkeys = nkeys;
+	state->out_ncols = out_ncols;
+	state->hash_slot_nvalid = maxkey;
+	return true;
+}
+
+/*
+ * Batch probe: consume probe rows from state->outer_batch starting at
+ * state->outer_position, assemble matched rows directly into the output
+ * batch, and return the number of output rows produced.  May stop early on
+ * output capacity, leaving a resume cursor inside the current bucket walk.
+ */
+static int
+VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
+{
+	HashJoinState *hj = state->hj;
+	HashJoinTable hashtable = hj->hj_HashTable;
+	HashState  *hashNode = castNode(HashState, innerPlanState(hj));
+	VectorBatch *batch = state->outer_batch;
+	VectorBatch *out = state->output;
+	ExprContext *econtext = hj->js.ps.ps_ExprContext;
+	int			nrows = start_row;
+	int			row = 0;
+	int			k;
+
+	while (nrows < out->capacity)
+	{
+		uint32		hashvalue;
+		bool		hashkeys_null = false;
+		int			bucketno;
+		int			batchno;
+		HashJoinTuple cursor;
+		bool		resume_stopped = false;
+
+		/* resume an unfinished bucket walk for the current probe row */
+		if (!state->resume_active)
+		{
+			if (state->outer_position >= batch->nselected)
+				break;
+			row = VectorBatchSelectedRow(batch, state->outer_position);
+			state->outer_position++;
+
+			/* fill the hash slot with key columns only */
+			ExecClearTuple(state->hash_slot);
+			for (k = 0; k < state->nkeys; k++)
+			{
+				int			bcol = state->outer_attnos[state->outer_key_pos[k] - 1] - 1;
+
+				state->hash_slot->tts_values[state->outer_key_pos[k] - 1] =
+					VectorBatchGetDatum(batch, bcol, row);
+				state->hash_slot->tts_isnull[state->outer_key_pos[k] - 1] =
+					VectorBatchIsNull(batch, bcol, row);
+			}
+			state->hash_slot->tts_nvalid = state->hash_slot_nvalid;
+			ExecStoreVirtualTuple(state->hash_slot);
+
+			econtext->ecxt_outertuple = state->hash_slot;
+			if (!ExecHashGetHashValue(hashNode, hashtable, econtext,
+									  hj->hj_OuterHashKeys, true,
+									  hashtable->keepNulls,
+									  &hashvalue, &hashkeys_null))
+				continue;		/* null keys never match */
+			ExecHashGetBucketAndBatch(hashtable, hashvalue, &bucketno, &batchno);
+			if (batchno != 0)
+			{
+				/* spilled to another batch: fall back to the row path */
+				state->fast_probe = false;
+				break;
+			}
+			{
+				int			skewno = ExecHashGetSkewBucket(hashtable, hashvalue);
+
+				if (skewno == INVALID_SKEW_BUCKET_NO)
+					cursor = hashtable->buckets.unshared[bucketno];
+				else
+					cursor = hashtable->skewBucket[skewno]->tuples;
+			}
+		}
+		else
+		{
+			row = state->resume_row;
+			hashvalue = state->resume_hashvalue;
+			bucketno = state->resume_bucket;
+			cursor = state->resume_cursor;
+		}
+
+		for (; cursor != NULL; cursor = cursor->next.unshared)
+		{
+			bool		matched = true;
+			int			c;
+			TupleTableSlot *hslot = hj->hj_HashTupleSlot;
+
+			if (cursor->hashvalue != hashvalue)
+				continue;
+
+			if (nrows >= out->capacity)
+			{
+				state->resume_active = true;
+				state->resume_bucket = bucketno;
+				state->resume_cursor = cursor;
+				state->resume_hashvalue = hashvalue;
+				state->resume_row = row;
+				resume_stopped = true;
+				break;
+			}
+
+			ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(cursor), hslot, false);
+			for (k = 0; k < state->nkeys; k++)
+			{
+				bool		inner_null;
+				Datum		ival = slot_getattr(hslot,
+											   state->inner_key_attno[k],
+											   &inner_null);
+				Datum		oval =
+					state->hash_slot->tts_values[state->outer_key_pos[k] - 1];
+
+				if (inner_null ||
+					!DatumGetBool(FunctionCall2Coll(&state->eq_fns[k],
+													state->eq_collations[k],
+													oval, ival)))
+				{
+					matched = false;
+					break;
+				}
+			}
+			if (!matched)
+				continue;
+
+			for (c = 0; c < state->out_ncols; c++)
+			{
+				Datum		value;
+				bool		isnull;
+
+				if (state->out_is_outer[c])
+				{
+					value = VectorBatchGetDatum(batch,
+										   state->out_batch_col[c], row);
+					isnull = VectorBatchIsNull(batch,
+											   state->out_batch_col[c], row);
+				}
+				else
+				{
+					value = slot_getattr(hslot, state->out_src[c], &isnull);
+				}
+				value = VectorBatchCopyDatum(out, c, value, isnull);
+				VectorBatchSetValue(out, c, nrows, value, isnull);
+			}
+			nrows++;
+		}
+
+		if (resume_stopped)
+			break;
+		state->resume_active = false;
+	}
+
+	return nrows;
 }
 
 void
@@ -186,6 +485,46 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 		while (nrows < state->output->capacity && !state->done)
 		{
 			TupleTableSlot *result = NULL;
+
+			if (state->fast_probe && !state->outer_in_progress &&
+				!state->outer_eof && !state->done)
+			{
+				HashJoinTable hashtable = state->hj->hj_HashTable;
+
+				if (!state->fast_checked)
+				{
+					state->fast_checked = true;
+					if (hashtable == NULL)
+					{
+						VectorHashJoinBuild(state);
+						state->built = true;
+						hashtable = state->hj->hj_HashTable;
+					}
+					if (hashtable->nbatch != 1 ||
+						hashtable->parallel_state != NULL ||
+						hashtable->eagerlyReleased)
+						state->fast_probe = false;
+				}
+				if (state->fast_probe)
+				{
+					if (state->outer_batch == NULL ||
+						(state->outer_position >= state->outer_batch->nselected &&
+						 !state->resume_active))
+					{
+						state->outer_batch = NULL;
+						state->outer_position = 0;
+						if (!state->next_outer(state->outer_arg,
+											   &state->outer_batch))
+						{
+							state->outer_eof = true;
+							state->done = true;		/* inner: no fill rows */
+							continue;
+						}
+					}
+					nrows = VectorHashProbeBatchFast(state, nrows);
+					continue;
+				}
+			}
 
 			if (state->outer_in_progress)
 				result = VectorHashJoinContinue(state);
@@ -244,6 +583,8 @@ VectorHashJoinBatchReset(VectorHashJoinState *state)
 	state->done = false;
 	state->built = state->hj->hj_HashTable != NULL;
 	state->outer_in_progress = false;
+	state->fast_checked = false;
+	state->resume_active = false;
 	MemoryContextReset(state->outer_values);
 	VectorHashJoinBatchReset(state->outer_join);
 }
@@ -257,6 +598,8 @@ VectorHashJoinDestroy(VectorHashJoinState *state)
 		VectorHashJoinDestroy(state->outer_join);
 	if (state->output != NULL)
 		VectorBatchDestroy(state->output);
+	if (state->hash_slot != NULL)
+		ExecDropSingleTupleTableSlot(state->hash_slot);
 	MemoryContextDelete(state->context);
 	pfree(state);
 }
