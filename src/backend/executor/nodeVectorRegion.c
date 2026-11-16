@@ -53,10 +53,28 @@ typedef struct VectorBuildScanState
 	bool		eof;
 } VectorBuildScanState;
 
+/*
+ * Probe-leaf source for a join chain whose leaf is a row producer (a Motion
+ * receiver or a nested region's output): rows convert into batches through
+ * the same deform-and-copy loop as the region's input adapter.
+ */
+typedef struct VectorRowLeafState
+{
+	PlanState  *input;
+	VectorBatch *batch;
+	bool		eof;
+} VectorRowLeafState;
+
 typedef struct VectorRegionState
 {
 	CustomScanState css;
 	SeqScanState *scan;
+	/*
+	 * Row source feeding a join chain's probe side when the leaf is not a
+	 * scan: a Motion receiver or a nested region's row output, converted to
+	 * batches by the row adapter.
+	 */
+	struct VectorRowLeafState *row_leaf;
 	AppendState *append;
 	int			append_index;
 	VectorExprState **append_quals;
@@ -109,6 +127,7 @@ typedef struct VectorNestLoopProxy
 static TupleTableSlot *VectorRegionNestLoopOuter(PlanState *pstate);
 static TupleTableSlot *VectorRegionMaterialOuter(PlanState *pstate);
 static bool VectorRegionInitJoinChain(VectorRegionState *state);
+static void VectorRowLeafDestroy(VectorRowLeafState *leaf);
 static bool VectorRegionSortIsPassthrough(SortState *sort);
 static void VectorRegionInitBuildChain(VectorRegionState *state);
 static bool VectorRegionNextScanBatch(VectorRegionState *state);
@@ -390,6 +409,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		state->scan = NULL;
 		state->hj = NULL;
 		state->sort = NULL;
+		VectorRowLeafDestroy(state->row_leaf);
+		state->row_leaf = NULL;
 		state->input = outerPlanState(state->agg);
 	}
 	else if (state->nested_batches)
@@ -850,6 +871,62 @@ VectorHashJoinSourceNextBatch(void *arg, VectorBatch **batch)
 	return VectorHashJoinNextBatch(state);
 }
 
+static void
+VectorRowLeafDestroy(VectorRowLeafState *leaf)
+{
+	if (leaf == NULL)
+		return;
+	if (leaf->batch != NULL)
+		VectorBatchDestroy(leaf->batch);
+	pfree(leaf);
+}
+
+static bool
+VectorRowLeafNext(VectorRowLeafState *leaf)
+{
+	VectorBatch *batch = leaf->batch;
+	int			nrows = 0;
+	int			col;
+
+	if (leaf->eof)
+		return false;
+	VectorBatchReset(batch);
+	while (nrows < batch->capacity)
+	{
+		TupleTableSlot *slot = ExecProcNode(leaf->input);
+
+		if (TupIsNull(slot))
+		{
+			leaf->eof = true;
+			break;
+		}
+		slot_getallattrs(slot);
+		if (slot->tts_nvalid != batch->ncols)
+			elog(ERROR, "vector region input shape changed during execution");
+		for (col = 0; col < batch->ncols; col++)
+		{
+			Datum		value = slot->tts_values[col];
+			bool		isnull = slot->tts_isnull[col];
+
+			value = VectorBatchCopyDatum(batch, col, value, isnull);
+			VectorBatchSetValue(batch, col, nrows, value, isnull);
+		}
+		nrows++;
+	}
+	VectorBatchSetRowCount(batch, nrows);
+	return nrows > 0;
+}
+
+static bool
+VectorRowLeafSource(void *arg, VectorBatch **batch)
+{
+	VectorRowLeafState *leaf = (VectorRowLeafState *) arg;
+
+	*batch = leaf->batch;
+	/* every call hands out one fresh batch from the row source */
+	return VectorRowLeafNext(leaf);
+}
+
 static VectorHashJoinState *
 VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 {
@@ -871,12 +948,33 @@ VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 	}
 	else if (IsA(outer, SeqScanState))
 		region->scan = (SeqScanState *) outer;
+	else if (IsA(outer, MotionState) || IsA(outer, CustomScanState))
+	{
+		/*
+		 * A row producer (another slice's Motion receiver, or a nested
+		 * region whose batches already returned to rows at its root) feeds
+		 * the chain through the row adapter.
+		 */
+		region->row_leaf = MemoryContextAllocZero(region->css.ss.ps.state->es_query_cxt,
+												  sizeof(VectorRowLeafState));
+		region->row_leaf->input = outer;
+		region->row_leaf->batch = VectorBatchCreate(region->css.ss.ps.state->es_query_cxt,
+													ExecGetResultType(outer),
+													VECTOR_BATCH_DEFAULT_CAPACITY,
+													false);
+		source = VectorRowLeafSource;
+		source_arg = region->row_leaf;
+	}
 	else
 		return NULL;
 	vhj = VectorHashJoinCreateBatch(region->css.ss.ps.state->es_query_cxt,
 									hj, source, source_arg, outer_join);
 	if (vhj == NULL)
+	{
 		VectorHashJoinDestroy(outer_join);
+		VectorRowLeafDestroy(region->row_leaf);
+		region->row_leaf = NULL;
+	}
 	return vhj;
 }
 
@@ -1510,6 +1608,7 @@ VectorRegionEnd(CustomScanState *node)
 	if (state->build_vhj != NULL)
 		VectorHashJoinDestroy(state->build_vhj);
 	VectorBuildScanDestroy(state->build_scan);
+	VectorRowLeafDestroy(state->row_leaf);
 	if (state->proj != NULL)
 	{
 		int			col;
@@ -1575,6 +1674,8 @@ VectorRegionRescan(CustomScanState *node)
 	}
 	if (state->vhj != NULL)
 		VectorHashJoinReset(state->vhj);
+	if (state->row_leaf != NULL)
+		state->row_leaf->eof = false;
 	if (state->build_vhj != NULL)
 	{
 		VectorHashJoinReset(state->build_vhj);

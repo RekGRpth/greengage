@@ -2413,9 +2413,9 @@ GROUP BY g ORDER BY g;
                Sort Key: vector_region_1.g
                ->  Redistribute Motion 3:3  (slice2; segments: 3)
                      Hash Key: vector_region_1.g
-                     ->  Streaming Partial HashAggregate
-                           Group Key: vector_region_1.g
-                           ->  Custom Scan (VectorRegion)
+                     ->  Custom Scan (VectorRegion)
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: (vector_region.id % 3)
                                  ->  Hash Join
                                        Hash Cond: ((l.id % 10) = (vector_region.id - 1))
                                        ->  Seq Scan on vector_aoco_test l

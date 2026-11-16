@@ -261,7 +261,16 @@ VectorAggPlanIsSupported(Agg *agg)
 		 agg->aggstrategy != AGG_SORTED && agg->aggstrategy != AGG_MIXED) ||
 		(agg->aggsplit != AGGSPLIT_SIMPLE &&
 		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
-		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0 || agg->streaming)
+		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0)
+		return false;
+	/*
+	 * A streaming hash aggregate processes input in rounds without spilling
+	 * and may emit a group's partial state more than once; the consumer
+	 * (a Finalize aggregate) combines states associatively, so emitting the
+	 * whole input in one pass is equivalent.  Other streaming strategies
+	 * stay with the standard executor.
+	 */
+	if (agg->streaming && agg->aggstrategy != AGG_HASHED)
 		return false;
 	if (agg->aggstrategy == AGG_MIXED)
 	{
