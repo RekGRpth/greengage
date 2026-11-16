@@ -27,6 +27,7 @@ struct VectorHashJoinState
 	HashJoinState *hj;
 	AttrNumber *outer_attnos;
 	int			outer_ncols;
+	bool		outer_dirty;	/* outer_values holds copies since last reset */
 	bool		built;
 	bool		outer_in_progress;
 	VectorHashJoinSourceNext next_outer;
@@ -390,7 +391,11 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 		state->built = true;
 	}
 
-	MemoryContextReset(state->outer_values);
+	if (state->outer_dirty)
+	{
+		MemoryContextReset(state->outer_values);
+		state->outer_dirty = false;
+	}
 	ExecClearTuple(outer);
 	for (col = 0; col < state->outer_ncols; col++)
 	{
@@ -399,11 +404,17 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 		Datum		value = VectorBatchGetDatum(batch, attno - 1, row);
 		bool		isnull = VectorBatchIsNull(batch, attno - 1, row);
 
+		/*
+		 * Result slots project by-ref outer values by reference and consumers
+		 * may outlive the current batch, so the copy cannot be skipped (an
+		 * attempt regressed q14 with invalid-memory errors).
+		 */
 		if (!isnull && !batch->columns[attno - 1].typbyval)
 		{
 			MemoryContext oldcontext = MemoryContextSwitchTo(state->outer_values);
 
 			value = datumCopy(value, false, batch->columns[attno - 1].typlen);
+			state->outer_dirty = true;
 			MemoryContextSwitchTo(oldcontext);
 		}
 		outer->tts_values[col] = value;
