@@ -2079,7 +2079,7 @@ FROM vector_aoco_small GROUP BY 1 ORDER BY 1;
                            Hash Key: vector_region.c1
                            ->  Custom Scan (VectorRegion)
                                  ->  Seq Scan on vector_aoco_small
-(11 rows)
+(12 rows)
 
 SELECT id % 3 AS g, count(DISTINCT val), sum(DISTINCT id % 10)
 FROM vector_aoco_test GROUP BY 1 ORDER BY 1;
@@ -2389,6 +2389,56 @@ ORDER BY a NULLS FIRST, b NULLS FIRST, g;
  2 | 1 | 0 |  1 | v5
 (10 rows)
 
+RESET enable_hashagg;
+-- A sorted aggregate over a join chain: the region drives the Sort between
+-- the join output batches and the sorted aggregation input.  The 4000-row
+-- join output crosses the batch boundary inside a group.
+SET enable_hashagg = off;
+SET gp_eager_two_phase_agg = on;
+EXPLAIN (COSTS OFF)
+SELECT s.id % 3 AS g, count(*), sum(l.id), min(l.num)
+FROM vector_aoco_test l JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
+GROUP BY g ORDER BY g;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: vector_region_1.c1
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: vector_region_1.c1
+         ->  Custom Scan (VectorRegion)
+               ->  Partial GroupAggregate
+                     Group Key: ((vector_region.c1 % 3))
+                     ->  Sort
+                           Sort Key: ((vector_region.c1 % 3))
+                           ->  Hash Join
+                                 Hash Cond: ((l.id % 10) = (vector_region.c1 - 1))
+                                 ->  Seq Scan on vector_aoco_test l
+                                 ->  Hash
+                                       ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                             ->  Custom Scan (VectorRegion)
+                                                   ->  Seq Scan on vector_aoco_small s
+(17 rows)
+
+SELECT s.id % 3 AS g, count(*), sum(l.id), min(l.num)
+FROM vector_aoco_test l JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
+GROUP BY g ORDER BY g;
+ g | count |   sum   | min  
+---+-------+---------+------
+ 0 |  1366 | 3420913 | 0.67
+ 1 |  1823 | 4569585 | 0.00
+ 2 |  1366 | 3420917 | 0.33
+(3 rows)
+
+SELECT s.id % 2 AS g, count(*), sum(l.num)
+FROM vector_aoco_test l LEFT JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
+GROUP BY g ORDER BY g;
+ g | count |   sum    
+---+-------+----------
+ 0 |  2277 | 37865.18
+ 1 |  2278 | 37101.07
+(2 rows)
+
+RESET gp_eager_two_phase_agg;
 RESET enable_hashagg;
 -- Mixed aggregation (hashed grouping sets plus the plain empty set):
 -- every row advances every set in one pass, plain sets project first.

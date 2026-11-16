@@ -755,6 +755,23 @@ SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,
 FROM vector_aoco_small GROUP BY GROUPING SETS ((a, b), (a), ())
 ORDER BY a NULLS FIRST, b NULLS FIRST, g;
 RESET enable_hashagg;
+-- A sorted aggregate over a join chain: the region drives the Sort between
+-- the join output batches and the sorted aggregation input.  The 4000-row
+-- join output crosses the batch boundary inside a group.
+SET enable_hashagg = off;
+SET gp_eager_two_phase_agg = on;
+EXPLAIN (COSTS OFF)
+SELECT s.id % 3 AS g, count(*), sum(l.id), min(l.num)
+FROM vector_aoco_test l JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
+GROUP BY g ORDER BY g;
+SELECT s.id % 3 AS g, count(*), sum(l.id), min(l.num)
+FROM vector_aoco_test l JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
+GROUP BY g ORDER BY g;
+SELECT s.id % 2 AS g, count(*), sum(l.num)
+FROM vector_aoco_test l LEFT JOIN vector_aoco_small s ON l.id % 10 = s.id - 1
+GROUP BY g ORDER BY g;
+RESET gp_eager_two_phase_agg;
+RESET enable_hashagg;
 -- Mixed aggregation (hashed grouping sets plus the plain empty set):
 -- every row advances every set in one pass, plain sets project first.
 SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,

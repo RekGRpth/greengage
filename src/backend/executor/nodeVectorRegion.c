@@ -86,6 +86,7 @@ typedef struct VectorRegionState
 	VectorExprState **proj;		/* per output column; NULL for plain columns */
 	VectorExprState *qual;
 	int		   *output_attnos;
+	int		   *sort_attnos;	/* identity column map for a region-driven Sort */
 	bool	   *read_attrs;
 	int			output_ncols;
 	int			position;
@@ -108,6 +109,7 @@ typedef struct VectorNestLoopProxy
 static TupleTableSlot *VectorRegionNestLoopOuter(PlanState *pstate);
 static TupleTableSlot *VectorRegionMaterialOuter(PlanState *pstate);
 static bool VectorRegionInitJoinChain(VectorRegionState *state);
+static bool VectorRegionSortIsPassthrough(SortState *sort);
 static void VectorRegionInitBuildChain(VectorRegionState *state);
 static bool VectorRegionNextScanBatch(VectorRegionState *state);
 static VectorBatch *VectorRegionInputBatch(VectorRegionState *state);
@@ -215,6 +217,20 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 
 		state->agg = (AggState *) child;
 		outer = outerPlanState(state->agg);
+		/*
+		 * A pass-through Sort below the aggregate (the sorted-aggregate plan
+		 * shape) is driven by the region: the join chain feeds the native
+		 * batch sort, and the aggregate reads sorted batches from it.  Only
+		 * the join-chain shape is wired this way; anything else keeps the
+		 * row-wise input adapter over the Sort.
+		 */
+		if (IsA(outer, SortState) &&
+			VectorRegionSortIsPassthrough((SortState *) outer) &&
+			IsA(outerPlanState((SortState *) outer), HashJoinState))
+		{
+			state->sort = (SortState *) outer;
+			outer = outerPlanState(state->sort);
+		}
 		if (IsA(outer, SeqScanState))
 			state->scan = (SeqScanState *) outer;
 		else if (IsA(outer, AppendState))
@@ -222,7 +238,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		else if (IsA(outer, HashJoinState))
 			state->hj = (HashJoinState *) outer;
 		else
-			state->input = outer;
+			state->input = state->sort != NULL ? (PlanState *) state->sort : outer;
 	}
 	else if (IsA(child, MaterialState))
 	{
@@ -365,6 +381,7 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	{
 		state->scan = NULL;
 		state->hj = NULL;
+		state->sort = NULL;
 		state->input = outerPlanState(state->agg);
 	}
 	else if (state->nested_batches)
@@ -643,6 +660,17 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 				col++;
 			}
 		}
+		if (state->sort != NULL)
+		{
+			/* the sort consumes and produces the join output columns as-is */
+			int			ncols = ExecGetResultType(outerPlanState(state->sort))->natts;
+			int			i;
+
+			state->sort_attnos = MemoryContextAlloc(estate->es_query_cxt,
+											 sizeof(int) * Max(ncols, 1));
+			for (i = 0; i < ncols; i++)
+				state->sort_attnos[i] = i;
+		}
 		if (state->agg != NULL)
 		{
 			state->vagg = VectorAggCreate(estate->es_query_cxt, state->agg,
@@ -851,6 +879,38 @@ VectorRegionInitJoinChain(VectorRegionState *state)
 	state->nested_batches = true;
 	state->vhj = vhj;
 	return true;
+}
+
+/*
+ * A Sort the region may drive itself between the aggregate and the join
+ * chain: a plain pass-through of its input, so the aggregate reads the join
+ * output columns unchanged.  Junk entries (sort keys) are fine; anything
+ * computed in the targetlist is not.
+ */
+static bool
+VectorRegionSortIsPassthrough(SortState *sort)
+{
+	Sort	   *plan = (Sort *) sort->ss.ps.plan;
+	ListCell   *lc;
+	int			ncols = 0;
+
+	if (plan->plan.qual != NIL)
+		return false;
+	foreach(lc, plan->plan.targetlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Var		   *var;
+
+		if (te->resjunk)
+			continue;
+		if (!IsA(te->expr, Var))
+			return false;
+		var = (Var *) te->expr;
+		if (var->varno != OUTER_VAR || var->varattno != te->resno)
+			return false;
+		ncols++;
+	}
+	return ncols == ExecGetResultType(outerPlanState(sort))->natts;
 }
 
 static void
@@ -1156,17 +1216,19 @@ VectorRegionNextScanBatch(VectorRegionState *state)
 }
 
 static void
-VectorRegionSortInput(VectorRegionState *state)
+VectorRegionSortInput(VectorRegionState *state, const int *sort_attnos)
 {
 	ScanDirection dir = state->css.ss.ps.state->es_direction;
+	VectorBatch *input = VectorRegionInputBatch(state);
+	int		   *cursor = state->nested_batches ? &state->join_position : &state->position;
 
 	if (state->sort->sort_Done)
 		return;
 	state->css.ss.ps.state->es_direction = ForwardScanDirection;
 	while (VectorRegionNextBatch(state))
 	{
-		VectorSortPutBatch(state->sort, state->batch, state->output_attnos);
-		state->position = state->batch->nselected;
+		VectorSortPutBatch(state->sort, input, sort_attnos);
+		*cursor = input->nselected;
 	}
 	VectorSortFinish(state->sort);
 	state->css.ss.ps.state->es_direction = dir;
@@ -1256,14 +1318,14 @@ VectorRegionExec(CustomScanState *node)
 
 	if (state->mergejoin != NULL)
 	{
-		VectorRegionSortInput(state);
+		VectorRegionSortInput(state, state->output_attnos);
 		state->sort->ss.ps.ExecProcNode = VectorSortExec;
 		return VectorMergeJoinNext(state->mergejoin);
 	}
 
 	if (state->unique != NULL)
 	{
-		VectorRegionSortInput(state);
+		VectorRegionSortInput(state, state->output_attnos);
 		for (;;)
 		{
 			TupleTableSlot *input = VectorSortNext(state->sort);
@@ -1279,7 +1341,7 @@ VectorRegionExec(CustomScanState *node)
 
 	if (state->sort != NULL && state->sort->randomAccess)
 	{
-		VectorRegionSortInput(state);
+		VectorRegionSortInput(state, state->output_attnos);
 		return VectorSortNext(state->sort);
 	}
 
@@ -1289,7 +1351,41 @@ VectorRegionExec(CustomScanState *node)
 		VectorBatch *input = VectorRegionInputBatch(state);
 		int		   *cursor = state->nested_batches ? &state->join_position : &state->position;
 
-		if (agg->aggstrategy == AGG_SORTED)
+		if (state->sort != NULL)
+		{
+			/*
+			 * A native sort sits between the join chain and the aggregate:
+			 * drain the chain into it once, then feed the aggregate sorted
+			 * batches (the sorted-aggregate machinery needs group-contiguous
+			 * input).
+			 */
+			VectorRegionSortInput(state, state->sort_attnos);
+			for (;;)
+			{
+				if (*cursor >= input->nselected)
+				{
+					if (!VectorSortNextBatch(state->sort, input,
+											 state->sort_attnos))
+						break;
+					*cursor = 0;
+				}
+				if (agg->aggstrategy == AGG_SORTED)
+				{
+					TupleTableSlot *result = VectorAggProcessBatchSorted(state->vagg,
+																		 input,
+																		 cursor);
+
+					if (result != NULL)
+						return result;
+				}
+				else
+				{
+					VectorAggProcessBatch(state->vagg, input);
+					*cursor = input->nselected;
+				}
+			}
+		}
+		else if (agg->aggstrategy == AGG_SORTED)
 		{
 			while (!agg->input_done &&
 				   (*cursor < input->nselected ||
@@ -1328,7 +1424,7 @@ VectorRegionExec(CustomScanState *node)
 		{
 			if (state->position >= state->batch->nselected)
 			{
-				VectorRegionSortInput(state);
+				VectorRegionSortInput(state, state->output_attnos);
 				if (!VectorSortNextBatch(state->sort, state->batch,
 									 state->output_attnos))
 					return slot;
@@ -1424,6 +1520,8 @@ VectorRegionEnd(CustomScanState *node)
 		VectorExprDestroy(state->qual);
 	if (state->output_attnos != NULL)
 		pfree(state->output_attnos);
+	if (state->sort_attnos != NULL)
+		pfree(state->sort_attnos);
 	if (state->read_attrs != NULL)
 		pfree(state->read_attrs);
 	if (state->nl_proxy != NULL)
@@ -1447,6 +1545,18 @@ VectorRegionRescan(CustomScanState *node)
 		outerPlanState(state->material) = state->mat_outer;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
+	if (state->sort != NULL)
+	{
+		/* same reset as ExecReScanSort, without recursing into the chain */
+		VectorSortReset(state->sort);
+		state->sort->sort_Done = false;
+		if (state->sort->tuplesortstate != NULL)
+		{
+			tuplesort_end((Tuplesortstate *) state->sort->tuplesortstate);
+			state->sort->tuplesortstate = NULL;
+		}
+		ExecClearTuple(state->sort->ss.ps.ps_ResultTupleSlot);
+	}
 	if (state->vhj != NULL)
 		VectorHashJoinReset(state->vhj);
 	if (state->build_vhj != NULL)
