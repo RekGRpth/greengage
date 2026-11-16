@@ -72,6 +72,8 @@ struct VectorHashJoinState
 	bool		fill_outer;		/* LEFT: emit null-filled unmatched rows */
 	bool		fill_inner;		/* RIGHT: mark matches for the finish phase */
 	bool		row_matched;	/* current probe row already emitted a match */
+	bool		hash_direct;	/* single key: hash straight from the batch */
+	Datum		probe_key;		/* current probe key (survives a resume) */
 };
 
 bool
@@ -302,6 +304,12 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 		state->hash_slot->tts_tupleDescriptor->natts < maxkey)
 		return false;
 	state->nkeys = nkeys;
+	/*
+	 * A single hash clause hashes straight from the batch column: with one
+	 * key the combine is just hashfn(key), so neither the slot nor the
+	 * expression interpreter is needed.
+	 */
+	state->hash_direct = (nkeys == 1);
 	state->out_ncols = out_ncols;
 	state->hash_slot_nvalid = maxkey;
 	return true;
@@ -344,26 +352,52 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 			row = VectorBatchSelectedRow(batch, state->outer_position);
 			state->outer_position++;
 
-			/* fill the hash slot with key columns only */
-			ExecClearTuple(state->hash_slot);
-			for (k = 0; k < state->nkeys; k++)
+			if (state->hash_direct)
 			{
-				int			bcol = state->outer_attnos[state->outer_key_pos[k] - 1] - 1;
+				/*
+				 * Single key: with one clause the combine is hashfn(key),
+				 * so hash straight from the batch column.  Null semantics
+				 * follow ExecHashGetHashValue (strict keys reject the row
+				 * unless the table keeps nulls).
+				 */
+				int			bcol = state->outer_attnos[state->outer_key_pos[0] - 1] - 1;
+				Datum		keyval = VectorBatchGetDatum(batch, bcol, row);
 
-				state->hash_slot->tts_values[state->outer_key_pos[k] - 1] =
-					VectorBatchGetDatum(batch, bcol, row);
-				state->hash_slot->tts_isnull[state->outer_key_pos[k] - 1] =
-					VectorBatchIsNull(batch, bcol, row);
+				state->probe_key = keyval;
+				if (VectorBatchIsNull(batch, bcol, row))
+				{
+					if (hashtable->hashStrict[0] && !hashtable->keepNulls)
+						continue;	/* strict key: never matches */
+					hashvalue = 0;	/* null hashes as zero, like the interp */
+				}
+				else
+					hashvalue = DatumGetUInt32(FunctionCall1Coll(
+								 &hashtable->outer_hashfunctions[0],
+								 hashtable->collations[0], keyval));
 			}
-			state->hash_slot->tts_nvalid = state->hash_slot_nvalid;
-			ExecStoreVirtualTuple(state->hash_slot);
+			else
+			{
+				/* fill the hash slot with key columns only */
+				ExecClearTuple(state->hash_slot);
+				for (k = 0; k < state->nkeys; k++)
+				{
+					int			bcol = state->outer_attnos[state->outer_key_pos[k] - 1] - 1;
 
-			econtext->ecxt_outertuple = state->hash_slot;
-			if (!ExecHashGetHashValue(hashNode, hashtable, econtext,
-									  hj->hj_OuterHashKeys, true,
-									  hashtable->keepNulls,
-									  &hashvalue, &hashkeys_null))
-				continue;		/* null keys never match */
+					state->hash_slot->tts_values[state->outer_key_pos[k] - 1] =
+						VectorBatchGetDatum(batch, bcol, row);
+					state->hash_slot->tts_isnull[state->outer_key_pos[k] - 1] =
+						VectorBatchIsNull(batch, bcol, row);
+				}
+				state->hash_slot->tts_nvalid = state->hash_slot_nvalid;
+				ExecStoreVirtualTuple(state->hash_slot);
+
+				econtext->ecxt_outertuple = state->hash_slot;
+				if (!ExecHashGetHashValue(hashNode, hashtable, econtext,
+										  hj->hj_OuterHashKeys, true,
+										  hashtable->keepNulls,
+										  &hashvalue, &hashkeys_null))
+					continue;	/* null keys never match */
+			}
 			ExecHashGetBucketAndBatch(hashtable, hashvalue, &bucketno, &batchno);
 			if (batchno != 0)
 			{
@@ -415,8 +449,9 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				Datum		ival = slot_getattr(hslot,
 											   state->inner_key_attno[k],
 											   &inner_null);
-				Datum		oval =
-					state->hash_slot->tts_values[state->outer_key_pos[k] - 1];
+				Datum		oval = state->hash_direct
+					? state->probe_key
+					: state->hash_slot->tts_values[state->outer_key_pos[k] - 1];
 
 				if (inner_null ||
 					!DatumGetBool(FunctionCall2Coll(&state->eq_fns[k],
