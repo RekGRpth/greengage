@@ -2144,26 +2144,6 @@ static inline void SaveWorkFileSetStatsInfo(HashJoinTable hashtable)
 	}
 }
 
-void
-VectorHashJoinBuild(HashJoinState *node)
-{
-	HashState  *hashNode = castNode(HashState, innerPlanState(node));
-	HashJoinTable hashtable;
-
-	hashtable = ExecHashTableCreate(hashNode, node, node->hj_HashOperators,
-									node->hj_Collations,
-									HJ_FILL_INNER(node) || hashNode->hs_keepnull,
-									PlanStateOperatorMemKB((PlanState *) hashNode));
-	node->hj_HashTable = hashtable;
-	hashNode->hashtable = hashtable;
-	MultiExecHash(hashNode);
-	node->hj_HashTable = hashNode->hashtable;
-	node->hj_HashTable->nbatch_outstart = node->hj_HashTable->nbatch;
-	node->hj_InnerEmpty = node->hj_HashTable->totalTuples == 0;
-	node->hj_OuterNotEmpty = false;
-	node->hj_JoinState = HJ_NEED_NEW_OUTER;
-}
-
 static TupleTableSlot *
 VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eof)
 {

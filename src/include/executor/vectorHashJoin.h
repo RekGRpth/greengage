@@ -23,6 +23,9 @@ extern VectorHashJoinState *VectorHashJoinCreateBatch(MemoryContext parent,
 									void *outer_arg,
 									VectorHashJoinState *outer_join);
 extern VectorBatch *VectorHashJoinOutput(VectorHashJoinState *state);
+extern void VectorHashJoinSetBuildSource(VectorHashJoinState *state,
+										 VectorHashJoinSourceNext next,
+										 void *arg);
 extern bool VectorHashJoinNextBatch(VectorHashJoinState *state);
 extern void VectorHashJoinDestroy(VectorHashJoinState *state);
 extern TupleTableSlot *VectorHashJoinNextRow(VectorHashJoinState *state,
@@ -33,7 +36,7 @@ extern TupleTableSlot *VectorHashJoinFinish(VectorHashJoinState *state);
 extern void VectorHashJoinReset(VectorHashJoinState *state);
 
 /* nodeHashjoin.c entry points into its existing build and probe machinery. */
-extern void VectorHashJoinBuild(HashJoinState *node);
+extern void VectorHashJoinBuild(VectorHashJoinState *state);
 extern TupleTableSlot *VectorHashJoinProbe(HashJoinState *node,
 										  TupleTableSlot *outer);
 extern TupleTableSlot *VectorHashJoinProbeFinal(HashJoinState *node);

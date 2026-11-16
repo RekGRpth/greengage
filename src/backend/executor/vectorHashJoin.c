@@ -7,8 +7,18 @@
  */
 #include "postgres.h"
 
+#include "executor/executor.h"
+#include "executor/nodeHash.h"
 #include "executor/vectorHashJoin.h"
+#include "miscadmin.h"
 #include "utils/datum.h"
+#include "utils/faultinjector.h"
+
+/* same state-machine constants as nodeHashjoin.c */
+#define HJ_NEED_NEW_OUTER		2
+
+/* Returns true if doing null-fill on inner relation */
+#define HJ_FILL_INNER(hjstate)	((hjstate)->hj_NullOuterTupleSlot != NULL)
 
 struct VectorHashJoinState
 {
@@ -27,6 +37,8 @@ struct VectorHashJoinState
 	bool		outer_eof;
 	bool		done;
 	VectorBatch *output;
+	VectorHashJoinSourceNext next_build;	/* batch feed for the hash build */
+	void	   *build_arg;
 };
 
 bool
@@ -131,6 +143,14 @@ VectorBatch *
 VectorHashJoinOutput(VectorHashJoinState *state)
 {
 	return state->output;
+}
+
+void
+VectorHashJoinSetBuildSource(VectorHashJoinState *state,
+							 VectorHashJoinSourceNext next, void *arg)
+{
+	state->next_build = next;
+	state->build_arg = arg;
 }
 
 static void
@@ -240,6 +260,122 @@ VectorHashJoinDestroy(VectorHashJoinState *state)
 	pfree(state);
 }
 
+/*
+ * Build the hash table from join output batches when the build side of the
+ * join is itself a batch pipeline; otherwise MultiExecHash pulls rows the
+ * usual way.  The per-row sequence mirrors MultiExecPrivateHash.
+ */
+static void
+VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
+						   HashJoinTable hashtable)
+{
+	ExprContext *econtext = hashNode->ps.ps_ExprContext;
+	List	   *hashkeys = hashNode->hashkeys;
+	PlanState  *child = outerPlanState(hashNode);
+	TupleTableSlot *slot;
+	int			ncols;
+	int			col;
+	int			row;
+	bool		quit = false;
+
+	slot = MakeSingleTupleTableSlot(child->ps_ResultTupleDesc, &TTSOpsVirtual);
+	ncols = slot->tts_tupleDescriptor->natts;
+
+	while (!quit && VectorHashJoinNextBatch((VectorHashJoinState *) state->build_arg))
+	{
+		VectorBatch *batch = ((VectorHashJoinState *) state->build_arg)->output;
+
+		for (row = 0; row < batch->nselected; row++)
+		{
+			bool		hashkeys_null = false;
+			uint32		hashvalue;
+			Datum		value;
+			bool		isnull;
+
+			CHECK_FOR_INTERRUPTS();
+
+			ExecClearTuple(slot);
+			for (col = 0; col < ncols; col++)
+			{
+				value = VectorBatchGetDatum(batch, col, row);
+				isnull = VectorBatchIsNull(batch, col, row);
+				slot->tts_values[col] = value;
+				slot->tts_isnull[col] = isnull;
+			}
+			slot->tts_nvalid = ncols;
+			ExecStoreVirtualTuple(slot);
+
+			econtext->ecxt_outertuple = slot;
+			if (ExecHashGetHashValue(hashNode, hashtable, econtext, hashkeys,
+									 false, hashtable->keepNulls,
+									 &hashvalue, &hashkeys_null))
+			{
+				int			bucketNumber = ExecHashGetSkewBucket(hashtable, hashvalue);
+
+				if (bucketNumber != INVALID_SKEW_BUCKET_NO)
+				{
+					ExecHashSkewTableInsert(hashNode, hashtable, slot, hashvalue,
+											bucketNumber);
+					hashtable->skewTuples += 1;
+				}
+				else
+					ExecHashTableInsert(hashNode, hashtable, slot, hashvalue);
+				hashtable->totalTuples += 1;
+			}
+
+			if (hashkeys_null)
+			{
+				hashNode->hs_hashkeys_null = true;
+				if (hashNode->hs_quit_if_hashkeys_null)
+				{
+					quit = true;
+					break;
+				}
+			}
+		}
+	}
+
+	ExecClearTuple(slot);
+	ExecDropSingleTupleTableSlot(slot);
+
+	/* the same finishing steps as MultiExecPrivateHash */
+	hashtable->nbatch_outstart = hashtable->nbatch;
+	if (hashtable->nbuckets != hashtable->nbuckets_optimal)
+		ExecHashIncreaseNumBuckets(hashtable);
+	hashtable->spaceUsed += hashtable->nbuckets * sizeof(HashJoinTuple);
+	if (hashtable->spaceUsed > hashtable->spacePeak)
+		hashtable->spacePeak = hashtable->spaceUsed;
+	hashtable->partialTuples = hashtable->totalTuples;
+}
+
+void
+VectorHashJoinBuild(VectorHashJoinState *state)
+{
+	HashJoinState *node = state->hj;
+	HashState  *hashNode = castNode(HashState, innerPlanState(node));
+	HashJoinTable hashtable;
+
+	hashtable = ExecHashTableCreate(hashNode, node, node->hj_HashOperators,
+									node->hj_Collations,
+									HJ_FILL_INNER(node) || hashNode->hs_keepnull,
+									PlanStateOperatorMemKB((PlanState *) hashNode));
+	node->hj_HashTable = hashtable;
+	hashNode->hashtable = hashtable;
+
+	SIMPLE_FAULT_INJECTOR("multi_exec_hash_large_vmem");
+
+	if (state->next_build != NULL)
+		VectorHashBuildFromBatches(state, hashNode, hashtable);
+	else
+		MultiExecHash(hashNode);
+
+	node->hj_HashTable = hashNode->hashtable;
+	node->hj_HashTable->nbatch_outstart = node->hj_HashTable->nbatch;
+	node->hj_InnerEmpty = node->hj_HashTable->totalTuples == 0;
+	node->hj_OuterNotEmpty = false;
+	node->hj_JoinState = HJ_NEED_NEW_OUTER;
+}
+
 TupleTableSlot *
 VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int position)
 {
@@ -250,7 +386,7 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 
 	if (!state->built)
 	{
-		VectorHashJoinBuild(hj);
+		VectorHashJoinBuild(state);
 		state->built = true;
 	}
 
@@ -306,7 +442,7 @@ VectorHashJoinFinish(VectorHashJoinState *state)
 {
 	if (!state->built)
 	{
-		VectorHashJoinBuild(state->hj);
+		VectorHashJoinBuild(state);
 		state->built = true;
 	}
 	return VectorHashJoinProbeFinal(state->hj);

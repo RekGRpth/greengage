@@ -39,6 +39,20 @@
 
 #define VECTOR_REGION_NAME "VectorRegion"
 
+/*
+ * Batch-leaf for the build side of a nested join chain: a second scan whose
+ * batches feed the hash build, independent of the region's own leaf.
+ */
+typedef struct VectorBuildScanState
+{
+	MemoryContext context;		/* owns batch, qual, read_attrs */
+	SeqScanState *scan;
+	VectorBatch *batch;
+	VectorExprState *qual;
+	bool	   *read_attrs;
+	bool		eof;
+} VectorBuildScanState;
+
 typedef struct VectorRegionState
 {
 	CustomScanState css;
@@ -63,6 +77,8 @@ typedef struct VectorRegionState
 	HashJoinState *hj;
 	VectorAggState *vagg;
 	VectorHashJoinState *vhj;
+	VectorHashJoinState *build_vhj;
+	VectorBuildScanState *build_scan;
 	VectorBatch *batch;
 	VectorBatch *join_batch;
 	bool		nested_batches;
@@ -92,6 +108,7 @@ typedef struct VectorNestLoopProxy
 static TupleTableSlot *VectorRegionNestLoopOuter(PlanState *pstate);
 static TupleTableSlot *VectorRegionMaterialOuter(PlanState *pstate);
 static bool VectorRegionInitJoinChain(VectorRegionState *state);
+static void VectorRegionInitBuildChain(VectorRegionState *state);
 static bool VectorRegionNextScanBatch(VectorRegionState *state);
 static VectorBatch *VectorRegionInputBatch(VectorRegionState *state);
 static Node *VectorRegionCreateState(CustomScan *cscan);
@@ -350,6 +367,8 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		state->hj = NULL;
 		state->input = outerPlanState(state->agg);
 	}
+	else if (state->nested_batches)
+		VectorRegionInitBuildChain(state);
 
 	if (state->append != NULL)
 	{
@@ -674,27 +693,21 @@ VectorRegionReadAdapter(VectorRegionState *state)
  * and qual.  The table AM fills the raw scan slot; referenced attributes are
  * deformed into columns and by-ref datums are copied before the slot is reused.
  */
+/* Fill a batch from a row slot stream; shared by region and build leaves. */
 static bool
-VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc,
-						VectorBatch *batch)
+VectorScanRowsToBatch(VectorBatch *batch, TupleTableSlot *slot,
+					  TableScanDesc scandesc, ScanDirection dir,
+					  bool *read_attrs, bool *eof)
 {
-	TupleTableSlot *slot = state->scan->ss.ss_ScanTupleSlot;
-	bool	   *read_attrs = state->read_attrs;
 	int			nrows = 0;
-
-	/* a divergent append child deforms its own attribute set */
-	if (batch != state->batch && state->append != NULL)
-		read_attrs = state->append_read_attrs[state->append_index];
+	int			col;
 
 	VectorBatchReset(batch);
 	while (nrows < batch->capacity)
 	{
-		int			col;
-
-		if (!table_scan_getnextslot(scandesc,
-								   state->scan->ss.ps.state->es_direction, slot))
+		if (!table_scan_getnextslot(scandesc, dir, slot))
 		{
-			state->eof = true;
+			*eof = true;
 			break;
 		}
 
@@ -714,6 +727,22 @@ VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc,
 
 	VectorBatchSetRowCount(batch, nrows);
 	return nrows > 0;
+}
+
+static bool
+VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc,
+						VectorBatch *batch)
+{
+	TupleTableSlot *slot = state->scan->ss.ss_ScanTupleSlot;
+	bool	   *read_attrs = state->read_attrs;
+
+	/* a divergent append child deforms its own attribute set */
+	if (batch != state->batch && state->append != NULL)
+		read_attrs = state->append_read_attrs[state->append_index];
+
+	return VectorScanRowsToBatch(batch, slot, scandesc,
+								 state->scan->ss.ps.state->es_direction,
+								 read_attrs, &state->eof);
 }
 
 /*
@@ -810,6 +839,189 @@ VectorRegionInitJoinChain(VectorRegionState *state)
 	state->nested_batches = true;
 	state->vhj = vhj;
 	return true;
+}
+
+static void
+VectorBuildScanDestroy(VectorBuildScanState *vs)
+{
+	if (vs == NULL)
+		return;
+	if (vs->qual != NULL)
+		VectorExprDestroy(vs->qual);
+	if (vs->context != NULL)
+		MemoryContextDelete(vs->context);	/* owns batch and read_attrs */
+	pfree(vs);
+}
+
+static VectorBuildScanState *
+VectorBuildScanCreate(VectorRegionState *region, SeqScanState *scan,
+					  EState *estate)
+{
+	VectorBuildScanState *vs;
+	Relation	relation = scan->ss.ss_currentRelation;
+	SeqScan    *plan = (SeqScan *) scan->ss.ps.plan;
+	MemoryContext oldcontext;
+	Bitmapset  *attrs = NULL;
+	int			natts = RelationGetNumberOfAttributes(relation);
+	int			a;
+
+	if (!RelationIsAoCols(relation))
+		return NULL;			/* batch reads only for AOCS in the build leaf */
+
+	vs = MemoryContextAllocZero(estate->es_query_cxt, sizeof(VectorBuildScanState));
+	vs->context = AllocSetContextCreate(estate->es_query_cxt,
+										"Vector Build Scan",
+										ALLOCSET_DEFAULT_MINSIZE,
+										ALLOCSET_DEFAULT_INITSIZE,
+										ALLOCSET_DEFAULT_MAXSIZE);
+	vs->scan = scan;
+	oldcontext = MemoryContextSwitchTo(vs->context);
+	vs->batch = VectorBatchCreate(vs->context, RelationGetDescr(relation),
+								  VECTOR_BATCH_DEFAULT_CAPACITY, false);
+
+	vs->read_attrs = MemoryContextAllocZero(vs->context, sizeof(bool) * natts);
+	pull_varattnos((Node *) plan->plan.targetlist, plan->scanrelid, &attrs);
+	pull_varattnos((Node *) plan->plan.qual, plan->scanrelid, &attrs);
+	while ((a = bms_first_member(attrs)) > 0)
+	{
+		a += FirstLowInvalidHeapAttributeNumber;
+		if (a > 0 && a <= natts)
+			vs->read_attrs[a - 1] = true;
+	}
+	bms_free(attrs);
+
+	if (plan->plan.qual != NIL)
+	{
+		VectorExprVarMap vars = {plan->scanrelid, NULL, 0, estate};
+
+		vars.parent = &scan->ss.ps;
+		vars.allow_correlated = false;
+		vs->qual = VectorExprCompile(vs->context, (Expr *) plan->plan.qual,
+									 vs->batch, &vars);
+		if (vs->qual == NULL)
+		{
+			VectorBuildScanDestroy(vs);
+			MemoryContextSwitchTo(oldcontext);
+			return NULL;
+		}
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+	return vs;
+}
+
+static bool
+VectorBuildScanNext(VectorBuildScanState *vs)
+{
+	TableScanDesc scandesc;
+
+	for (;;)
+	{
+		if (vs->eof)
+			return false;
+		scandesc = vs->scan->ss.ss_currentScanDesc;
+		if (scandesc == NULL)
+		{
+			MemoryContext oldcontext = MemoryContextSwitchTo(vs->context);
+
+			scandesc = table_beginscan_es(vs->scan->ss.ss_currentRelation,
+										  vs->scan->ss.ps.state->es_snapshot,
+										  ((SeqScan *) vs->scan->ss.ps.plan)->plan.targetlist,
+										  ((SeqScan *) vs->scan->ss.ps.plan)->plan.qual,
+										  NULL, NULL);
+			vs->scan->ss.ss_currentScanDesc = scandesc;
+			MemoryContextSwitchTo(oldcontext);
+		}
+		if (!aocs_getnext_batch((AOCSScanDesc) scandesc, vs->batch))
+		{
+			vs->eof = true;
+			return false;
+		}
+		VectorExprFilter(vs->batch, vs->qual);
+		if (vs->batch->nselected > 0)
+			return true;
+	}
+}
+
+static bool
+VectorBuildLeafSource(void *arg, VectorBatch **batch)
+{
+	VectorBuildScanState *vs = (VectorBuildScanState *) arg;
+
+	*batch = vs->batch;
+	/* every call hands out one fresh scan batch */
+	return VectorBuildScanNext(vs);
+}
+
+/*
+ * The build side of the top join is a Hash over a join chain; when that
+ * chain's probe side is batchable, run it batch-wise and feed the hash build
+ * from its output batches instead of MultiExecHash's row-wise pull.
+ */
+static VectorHashJoinState *
+VectorRegionCreateBuildChain(VectorRegionState *region, HashJoinState *hj)
+{
+	PlanState  *outer = outerPlanState(hj);
+	VectorHashJoinState *outer_join = NULL;
+	VectorHashJoinSourceNext source;
+	void	   *source_arg;
+	VectorHashJoinState *vhj;
+
+	if (!VectorHashJoinPlanIsSupported((HashJoin *) hj->js.ps.plan))
+		return NULL;
+	if (IsA(outer, HashJoinState))
+	{
+		outer_join = VectorRegionCreateBuildChain(region, (HashJoinState *) outer);
+		if (outer_join == NULL)
+			return NULL;
+		source = VectorHashJoinSourceNextBatch;
+		source_arg = outer_join;
+	}
+	else if (IsA(outer, SeqScanState))
+	{
+		region->build_scan = VectorBuildScanCreate(region, (SeqScanState *) outer,
+												   region->css.ss.ps.state);
+		if (region->build_scan == NULL)
+			return NULL;
+		source = VectorBuildLeafSource;
+		source_arg = region->build_scan;
+	}
+	else
+		return NULL;
+	vhj = VectorHashJoinCreateBatch(region->css.ss.ps.state->es_query_cxt,
+									hj, source, source_arg, outer_join);
+	if (vhj == NULL)
+	{
+		VectorHashJoinDestroy(outer_join);
+		VectorBuildScanDestroy(region->build_scan);
+		region->build_scan = NULL;
+	}
+	return vhj;
+}
+
+static void
+VectorRegionInitBuildChain(VectorRegionState *state)
+{
+	PlanState  *hash = innerPlanState(state->hj);
+	PlanState  *child;
+	VectorHashJoinState *build;
+
+	if (!IsA(hash, HashState))
+		return;
+	child = outerPlanState(hash);
+	if (!IsA(child, HashJoinState))
+		return;
+	build = VectorRegionCreateBuildChain(state, (HashJoinState *) child);
+	if (build == NULL)
+	{
+		/* the leaf may have been created before a deeper failure */
+		VectorBuildScanDestroy(state->build_scan);
+		state->build_scan = NULL;
+		return;
+	}
+	VectorHashJoinSetBuildSource(state->vhj,
+								 VectorHashJoinSourceNextBatch, build);
+	state->build_vhj = build;
 }
 
 static VectorBatch *
@@ -1168,6 +1380,9 @@ VectorRegionEnd(CustomScanState *node)
 
 	if (state->vhj != NULL)
 		VectorHashJoinDestroy(state->vhj);
+	if (state->build_vhj != NULL)
+		VectorHashJoinDestroy(state->build_vhj);
+	VectorBuildScanDestroy(state->build_scan);
 	if (state->proj != NULL)
 	{
 		int			col;
@@ -1219,6 +1434,11 @@ VectorRegionRescan(CustomScanState *node)
 		VectorBatchReset(state->batch);
 	if (state->vhj != NULL)
 		VectorHashJoinReset(state->vhj);
+	if (state->build_vhj != NULL)
+	{
+		VectorHashJoinReset(state->build_vhj);
+		state->build_scan->eof = false;
+	}
 	if (state->vagg != NULL)
 		VectorAggReset(state->vagg);
 	else if (state->vhj == NULL)
