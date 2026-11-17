@@ -5545,3 +5545,28 @@ VectorAggRetrieveHashed(AggState *aggstate)
 {
 	return agg_retrieve_hash_table(aggstate);
 }
+
+/*
+ * Project one hashed group whose input slot and states the caller has
+ * prepared: the fast group table retrieves without a conversion pass into
+ * the standard hash table.  Mirrors the per-entry work of
+ * agg_retrieve_hash_table_in_memory.
+ */
+TupleTableSlot *
+VectorAggRetrieveHashedEntry(AggState *aggstate, AggStatePerGroup pergroup)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+	TupleTableSlot *result;
+
+	/*
+	 * Clear the per-output-tuple context for each group, without rescanning
+	 * it: aggregate shutdown callbacks must not run yet.
+	 */
+	ResetExprContext(econtext);
+	econtext->ecxt_outertuple = aggstate->ss.ss_ScanTupleSlot;
+	prepare_projection_slot(aggstate, econtext->ecxt_outertuple,
+							aggstate->current_set);
+	finalize_aggregates(aggstate, aggstate->peragg, pergroup);
+	result = project_aggregates(aggstate);
+	return result;
+}

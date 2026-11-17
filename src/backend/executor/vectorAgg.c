@@ -106,6 +106,7 @@ struct VectorAggState
 	 */
 	struct VectorAggFastGroups *fast;
 	bool		fast_rejected;	/* the keys are not fast-table material */
+	int			fast_pos;		/* next fast-table entry during retrieval */
 	int			projected_set;
 	bool		group_open;
 	bool		input_done;
@@ -1078,6 +1079,75 @@ fast_lookup_group(VectorAggState *state, VectorAggFastGroups *t,
 	return &t->states[(Size) e * t->ntrans];
 }
 
+/*
+ * Serve one group from the fast table: unpack its packed key into the scan
+ * slot the way agg_retrieve_hash_table_in_memory unpacks the representative
+ * tuple, and project through the standard per-entry path (which applies the
+ * HAVING qual).  Surviving tables retrieve this way; a table that converted
+ * mid-stream is served from the standard hash table instead.
+ */
+static TupleTableSlot *
+fast_retrieve_next(VectorAggState *state)
+{
+	VectorAggFastGroups *t = state->fast;
+	AggState   *agg = state->agg;
+	AggStatePerHash perhash = &agg->perhash[0];
+	TupleTableSlot *firstSlot = agg->ss.ss_ScanTupleSlot;
+
+	while (state->fast_pos < t->nentries)
+	{
+		uint32		e = state->fast_pos++;
+		const uint64 *k = &t->keys[(Size) e * VFAST_WORDS];
+		TupleTableSlot *result;
+		int			c;
+
+		CHECK_FOR_INTERRUPTS();
+		ResetExprContext(agg->ss.ps.ps_ExprContext);
+
+		ExecClearTuple(firstSlot);
+		memset(firstSlot->tts_isnull, true,
+			   firstSlot->tts_tupleDescriptor->natts * sizeof(bool));
+		for (c = 0; c < t->nkeys; c++)
+		{
+			int			varNumber = perhash->hashGrpColIdxInput[c] - 1;
+			uint64		w = k[c + 1];
+
+			if ((k[0] >> c) & 1)
+			{
+				firstSlot->tts_isnull[varNumber] = true;
+				firstSlot->tts_values[varNumber] = (Datum) 0;
+				continue;
+			}
+			firstSlot->tts_isnull[varNumber] = false;
+			switch (t->keylen[c])
+			{
+				case 8:
+					firstSlot->tts_values[varNumber] = Int64GetDatum((int64) w);
+					break;
+				case 4:
+					firstSlot->tts_values[varNumber] =
+						Int32GetDatum((int32) (uint32) w);
+					break;
+				case 2:
+					firstSlot->tts_values[varNumber] =
+						Int16GetDatum((int16) (uint16) w);
+					break;
+				default:
+					firstSlot->tts_values[varNumber] =
+						Int8GetDatum((int8) (uint8) w);
+					break;
+			}
+		}
+		ExecStoreVirtualTuple(firstSlot);
+
+		result = VectorAggRetrieveHashedEntry(agg,
+											  &t->states[(Size) e * t->ntrans]);
+		if (result != NULL)
+			return result;
+	}
+	return NULL;
+}
+
 static AggStatePerGroup
 lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 {
@@ -1914,13 +1984,6 @@ VectorAggNext(VectorAggState *state)
 	if (state->output_done)
 		return NULL;
 
-	/*
-	 * Hand the fast table's groups over to the standard hash table before
-	 * any retrieval walks it.
-	 */
-	if (state->fast != NULL && !state->fast->converted)
-		fast_convert(state);
-
 	if (state->multi_phase)
 	{
 		AggState   *agg = state->agg;
@@ -2079,7 +2142,15 @@ VectorAggNext(VectorAggState *state)
 	}
 
 	if (state->agg->aggstrategy == AGG_HASHED)
+	{
+		/*
+		 * A table that survived the whole input serves its groups directly;
+		 * one that converted mid-stream lives in the standard hash table.
+		 */
+		if (state->fast != NULL && !state->fast->converted)
+			return fast_retrieve_next(state);
 		return VectorAggRetrieveHashed(state->agg);
+	}
 
 	state->output_done = true;
 	return VectorAggRetrievePlain(state->agg);
@@ -2099,6 +2170,7 @@ VectorAggReset(VectorAggState *state)
 			memset(t->buckets, 0, sizeof(uint32) * t->nbuckets);
 		t->nentries = 0;
 		t->converted = false;
+		state->fast_pos = 0;
 		t->mem_used = sizeof(uint32) * t->nbuckets +
 			t->nslots * (sizeof(uint64) * VFAST_WORDS +
 						 sizeof(AggStatePerGroupData) * t->ntrans);

@@ -47,6 +47,8 @@ extern TupleTableSlot *VectorAggRetrieveGroup(AggState *aggstate, int currentSet
 extern bool VectorAggSameGroup(AggState *aggstate, TupleTableSlot *slot,
 							   int numCols);
 extern TupleTableSlot *VectorAggRetrieveHashed(AggState *aggstate);
+extern TupleTableSlot *VectorAggRetrieveHashedEntry(AggState *aggstate,
+													AggStatePerGroup pergroup);
 extern TupleTableSlot *VectorAggRetrievePlainSet(AggState *aggstate,
 															  int phaseidx, int phaseset,
 															  int setno);
