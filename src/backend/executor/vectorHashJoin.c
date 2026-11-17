@@ -607,6 +607,15 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 						if (!state->next_outer(state->outer_arg,
 											   &state->outer_batch))
 						{
+							/*
+							 * A source hands back its reusable batch object
+							 * even at EOF: drop the pointer, or the machine
+							 * path would re-probe the already-consumed last
+							 * batch and end the chain before the fill_inner
+							 * finish phase runs.
+							 */
+							state->outer_batch = NULL;
+							state->outer_position = 0;
 							state->outer_eof = true;
 							/* RIGHT hands unmatched stored tuples to the
 							 * finish phase; INNER/LEFT have nothing left */
@@ -640,6 +649,8 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 				}
 				else
 				{
+					/* drop the stale batch the source handed back */
+					state->outer_batch = NULL;
 					state->outer_eof = true;
 					continue;
 				}
