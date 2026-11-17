@@ -782,6 +782,23 @@ SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
   ON l.id % 1000 = w.id % 1000;
 SELECT count(*) FROM vector_aoco_test l LEFT JOIN vector_aoco_wide w
   ON l.id % 1000 = w.id % 1000;
+-- RIGHT join over a join chain (the aggregate sits between the join and
+-- the region root): probe rows with no build match are dropped, and the
+-- finish phase emits unmatched build rows null-extended across output
+-- batch boundaries.
+EXPLAIN (COSTS OFF)
+SELECT cnt, count(*) AS custdist FROM
+  (SELECT l.id AS lk, count(w.id) AS cnt
+   FROM vector_aoco_wide w RIGHT JOIN vector_aoco_test l
+     ON w.id % 2000 = l.id
+   GROUP BY l.id) s
+GROUP BY cnt ORDER BY custdist DESC, cnt DESC;
+SELECT cnt, count(*) AS custdist FROM
+  (SELECT l.id AS lk, count(w.id) AS cnt
+   FROM vector_aoco_wide w RIGHT JOIN vector_aoco_test l
+     ON w.id % 2000 = l.id
+   GROUP BY l.id) s
+GROUP BY cnt ORDER BY custdist DESC, cnt DESC;
 -- Mixed aggregation (hashed grouping sets plus the plain empty set):
 -- every row advances every set in one pass, plain sets project first.
 SELECT id % 3 AS a, id % 2 AS b, GROUPING(id % 3, id % 2) AS g,

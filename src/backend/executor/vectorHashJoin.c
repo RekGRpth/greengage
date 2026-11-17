@@ -74,6 +74,15 @@ struct VectorHashJoinState
 	bool		row_matched;	/* current probe row already emitted a match */
 	bool		hash_direct;	/* single key: hash straight from the batch */
 	Datum		probe_key;		/* current probe key (survives a resume) */
+	/*
+	 * Batched fill_inner finish: a cursor over the hash table's buckets that
+	 * assembles unmatched stored tuples directly into output batches.
+	 */
+	bool		finish_prepped; /* cursor initialized */
+	bool		finish_done;	/* all buckets scanned */
+	int			finish_bucket;	/* next regular bucket */
+	int			finish_skew;	/* next skew bucket index */
+	HashJoinTuple finish_tuple; /* last unmatched tuple returned */
 };
 
 bool
@@ -107,6 +116,7 @@ VectorHashJoinPlanIsSupported(HashJoin *join)
 }
 
 static bool VectorHashProbeFastGate(VectorHashJoinState *state);
+static int VectorHashFinishBatch(VectorHashJoinState *state, int start_row);
 static int VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row);
 
 static void
@@ -635,7 +645,23 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 				result = VectorHashJoinNextRow(state, state->outer_batch,
 											  state->outer_position++);
 			else if (state->outer_eof)
+			{
+				/*
+				 * RIGHT join over a single-batch table: assemble the
+				 * unmatched stored tuples directly into output batches
+				 * instead of projecting them row by row through the
+				 * machine's finish phase.
+				 */
+				if (state->fill_inner && state->fast_probe &&
+					state->hj->hj_HashTable != NULL)
+				{
+					nrows = VectorHashFinishBatch(state, nrows);
+					if (state->finish_done)
+						state->done = true;
+					continue;
+				}
 				result = VectorHashJoinFinish(state);
+			}
 			else
 			{
 				state->outer_batch = NULL;
@@ -689,6 +715,11 @@ VectorHashJoinBatchReset(VectorHashJoinState *state)
 	state->outer_in_progress = false;
 	state->fast_checked = false;
 	state->resume_active = false;
+	state->finish_prepped = false;
+	state->finish_done = false;
+	state->finish_bucket = 0;
+	state->finish_skew = 0;
+	state->finish_tuple = NULL;
 	MemoryContextReset(state->outer_values);
 	VectorHashJoinBatchReset(state->outer_join);
 }
@@ -904,6 +935,93 @@ VectorHashJoinFinish(VectorHashJoinState *state)
 		state->built = true;
 	}
 	return VectorHashJoinProbeFinal(state->hj);
+}
+
+/*
+ * Batched fill_inner finish: walk the hash table's buckets (single batch,
+ * the only shape the fast probe gate approves), assembling each unmatched
+ * stored tuple directly into the output batch - outer columns null-filled,
+ * inner columns read positionally.  The cursor persists across calls, so
+ * the walk resumes where the previous output batch stopped.  No quals run
+ * here: the gate only reaches this shape with a plain targetlist and no
+ * quals, which is exactly what the machine's ExecProject would project.
+ */
+static int
+VectorHashFinishBatch(VectorHashJoinState *state, int start_row)
+{
+	HashJoinState *hj = state->hj;
+	HashJoinTable hashtable = hj->hj_HashTable;
+	VectorBatch *out = state->output;
+	TupleTableSlot *hslot = hj->hj_HashTupleSlot;
+	int			nrows = start_row;
+	int			c;
+
+	if (!state->finish_prepped)
+	{
+		state->finish_prepped = true;
+		state->finish_bucket = 0;
+		state->finish_skew = 0;
+		state->finish_tuple = NULL;
+		state->finish_done = false;
+	}
+	while (nrows < out->capacity && !state->finish_done)
+	{
+		HashJoinTuple tuple = state->finish_tuple;
+
+		/*
+		 * Advance the cursor: resuming an emitted tuple walks its chain;
+		 * NULL (emitted tuple's chain or a fetched bucket exhausted) makes
+		 * the next call fetch the following bucket, whose index was already
+		 * advanced below.
+		 */
+		if (tuple != NULL)
+			tuple = tuple->next.unshared;
+		else if (state->finish_bucket < hashtable->nbuckets)
+		{
+			tuple = hashtable->buckets.unshared[state->finish_bucket];
+			state->finish_bucket++;
+		}
+		else if (state->finish_skew < hashtable->nSkewBuckets)
+		{
+			int			j = hashtable->skewBucketNums[state->finish_skew];
+
+			tuple = hashtable->skewBucket[j]->tuples;
+			state->finish_skew++;
+		}
+		else
+		{
+			state->finish_done = true;
+			break;
+		}
+
+		while (tuple != NULL &&
+			   HeapTupleHeaderHasMatch(HJTUPLE_MINTUPLE(tuple)))
+			tuple = tuple->next.unshared;
+
+		/*
+		 * Park the cursor on the tuple this call will emit (or NULL when
+		 * the chain ended), so a capacity stop resumes after it and an
+		 * exhausted chain moves to the next bucket.
+		 */
+		state->finish_tuple = tuple;
+		if (tuple == NULL)
+			continue;
+
+		ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(tuple), hslot, false);
+		slot_getallattrs(hslot);
+		for (c = 0; c < state->out_ncols; c++)
+		{
+			Datum		value = 0;
+			bool		isnull = true;
+
+			if (!state->out_is_outer[c])
+				value = slot_getattr(hslot, state->out_src[c], &isnull);
+			value = VectorBatchCopyDatum(out, c, value, isnull);
+			VectorBatchSetValue(out, c, nrows, value, isnull);
+		}
+		nrows++;
+	}
+	return nrows;
 }
 
 void
