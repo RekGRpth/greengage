@@ -948,12 +948,14 @@ VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 	}
 	else if (IsA(outer, SeqScanState))
 		region->scan = (SeqScanState *) outer;
-	else if (IsA(outer, MotionState) || IsA(outer, CustomScanState))
+	else if (IsA(outer, CustomScanState))
 	{
 		/*
-		 * A row producer (another slice's Motion receiver, or a nested
-		 * region whose batches already returned to rows at its root) feeds
-		 * the chain through the row adapter.
+		 * A nested region whose batches already returned to rows at its
+		 * root feeds the chain through the row adapter.  MotionState leaves
+		 * keep the row-wise input adapter: feeding a chain directly from a
+		 * Motion receiver produced wrong group counts and a coordinator
+		 * crash on q13-style plans.
 		 */
 		region->row_leaf = MemoryContextAllocZero(region->css.ss.ps.state->es_query_cxt,
 												  sizeof(VectorRowLeafState));

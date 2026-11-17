@@ -735,11 +735,61 @@ vectorize_motion_subtrees(VectorizeContext *ctx, Plan *plan)
 	vectorize_motion_subtrees(ctx, innerPlan(plan));
 }
 
+/*
+ * Walk a join chain's probe side and vectorize a leaf the chain builder
+ * cannot consume natively (an aggregate over a flattened EXISTS subquery,
+ * a Result, ...).  Capture swallows the whole subtree, so without this the
+ * leaf never reaches the top-down mutator and stays row-wise inside the
+ * region.  SeqScan stays native; Motions vectorize their producer
+ * subtrees; a pass-through Sort belongs to the region's own Sort driver,
+ * so the walk continues below it.
+ */
+static void
+vectorize_chain_leaves(VectorizeContext *ctx, Plan **link)
+{
+	Plan	   *plan = *link;
+
+	while (plan != NULL)
+	{
+		if (IsA(plan, SeqScan) || IsA(plan, CustomScan))
+			return;
+		if (IsA(plan, Motion))
+		{
+			vectorize_motion_subtrees(ctx, plan);
+			return;
+		}
+		if (IsA(plan, Sort))
+		{
+			link = &outerPlan(plan);
+			plan = *link;
+			continue;
+		}
+		if (!IsA(plan, HashJoin))
+		{
+			/* replace the parent's pointer, never the leaf's own outer */
+			*link = (Plan *) vectorize_mutator((Node *) plan, ctx);
+			return;
+		}
+		link = &outerPlan(plan);
+		plan = *link;
+	}
+}
+
 static Node *
 vectorize_mutator(Node *node, VectorizeContext *ctx)
 {
 	if (node == NULL)
 		return NULL;
+
+	/*
+	 * A captured region is frozen: the pre-processing walks
+	 * (vectorize_motion_subtrees, vectorize_chain_leaves) may reach an
+	 * already-built region through plan_tree_mutator's descent into
+	 * custom_plans, and re-wrapping nodes inside it would nest regions
+	 * within regions the executor cannot initialize.
+	 */
+	if (IsA(node, CustomScan))
+		return node;
 
 	if (IsA(node, Motion))
 	{
@@ -850,6 +900,7 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		auto_allowed(ctx, (Plan *) node))
 	{
 		vectorize_motion_subtrees(ctx, outerPlan(node));
+		vectorize_chain_leaves(ctx, &outerPlan(node));
 		return (Node *) make_region(ctx, (Plan *) node);
 	}
 
