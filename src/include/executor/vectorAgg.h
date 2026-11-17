@@ -31,6 +31,8 @@ extern void VectorAggAdvanceTransition(AggState *aggstate,
 									   Datum *values, bool *isnull);
 extern void VectorAggInitializeEntry(AggState *aggstate,
 									 TupleHashEntry entry);
+extern void VectorAggInitPergroup(AggState *aggstate, AggStatePerGroup pergroup);
+extern void VectorAggEnterSpillMode(AggState *aggstate);
 extern void VectorAggInitializePlain(AggState *aggstate);
 extern void VectorAggInitializeSet(AggState *aggstate, int numReset);
 extern void VectorAggSelectSet(AggState *aggstate, int currentSet);

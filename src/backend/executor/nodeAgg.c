@@ -5383,6 +5383,35 @@ VectorAggInitializeEntry(AggState *aggstate, TupleHashEntry entry)
 	initialize_hash_entry(aggstate, aggstate->perhash[0].hashtable, entry);
 }
 
+/*
+ * The vector aggregate's fast group table keeps per-group states in its own
+ * array: initialize one freshly appended entry the way a new hash entry
+ * would be, without a TupleHashEntry to hang it off.
+ */
+void
+VectorAggInitPergroup(AggState *aggstate, AggStatePerGroup pergroup)
+{
+	int			transno;
+
+	aggstate->hash_ngroups_current++;
+	if (aggstate->numtrans == 0)
+		return;
+	for (transno = 0; transno < aggstate->numtrans; transno++)
+		initialize_aggregate(aggstate, &aggstate->pertrans[transno],
+							 &pergroup[transno]);
+}
+
+/*
+ * The fast group table converts into the standard hash table when it
+ * outgrows the operator's memory; the rest of the stream then runs in the
+ * ordinary spill machinery.
+ */
+void
+VectorAggEnterSpillMode(AggState *aggstate)
+{
+	hash_agg_enter_spill_mode(aggstate);
+}
+
 void
 VectorAggSpillTuple(AggState *aggstate, TupleTableSlot *slot, uint32 hash)
 {

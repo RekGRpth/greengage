@@ -100,6 +100,12 @@ struct VectorAggState
 	AggStatePerGroup group_pergroup;
 	Datum	   *group_keys;
 	bool	   *group_key_nulls;
+	/*
+	 * Fast open-addressing group table for by-value fixed-width keys; NULL
+	 * once rejected or after conversion into the standard hash table.
+	 */
+	struct VectorAggFastGroups *fast;
+	bool		fast_rejected;	/* the keys are not fast-table material */
 	int			projected_set;
 	bool		group_open;
 	bool		input_done;
@@ -767,6 +773,311 @@ fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
 	return slot;
 }
 
+/*
+ * Fast open-addressing group table for hashed aggregates whose grouping
+ * keys are all by-value fixed-width columns (at most VFAST_MAXKEYS of
+ * 1/2/4/8 bytes).  Each entry packs a null-bit word plus the key datums
+ * into VFAST_WORDS words and owns its per-group states in one array, so a
+ * lookup is a probe and a word compare: no virtual slot round-trip, no
+ * MinimalTuple copy, no per-group palloc.  When the table outgrows the
+ * operator's memory limit it converts into the standard hash table - every
+ * entry is reinserted and its state pointer becomes the new entry's
+ * additional - and the rest of the stream runs through the ordinary spill
+ * machinery.
+ */
+#define VFAST_MAXKEYS	4
+#define VFAST_WORDS		(VFAST_MAXKEYS + 1)
+
+typedef struct VectorAggFastGroups
+{
+	uint64	   *keys;			/* nentries * VFAST_WORDS packed keys */
+	AggStatePerGroupData *states;	/* flat: nslots * numtrans states */
+	uint32	   *buckets;		/* entry index + 1; 0 = empty */
+	uint32		nbuckets;		/* power of two */
+	uint32		nentries;
+	uint32		nslots;			/* allocated key/state entries */
+	int			nkeys;
+	int			ntrans;
+	int			keycols[VFAST_MAXKEYS];	/* batch column index */
+	int16		keylen[VFAST_MAXKEYS];
+	Size		mem_used;
+	bool		converted;
+} VectorAggFastGroups;
+
+static bool
+fast_groups_supported(VectorAggState *state, VectorBatch *batch)
+{
+	AggState   *agg = state->agg;
+	AggStatePerHash perhash = &agg->perhash[0];
+	int			col;
+
+	if (agg->aggstrategy != AGG_HASHED || agg->num_hashes != 1 ||
+		agg->streaming || agg->hash_spill_mode)
+		return false;
+	if (perhash->numhashGrpCols < 1 ||
+		perhash->numhashGrpCols > VFAST_MAXKEYS)
+		return false;
+	for (col = 0; col < perhash->numhashGrpCols; col++)
+	{
+		int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
+		AttrNumber	attno = state->vars.outer_attnos[inputcol];
+		VectorColumn *column;
+		int16		typlen;
+
+		if (attno <= 0 || attno > batch->ncols)
+			return false;
+		column = &batch->columns[attno - 1];
+		typlen = column->typlen;
+		if (!column->typbyval ||
+			(typlen != 1 && typlen != 2 && typlen != 4 && typlen != 8))
+			return false;
+	}
+	return true;
+}
+
+static void
+fast_groups_init(VectorAggState *state, VectorBatch *batch)
+{
+	AggState   *agg = state->agg;
+	AggStatePerHash perhash = &agg->perhash[0];
+	VectorAggFastGroups *t;
+	uint32		nbuckets = 1024;
+	double		ngroups = perhash->aggnode->numGroups;
+	int			col;
+
+	/* pre-size for the estimated group count, bounded for a first alloc */
+	while (nbuckets < (1u << 22) && (double) nbuckets < ngroups)
+		nbuckets <<= 1;
+
+	t = MemoryContextAllocZero(state->context, sizeof(*t));
+	t->nbuckets = nbuckets;
+	t->buckets = MemoryContextAllocZero(state->context,
+										sizeof(uint32) * nbuckets);
+	t->nkeys = perhash->numhashGrpCols;
+	t->ntrans = Max(agg->numtrans, 1);
+	t->nslots = 1024;
+	t->keys = MemoryContextAlloc(state->context,
+								 sizeof(uint64) * VFAST_WORDS * t->nslots);
+	t->states = MemoryContextAlloc(state->context,
+								   sizeof(AggStatePerGroupData) * t->ntrans *
+								   t->nslots);
+	for (col = 0; col < t->nkeys; col++)
+	{
+		int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
+		AttrNumber	attno = state->vars.outer_attnos[inputcol];
+
+		t->keycols[col] = attno - 1;
+		t->keylen[col] = batch->columns[attno - 1].typlen;
+	}
+	t->mem_used = sizeof(uint32) * nbuckets +
+		t->nslots * (sizeof(uint64) * VFAST_WORDS +
+					 sizeof(AggStatePerGroupData) * t->ntrans);
+	state->fast = t;
+}
+
+static uint32
+fast_key_hash(const uint64 *key, int nwords)
+{
+	uint64		h = UINT64CONST(0x9E3779B97F4A7C15);
+	int			c;
+
+	for (c = 0; c < nwords; c++)
+		h = (h ^ key[c]) * UINT64CONST(0xC2B7AE3D27D4EB4F);
+	h ^= h >> 33;
+	h *= UINT64CONST(0xFF51AFD7ED5581C3);
+	h ^= h >> 33;
+	return (uint32) (h >> 32);
+}
+
+/* Pack one row's keys and null bits; returns the hash of the packed words. */
+static inline uint32
+fast_key_pack(VectorAggFastGroups *t, VectorBatch *batch, int row,
+			  uint64 *key)
+{
+	int			c;
+
+	key[0] = 0;
+	for (c = 0; c < t->nkeys; c++)
+	{
+		VectorColumn *column = &batch->columns[t->keycols[c]];
+		Datum		d = 0;
+
+		if ((column->nulls[row / 64] & ((uint64) 1 << (row % 64))) == 0)
+		{
+			d = VectorColumnGetDatum(column, row);
+			switch (t->keylen[c])
+			{
+				case 8:
+					key[c + 1] = (uint64) DatumGetInt64(d);
+					continue;
+				case 4:
+					key[c + 1] = (uint64) (uint32) DatumGetInt32(d);
+					continue;
+				case 2:
+					key[c + 1] = (uint64) (uint16) DatumGetInt16(d);
+					continue;
+				default:
+					key[c + 1] = (uint64) (uint8) (uint32) d;
+					continue;
+			}
+		}
+		key[0] |= (uint64) 1 << c;
+		key[c + 1] = 0;
+	}
+	return fast_key_hash(key, t->nkeys + 1);
+}
+
+static inline bool
+fast_key_eq(const VectorAggFastGroups *t, uint32 e, const uint64 *key)
+{
+	const uint64 *k = &t->keys[(Size) e * VFAST_WORDS];
+	int			c;
+
+	for (c = 0; c <= t->nkeys; c++)
+		if (k[c] != key[c])
+			return false;
+	return true;
+}
+
+/*
+ * Move every entry into the standard hash table.  The states were filled
+ * during the pass, so each new entry adopts its state pointer instead of
+ * initializing fresh ones.
+ */
+static void
+fast_convert(VectorAggState *state)
+{
+	VectorAggFastGroups *t = state->fast;
+	AggState   *agg = state->agg;
+	AggStatePerHash perhash = &agg->perhash[0];
+	TupleTableSlot *hashslot = perhash->hashslot;
+	uint32		i;
+	int			c;
+
+	for (i = 0; i < t->nentries; i++)
+	{
+		const uint64 *k = &t->keys[(Size) i * VFAST_WORDS];
+		TupleHashEntry entry;
+		bool		isnew;
+
+		ExecClearTuple(hashslot);
+		for (c = 0; c < t->nkeys; c++)
+		{
+			uint64		w = k[c + 1];
+
+			switch (t->keylen[c])
+			{
+				case 8:
+					hashslot->tts_values[c] = Int64GetDatum((int64) w);
+					break;
+				case 4:
+					hashslot->tts_values[c] = Int32GetDatum((int32) (uint32) w);
+					break;
+				case 2:
+					hashslot->tts_values[c] = Int16GetDatum((int16) (uint16) w);
+					break;
+				default:
+					hashslot->tts_values[c] = Int8GetDatum((int8) (uint8) w);
+					break;
+			}
+			hashslot->tts_isnull[c] = (k[0] >> c) & 1;
+		}
+		ExecStoreVirtualTuple(hashslot);
+		entry = LookupTupleHashEntry(perhash->hashtable, hashslot, &isnew,
+									 NULL);
+		if (entry != NULL && isnew)
+			entry->additional = &t->states[(Size) i * t->ntrans];
+	}
+	agg->hash_ngroups_current += t->nentries;
+	t->converted = true;
+	t->mem_used -= sizeof(uint32) * t->nbuckets;
+	pfree(t->buckets);
+	t->buckets = NULL;
+	state->group_valid = false;
+}
+
+/*
+ * Append a new entry for key at the free bucket idx.  Growth invalidates
+ * the per-row memo (the states array moves), never the caller's held
+ * pointer: the entry is appended before lookup_group returns it.
+ */
+static AggStatePerGroup
+fast_lookup_group(VectorAggState *state, VectorAggFastGroups *t,
+				  VectorBatch *batch, int row)
+{
+	AggState   *agg = state->agg;
+	uint64		key[VFAST_WORDS];
+	uint32		h = fast_key_pack(t, batch, row, key);
+	uint32		idx = h & (t->nbuckets - 1);
+	uint32		e;
+
+	for (;;)
+	{
+		e = t->buckets[idx];
+		if (e == 0)
+			break;
+		if (fast_key_eq(t, e - 1, key))
+			return &t->states[(Size) (e - 1) * t->ntrans];
+		idx = (idx + 1) & (t->nbuckets - 1);
+	}
+
+	if (t->mem_used > agg->hash_mem_limit ||
+		t->nentries >= agg->hash_ngroups_limit)
+	{
+		/* hand the groups over and spill the rest of the stream */
+		fast_convert(state);
+		VectorAggEnterSpillMode(state->agg);
+		return NULL;
+	}
+
+	if (t->nentries >= t->nslots)
+	{
+		uint32		nslots = t->nslots * 2;
+		Size		entrysz = sizeof(uint64) * VFAST_WORDS +
+			sizeof(AggStatePerGroupData) * t->ntrans;
+
+		t->keys = repalloc(t->keys, sizeof(uint64) * VFAST_WORDS * nslots);
+		t->states = repalloc(t->states,
+							 sizeof(AggStatePerGroupData) * t->ntrans * nslots);
+		t->mem_used += (nslots - t->nslots) * entrysz;
+		t->nslots = nslots;
+		state->group_valid = false;
+	}
+	if (t->nentries + 1 > t->nbuckets * 3 / 4)
+	{
+		uint32		nb = t->nbuckets * 2;
+		uint32	   *buckets = MemoryContextAllocZero(state->context,
+													 sizeof(uint32) * nb);
+		uint32		i;
+
+		for (i = 0; i < t->nentries; i++)
+		{
+			uint32		h2 = fast_key_hash(&t->keys[(Size) i * VFAST_WORDS],
+										   t->nkeys + 1);
+			uint32		j = h2 & (nb - 1);
+
+			while (buckets[j] != 0)
+				j = (j + 1) & (nb - 1);
+			buckets[j] = i + 1;
+		}
+		t->mem_used -= sizeof(uint32) * t->nbuckets;
+		t->mem_used += sizeof(uint32) * nb;
+		pfree(t->buckets);
+		t->buckets = buckets;
+		t->nbuckets = nb;
+		idx = h & (nb - 1);
+		while (t->buckets[idx] != 0)
+			idx = (idx + 1) & (nb - 1);
+	}
+
+	e = t->nentries++;
+	memcpy(&t->keys[(Size) e * VFAST_WORDS], key,
+		   sizeof(uint64) * (t->nkeys + 1));
+	t->buckets[idx] = e + 1;
+	VectorAggInitPergroup(state->agg, &t->states[(Size) e * t->ntrans]);
+	return &t->states[(Size) e * t->ntrans];
+}
+
 static AggStatePerGroup
 lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 {
@@ -808,6 +1119,38 @@ lookup_group(VectorAggState *state, VectorBatch *batch, int row)
 		}
 		if (hit)
 			return state->group_pergroup;
+	}
+
+	/*
+	 * By-value fixed-width keys run through the fast table.  When it hits
+	 * the operator's memory limit it converts into the standard table and
+	 * this row falls through to the ordinary path (in spill mode it spills).
+	 */
+	if (state->fast != NULL && !state->fast->converted)
+	{
+		AggStatePerGroup pg = fast_lookup_group(state, state->fast, batch, row);
+
+		if (pg != NULL)
+		{
+			if (state->group_keys == NULL)
+			{
+				state->group_keys = MemoryContextAlloc(state->context,
+													   sizeof(Datum) * Max(perhash->numhashGrpCols, 1));
+				state->group_key_nulls = MemoryContextAlloc(state->context,
+															sizeof(bool) * Max(perhash->numhashGrpCols, 1));
+			}
+			for (col = 0; col < perhash->numhashGrpCols; col++)
+			{
+				int			inputcol = perhash->hashGrpColIdxInput[col] - 1;
+				AttrNumber	attno = state->vars.outer_attnos[inputcol];
+
+				state->group_keys[col] = VectorBatchGetDatum(batch, attno - 1, row);
+				state->group_key_nulls[col] = VectorBatchIsNull(batch, attno - 1, row);
+			}
+			state->group_pergroup = pg;
+			state->group_valid = true;
+			return pg;
+		}
 	}
 
 	ExecClearTuple(hashslot);
@@ -1394,6 +1737,14 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 	if (batch->nselected == 0)
 		return;
 
+	if (state->fast == NULL && !state->fast_rejected)
+	{
+		if (fast_groups_supported(state, batch))
+			fast_groups_init(state, batch);
+		else
+			state->fast_rejected = true;
+	}
+
 	/* the group memo's key datums die with the previous batch */
 	state->group_valid = false;
 	eval_arguments(state, batch);
@@ -1562,6 +1913,13 @@ VectorAggNext(VectorAggState *state)
 	Assert(state->input_done);
 	if (state->output_done)
 		return NULL;
+
+	/*
+	 * Hand the fast table's groups over to the standard hash table before
+	 * any retrieval walks it.
+	 */
+	if (state->fast != NULL && !state->fast->converted)
+		fast_convert(state);
 
 	if (state->multi_phase)
 	{
@@ -1733,6 +2091,18 @@ VectorAggReset(VectorAggState *state)
 	ExecReScanAgg(state->agg);
 	/* the rescanned hash table drops the memoized group */
 	state->group_valid = false;
+	if (state->fast != NULL)
+	{
+		VectorAggFastGroups *t = state->fast;
+
+		if (t->buckets != NULL)
+			memset(t->buckets, 0, sizeof(uint32) * t->nbuckets);
+		t->nentries = 0;
+		t->converted = false;
+		t->mem_used = sizeof(uint32) * t->nbuckets +
+			t->nslots * (sizeof(uint64) * VFAST_WORDS +
+						 sizeof(AggStatePerGroupData) * t->ntrans);
+	}
 	if (state->agg->aggstrategy == AGG_PLAIN)
 	{
 		MemoryContext oldcontext = MemoryContextSwitchTo(
