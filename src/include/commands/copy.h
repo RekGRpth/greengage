@@ -155,8 +155,6 @@ typedef struct CopyStateData
 	bool	   *convert_select_flags;	/* per-column CSV/TEXT CS flags */
 	Node	   *whereClause;	/* WHERE condition (or NULL) */
 	bool		fill_missing;	/* missing attrs at end of line are NULL */
-	bool		fast_parse;		/* COPY FROM fast text parse enabled */
-	int		   *fast_kinds;		/* per-column fast input kernel (CopyFastKind) */
 
 	SingleRowErrorDesc *sreh;
 
@@ -262,6 +260,8 @@ typedef struct CopyStateData
 	CdbCopy    *cdbCopy;
 
 	bool		delim_off;		/* delimiter is set to OFF? */
+	bool		fast_parse;		/* COPY FROM fast text parse enabled */
+	int		   *fast_kinds;		/* per-column fast input kernel (CopyFastKind) */
 
 /* end Greengage Database specific variables */
 } CopyStateData;
