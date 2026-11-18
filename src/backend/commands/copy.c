@@ -6173,12 +6173,12 @@ CopyFromFastGate(CopyState cstate)
 		return false;
 
 	/*
-	 * Single-row error handling works with the fast parse: clean rows are
-	 * never rejected by the kernels, and any doubtful line falls back to
-	 * the regular path, whose error is caught by the SREH machinery as
-	 * before.
+	 * Single-row error handling keeps the regular path: after a rejected
+	 * row the SREH continue leaves per-line state that the fast parse's
+	 * field walk does not fully restore, so subsequent rows can lose their
+	 * first character in text columns.
 	 */
-	if (cstate->convert_select_flags)
+	if (cstate->cdbsreh || cstate->convert_select_flags)
 		return false;
 
 	/*
@@ -6190,10 +6190,14 @@ CopyFromFastGate(CopyState cstate)
 		return false;
 
 	/*
-	 * The fast parse covers every text-mode reader: utility/direct mode,
-	 * the QD (which parses the routing prefix) and the QE re-parse of the
-	 * residual fields of forwarded rows.
+	 * The fast parse covers utility/direct mode and the QD routing prefix.
+	 * COPY_DISPATCH is excluded for now: a NULL field in the QD's prefix
+	 * makes the pass-2 loop stop early and the dispatcher forwards the
+	 * residual line from a shifted offset, corrupting subsequent rows.
 	 */
+	if (cstate->dispatch_mode == COPY_DISPATCH)
+		return false;
+
 	return true;
 }
 
@@ -6326,6 +6330,7 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 		}
 		cstate->raw_fields[nfields] = p;	/* end of field value, exclusive */
 		nfields++;
+		/* true unless the field ended at the line end */
 		last_had_delim = (p < line_end);
 		if (!last_had_delim)
 			break;
@@ -6368,6 +6373,18 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 
 			sp++;
 			q1 = memchr(sp, quotec, p - sp);
+
+			/*
+			 * Pass 1 validated this field: the closing quote must sit
+			 * exactly at p - 1 and the inner slice must hold no quote or
+			 * escape characters.  Anything else falls back to the
+			 * regular path for this line.
+			 */
+			if (q1 == NULL || q1 != p - 1 ||
+				memchr(sp, quotec, q1 - sp) != NULL ||
+				(escapec != '\0' &&
+				 memchr(sp, escapec, q1 - sp) != NULL))
+				return false;
 			flen = q1 - sp;
 			quoted = true;
 		}
