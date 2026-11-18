@@ -279,6 +279,10 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			proxy->ps.state = estate;
 			proxy->ps.ExecProcNode = VectorRegionMaterialOuter;
 			proxy->region = state;
+			/* the stat walkers visit this hand-made state; give it stats */
+			if (estate->es_instrument)
+				proxy->ps.instrument = GpInstrAlloc(proxy->ps.plan,
+													estate->es_instrument);
 			state->mat_proxy = &proxy->ps;
 			state->mat_slot = ExecInitExtraTupleSlot(estate,
 										  state->mat_outer->ps_ResultTupleDesc,
@@ -306,6 +310,10 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			proxy->ps.state = estate;
 			proxy->ps.ExecProcNode = VectorRegionNestLoopOuter;
 			proxy->region = state;
+			/* the stat walkers visit this hand-made state; give it stats */
+			if (estate->es_instrument)
+				proxy->ps.instrument = GpInstrAlloc(proxy->ps.plan,
+													estate->es_instrument);
 			state->nl_proxy = &proxy->ps;
 			state->nl_slot = ExecInitExtraTupleSlot(estate,
 										 state->nl_outer->ps_ResultTupleDesc,
