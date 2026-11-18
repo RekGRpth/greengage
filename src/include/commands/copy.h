@@ -193,9 +193,12 @@ typedef struct CopyStateData
 
 	TransitionCaptureState *transition_capture;
 
-	StringInfo	dispatch_msgbuf; /* used in COPY_DISPATCH mode, to construct message
-								  * to send to QE. */
-	
+	StringInfo	dispatch_msgbuf; /* used in COPY_DISPATCH mode, to construct
+								 * message frames to send to QE. */
+	StringInfo *dispatch_batch; /* per-segment buffers coalescing forwarded
+								 * row frames (COPY_DISPATCH COPY FROM) */
+	int			dispatch_nbatch;	/* number of slots in dispatch_batch */
+
 	/* Error handling options */
 	CopyErrMode	errMode;
 	struct CdbSreh *cdbsreh; /* single row error handler */

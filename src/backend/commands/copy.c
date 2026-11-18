@@ -265,6 +265,9 @@ static uint64 CopyTo(CopyState cstate);
 static uint64 CopyDispatchOnSegment(CopyState cstate, const CopyStmt *stmt);
 static uint64 CopyToQueryOnSegment(CopyState cstate);
 static bool CopyReadLine(CopyState cstate);
+static void CopyDispatchSendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg);
+static void CopyDispatchFlushBatches(CopyState cstate, CdbCopy *cdbCopy);
+static void CopyDispatchAppendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg);
 static bool CopyFromFastGate(CopyState cstate);
 static int *CopyFromFastAssignKinds(CopyState cstate, TupleDesc tupDesc);
 static bool CopyReadLineText(CopyState cstate);
@@ -5531,6 +5534,9 @@ CopyFrom(CopyState cstate)
 		int64		total_completed_from_qes;
 		int64		total_rejected_from_qes;
 
+		/* send any still-pending forwarded row frames */
+		CopyDispatchFlushBatches(cstate, cdbCopy);
+
 		cdbCopyEnd(cdbCopy,
 				   &total_completed_from_qes,
 				   &total_rejected_from_qes);
@@ -7465,10 +7471,16 @@ SendCopyFromForwardedTuple(CopyState cstate,
 	frame->fld_count = num_sent_fields;
 	frame->delim_seen_at_end = cstate->stopped_processing_at_delim;
 
+	/* coalesce the frame into the target segment's batch buffer */
 	if (toAll)
-		cdbCopySendDataToAll(cdbCopy, msgbuf->data, msgbuf->len);
+	{
+		int			i;
+
+		for (i = 0; i < cdbCopy->total_segs; i++)
+			CopyDispatchAppendBatch(cstate, cdbCopy, i);
+	}
 	else
-		cdbCopySendData(cdbCopy, target_seg, msgbuf->data, msgbuf->len);
+		CopyDispatchAppendBatch(cstate, cdbCopy, target_seg);
 }
 
 static void
@@ -7484,6 +7496,69 @@ SendCopyFromForwardedHeader(CopyState cstate, CdbCopy *cdbCopy)
 	cdbCopySendDataToAll(cdbCopy, (char *) &header_frame, sizeof(header_frame));
 }
 
+/*
+ * Frames forwarded to a segment accumulate in that segment's batch buffer
+ * and go out as one libpq copy-data chunk per COPY_DISPATCH_BATCH_FLUSH
+ * bytes; the receiving side reads the copy stream through buffered
+ * pq_getcopydata, so the message boundaries are transparent to it.
+ */
+#define COPY_DISPATCH_BATCH_FLUSH	32768
+
+/* Send one segment's pending frames and clear its batch buffer. */
+static void
+CopyDispatchSendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg)
+{
+	StringInfo	b;
+
+	if (cstate->dispatch_batch == NULL)
+		return;
+	b = cstate->dispatch_batch[target_seg];
+	if (b == NULL || b->len == 0)
+		return;
+
+	cdbCopySendData(cdbCopy, target_seg, b->data, b->len);
+	resetStringInfo(b);
+}
+
+/* Flush every segment's pending frames, preserving the frame order. */
+static void
+CopyDispatchFlushBatches(CopyState cstate, CdbCopy *cdbCopy)
+{
+	int			i;
+
+	if (cstate->dispatch_batch == NULL)
+		return;
+	for (i = 0; i < cstate->dispatch_nbatch; i++)
+		CopyDispatchSendBatch(cstate, cdbCopy, i);
+}
+
+/*
+ * Append the frame built in dispatch_msgbuf to the target segment's batch
+ * buffer, flushing the buffer when it reaches the batch size.
+ */
+static void
+CopyDispatchAppendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg)
+{
+	StringInfo	b;
+
+	if (cstate->dispatch_batch == NULL)
+	{
+		cstate->dispatch_nbatch = cdbCopy->total_segs;
+		cstate->dispatch_batch = palloc0(cstate->dispatch_nbatch *
+										 sizeof(StringInfoData));
+	}
+	Assert(target_seg >= 0 && target_seg < cstate->dispatch_nbatch);
+	if (cstate->dispatch_batch[target_seg] == NULL)
+		cstate->dispatch_batch[target_seg] = makeStringInfo();
+
+	b = cstate->dispatch_batch[target_seg];
+	appendBinaryStringInfo(b, cstate->dispatch_msgbuf->data,
+						   cstate->dispatch_msgbuf->len);
+
+	if (b->len >= COPY_DISPATCH_BATCH_FLUSH)
+		CopyDispatchSendBatch(cstate, cdbCopy, target_seg);
+}
+
 static void
 SendCopyFromForwardedError(CopyState cstate, CdbCopy *cdbCopy, char *errormsg)
 {
@@ -7493,6 +7568,10 @@ SendCopyFromForwardedError(CopyState cstate, CdbCopy *cdbCopy, char *errormsg)
 	int			errormsg_len = strlen(errormsg);
 
 	msgbuf = cstate->dispatch_msgbuf;
+
+	/* pending row frames must precede the error frame in the stream */
+	CopyDispatchFlushBatches(cstate, cdbCopy);
+
 	resetStringInfo(msgbuf);
 	enlargeStringInfo(msgbuf, SizeOfCopyFromDispatchError);
 	/* allocate space for the header (we'll fill it in last). */
