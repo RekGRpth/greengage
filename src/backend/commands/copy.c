@@ -5983,13 +5983,10 @@ CopyFromFastGate(CopyState cstate)
 		return false;
 
 	/*
-	 * The fast parse covers the process that reads the original file: the
-	 * QD (which parses the routing prefix) and utility/direct mode.  The
-	 * QE re-parse of forwarded rows is a follow-up.
+	 * The fast parse covers every text-mode reader: utility/direct mode,
+	 * the QD (which parses the routing prefix) and the QE re-parse of the
+	 * residual fields of forwarded rows.
 	 */
-	if (cstate->dispatch_mode == COPY_EXECUTOR)
-		return false;
-
 	return true;
 }
 
@@ -6535,8 +6532,17 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 		{
 			/*
 			 * We have received the raw line from the QD, and we just
-			 * need to split it into raw fields.
+			 * need to split it into raw fields.  The fast parse handles
+			 * the residual fields from line_buf.cursor; anything it
+			 * cannot prove goes to the regular split below.
 			 */
+			if (cstate->fast_parse &&
+				cstate->stopped_processing_at_delim &&
+				cstate->line_buf.cursor <= cstate->line_buf.len &&
+				CopyFastParseFields(cstate, values, nulls,
+									attnumlist, attr_count, -1))
+				goto defaults;
+
 			if (cstate->stopped_processing_at_delim &&
 				cstate->line_buf.cursor <= cstate->line_buf.len)
 			{
