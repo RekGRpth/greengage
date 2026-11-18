@@ -122,6 +122,22 @@ typedef enum CopyBatchColumnKind
 } CopyBatchColumnKind;
 
 /*
+ * Per-column input dispatch for the vectorized COPY FROM fast parse path
+ * (stored as ints in CopyStateData.fast_kinds to keep copy.h lean).
+ */
+typedef enum CopyFastKind
+{
+	COPY_FAST_FMGR,				/* regular input function on a C string */
+	COPY_FAST_INT2,
+	COPY_FAST_INT4,
+	COPY_FAST_INT8,
+	COPY_FAST_BOOL,
+	COPY_FAST_DATE,				/* canonical YYYY-MM-DD only */
+	COPY_FAST_NUMERIC,			/* plain integer text only */
+	COPY_FAST_TEXT				/* raw bytes into a varlena */
+} CopyFastKind;
+
+/*
  * No more than this many tuples per CopyMultiInsertBuffer
  *
  * Caution: Don't make this too big, as we could end up with this many
@@ -249,6 +265,8 @@ static uint64 CopyTo(CopyState cstate);
 static uint64 CopyDispatchOnSegment(CopyState cstate, const CopyStmt *stmt);
 static uint64 CopyToQueryOnSegment(CopyState cstate);
 static bool CopyReadLine(CopyState cstate);
+static bool CopyFromFastGate(CopyState cstate);
+static int *CopyFromFastAssignKinds(CopyState cstate, TupleDesc tupDesc);
 static bool CopyReadLineText(CopyState cstate);
 static int	CopyReadAttributesText(CopyState cstate, int stop_processing_at_field);
 static int	CopyReadAttributesCSV(CopyState cstate, int stop_processing_at_field);
@@ -4389,6 +4407,17 @@ CopyFrom(CopyState cstate)
 	Assert(cstate->rel);
 
 	/*
+	 * Set up the fast text parse path (see CopyFastParseFields); kinds are
+	 * per physical attribute, shared by the QD prefix and the full list.
+	 * Done here because the gate depends on state (SREH, dispatch mode)
+	 * that is only complete after BeginCopyFrom/DoCopy.
+	 */
+	cstate->fast_parse = CopyFromFastGate(cstate);
+	if (cstate->fast_parse)
+		cstate->fast_kinds = CopyFromFastAssignKinds(cstate,
+													 RelationGetDescr(cstate->rel));
+
+	/*
 	 * The target must be a plain, foreign, or partitioned relation, or have
 	 * an INSTEAD OF INSERT row trigger.  (Currently, such triggers are only
 	 * allowed on views, so we only hint about them in the view case.)
@@ -5764,6 +5793,461 @@ NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields)
 	return NextCopyFromRawFieldsX(cstate, fields, nfields, -1);
 }
 
+/*
+ * Sign-aware decimal parsers for the COPY FROM fast path.  They accept a
+ * strict subset of the regular input functions (no whitespace, no trailing
+ * garbage) and never throw: any doubt makes the caller fall back to the
+ * regular per-field path, which produces the exact error messages.
+ */
+static bool
+CopyFastInt(const char *p, int len, int64 minval, int64 maxval, int64 *out)
+{
+	int64		acc = 0;
+	bool		neg = false;
+	int			i = 0;
+
+	if (len <= 0)
+		return false;
+	if (p[0] == '-')
+	{
+		neg = true;
+		i = 1;
+	}
+	else if (p[0] == '+')
+		i = 1;
+	if (i >= len)
+		return false;
+	for (; i < len; i++)
+	{
+		int			d = p[i] - '0';
+
+		if (d < 0 || d > 9)
+			return false;
+		if (acc > (PG_INT64_MAX - d) / 10)
+			return false;
+		acc = acc * 10 + d;
+	}
+	if (neg)
+		acc = -acc;
+	if (acc < minval || acc > maxval)
+		return false;
+	*out = acc;
+	return true;
+}
+
+static bool
+CopyFastBool(const char *p, int len, bool *out)
+{
+	if (len == 1 && p[0] == 't')
+		*out = true;
+	else if (len == 1 && p[0] == 'f')
+		*out = false;
+	else if (len == 4 && memcmp(p, "true", 4) == 0)
+		*out = true;
+	else if (len == 5 && memcmp(p, "false", 5) == 0)
+		*out = false;
+	else
+		return false;
+	return true;
+}
+
+/*
+ * Accepts only the canonical zero-padded ISO form YYYY-MM-DD, which parses
+ * as year-month-day under any DateStyle.  Validation mirrors date_in:
+ * month/day bounds, the Julian overflow guard and the date range check.
+ */
+static bool
+CopyFastDate(const char *p, int len, Datum *out)
+{
+	int			year,
+				mon,
+				mday;
+	int			mdays;
+	DateADT		date;
+	static const int mdays_tab[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+	if (len != 10 || p[4] != '-' || p[7] != '-')
+		return false;
+	year = mon = mday = 0;
+	for (int i = 0; i < 4; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		year = year * 10 + (p[i] - '0');
+	}
+	for (int i = 5; i < 7; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		mon = mon * 10 + (p[i] - '0');
+	}
+	for (int i = 8; i < 10; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		mday = mday * 10 + (p[i] - '0');
+	}
+	if (mon < 1 || mon > 12)
+		return false;
+	mdays = mdays_tab[mon];
+	if (mon == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
+		mdays = 29;
+	if (mday < 1 || mday > mdays)
+		return false;
+	if (!IS_VALID_JULIAN(year, mon, mday))
+		return false;
+	date = date2j(year, mon, mday) - POSTGRES_EPOCH_JDATE;
+	if (!IS_VALID_DATE(date))
+		return false;
+	*out = Int32GetDatum(date);
+	return true;
+}
+
+static bool
+CopyFastNumeric(const char *p, int len, Datum *out)
+{
+	int64		acc = 0;
+	int			dscale = 0;
+	bool		neg = false;
+	bool		saw_digit = false;
+	bool		saw_point = false;
+	int			i = 0;
+
+	if (len <= 0)
+		return false;
+	if (p[0] == '-')
+	{
+		neg = true;
+		i = 1;
+	}
+	else if (p[0] == '+')
+		i = 1;
+	for (; i < len; i++)
+	{
+		int			d = p[i] - '0';
+
+		if (d < 0 || d > 9)
+		{
+			/* a single decimal point switches to the fraction part */
+			if (p[i] == '.' && !saw_point)
+			{
+				saw_point = true;
+				continue;
+			}
+			return false;
+		}
+		saw_digit = true;
+		if (acc > (PG_INT64_MAX - d) / 10)
+			return false;
+		acc = acc * 10 + d;
+		if (saw_point)
+			dscale++;
+	}
+	if (!saw_digit)
+		return false;
+	if (neg)
+		acc = -acc;
+	*out = PointerGetDatum(numeric_build_fast(acc, dscale));
+	return true;
+}
+
+/*
+ * Returns true iff COPY FROM can use the fast text parse path.  Anything
+ * unsupported keeps the regular per-field path; the parsed data is
+ * identical either way.
+ */
+static bool
+CopyFromFastGate(CopyState cstate)
+{
+	/* perf feature enabled under gp_vectorized_execution */
+	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_OFF)
+		return false;
+
+	/* text format only; escape processing stays on the regular path */
+	if (cstate->csv_mode || cstate->binary || cstate->escape_off)
+		return false;
+
+	/* single-row error handling needs its own per-line machinery */
+	if (cstate->cdbsreh)
+		return false;
+
+	if (cstate->convert_select_flags)
+		return false;
+
+	/*
+	 * The fast path reads raw file bytes without encoding conversion and
+	 * does not need the multibyte grouping of the line reader.
+	 */
+	if (cstate->file_encoding != GetDatabaseEncoding() ||
+		cstate->encoding_embeds_ascii)
+		return false;
+
+	/*
+	 * The fast parse covers the process that reads the original file: the
+	 * QD (which parses the routing prefix) and utility/direct mode.  The
+	 * QE re-parse of forwarded rows is a follow-up.
+	 */
+	if (cstate->dispatch_mode == COPY_EXECUTOR)
+		return false;
+
+	return true;
+}
+
+/*
+ * Assign the per-column fast input kernel kind.  Types without a kernel
+ * stay on COPY_FAST_FMGR, which behaves exactly like the regular path.
+ */
+static int *
+CopyFromFastAssignKinds(CopyState cstate, TupleDesc tupDesc)
+{
+	int		   *kinds = palloc(tupDesc->natts * sizeof(int));
+
+	for (int i = 0; i < tupDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupDesc, i);
+		int			kind = COPY_FAST_FMGR;
+
+		switch (attr->atttypid)
+		{
+			case INT2OID:
+				kind = COPY_FAST_INT2;
+				break;
+			case INT4OID:
+				kind = COPY_FAST_INT4;
+				break;
+			case INT8OID:
+				kind = COPY_FAST_INT8;
+				break;
+			case BOOLOID:
+				kind = COPY_FAST_BOOL;
+				break;
+			case DATEOID:
+				kind = COPY_FAST_DATE;
+				break;
+			case NUMERICOID:
+				kind = COPY_FAST_NUMERIC;
+				break;
+			case TEXTOID:
+				kind = COPY_FAST_TEXT;
+				break;
+			default:
+				break;
+		}
+		kinds[i] = kind;
+	}
+	return kinds;
+}
+
+/*
+ * Fast text-mode parse of the current input line.  The line must already
+ * be read into line_buf.  Returns true when every field was parsed with
+ * the fast kernels; values/nulls are then filled for the processed
+ * fields, and line_buf.cursor/stopped_processing_at_delim are updated
+ * exactly like the regular path does.  Returns false when this line must
+ * go through the regular per-field path (its conversion loop overwrites
+ * everything this function may have written).
+ */
+static bool
+CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
+					List *attnumlist, AttrNumber attr_count,
+					int stop_processing_at_field)
+{
+	char	   *line_start = cstate->line_buf.data + cstate->line_buf.cursor;
+	char	   *line_end = cstate->line_buf.data + cstate->line_buf.len;
+	char	   *p;
+	int			limit;
+	int			nfields = 0;
+	bool		last_had_delim = false;
+	bool		delim_off = cstate->delim_off;
+	char		delimc = cstate->delim[0];
+	ListCell   *cur;
+	int			fieldno = 0;
+
+	/* FILL MISSING FIELDS changes the missing-field rules */
+	if (cstate->fill_missing)
+		return false;
+
+	/*
+	 * Single fused scan over the processed fields: record each field's end
+	 * pointer in raw_fields and bail out if a backslash shows up (escapes
+	 * and the end-of-copy marker rules live in the regular path).  The
+	 * remainder after the QD's processing limit is not scanned here; it is
+	 * forwarded raw.
+	 */
+	limit = (stop_processing_at_field >= 0) ?
+		stop_processing_at_field : attr_count;
+
+	p = line_start;
+	while (nfields < limit)
+	{
+		if (nfields + 1 > cstate->max_fields)
+		{
+			cstate->max_fields *= 2;
+			cstate->raw_fields = repalloc(cstate->raw_fields,
+										  cstate->max_fields * sizeof(char *));
+		}
+		while (p < line_end)
+		{
+			char		c = *p;
+
+			if (c == delimc && !delim_off)
+				break;
+			if (c == '\\')
+				return false;
+			p++;
+		}
+		cstate->raw_fields[nfields] = p;	/* end of field, exclusive */
+		nfields++;
+		last_had_delim = (p < line_end);
+		if (!last_had_delim)
+			break;
+		p++;						/* skip the delimiter */
+	}
+
+	if (stop_processing_at_field >= 0)
+	{
+		if (nfields < limit)
+			return false;
+	}
+	else if (nfields + (last_had_delim ? 1 : 0) != attr_count)
+		return false;
+
+	/*
+	 * Convert the recorded fields to values/nulls.
+	 */
+	resetStringInfo(&cstate->attribute_buf);
+	p = line_start;
+	foreach(cur, attnumlist)
+	{
+		int			attnum = lfirst_int(cur);
+		int			m = attnum - 1;
+		Form_pg_attribute att = TupleDescAttr(cstate->rel->rd_att, m);
+		const char *sp;
+		int			flen;
+
+		if (fieldno == limit)
+			break;
+
+		sp = p;
+		p = cstate->raw_fields[fieldno];
+		flen = p - sp;
+		fieldno++;
+
+		/* raw match against the null marker, like CopyReadAttributesText */
+		if (flen == cstate->null_print_len &&
+			(flen == 0 || memcmp(sp, cstate->null_print, flen) == 0))
+			continue;			/* values[m] == 0, nulls[m] == true */
+
+		switch (cstate->fast_kinds[m])
+		{
+			case COPY_FAST_INT2:
+				{
+					int64		v;
+
+					if (!CopyFastInt(sp, flen, PG_INT16_MIN, PG_INT16_MAX, &v))
+						return false;
+					values[m] = Int16GetDatum((int16) v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_INT4:
+				{
+					int64		v;
+
+					if (!CopyFastInt(sp, flen, PG_INT32_MIN, PG_INT32_MAX, &v))
+						return false;
+					values[m] = Int32GetDatum((int32) v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_INT8:
+				{
+					int64		v;
+
+					if (!CopyFastInt(sp, flen, PG_INT64_MIN, PG_INT64_MAX, &v))
+						return false;
+					values[m] = Int64GetDatum(v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_BOOL:
+				{
+					bool		v;
+
+					if (!CopyFastBool(sp, flen, &v))
+						return false;
+					values[m] = BoolGetDatum(v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_DATE:
+				if (!CopyFastDate(sp, flen, &values[m]))
+					return false;
+				nulls[m] = false;
+				break;
+			case COPY_FAST_NUMERIC:
+				if (!CopyFastNumeric(sp, flen, &values[m]))
+					return false;
+				nulls[m] = false;
+				break;
+			case COPY_FAST_TEXT:
+				{
+					text	   *t = (text *) palloc(flen + VARHDRSZ);
+
+					SET_VARSIZE(t, flen + VARHDRSZ);
+					memcpy(VARDATA(t), sp, flen);
+					values[m] = PointerGetDatum(t);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_FMGR:
+			default:
+				{
+					/*
+					 * Scratch space in attribute_buf, which the regular
+					 * path resets per line anyway; each field's string
+					 * starts at the position this field was appended at.
+					 */
+					char	   *string;
+					int			startpos = cstate->attribute_buf.len;
+
+					appendBinaryStringInfo(&cstate->attribute_buf, sp, flen);
+					appendStringInfoCharMacro(&cstate->attribute_buf, '\0');
+					string = cstate->attribute_buf.data + startpos;
+
+					cstate->cur_attname = NameStr(att->attname);
+					cstate->cur_attval = string;
+					values[m] = InputFunctionCall(&cstate->in_functions[m],
+												  string,
+												  cstate->typioparams[m],
+												  att->atttypmod);
+					nulls[m] = false;
+					cstate->cur_attname = NULL;
+					cstate->cur_attval = NULL;
+					break;
+				}
+		}
+
+		/* the delimiter between fields is not part of the value */
+		if (p < line_end)
+			p++;
+	}
+
+	/* Bookkeeping identical to CopyReadAttributesText */
+	if (stop_processing_at_field >= 0 && fieldno == limit && last_had_delim)
+	{
+		cstate->stopped_processing_at_delim = true;
+		cstate->line_buf.cursor = p - cstate->line_buf.data;
+	}
+	else
+	{
+		cstate->stopped_processing_at_delim = false;
+		cstate->line_buf.cursor = line_end - cstate->line_buf.data;
+	}
+
+	return true;
+}
+
 static bool
 NextCopyFromRawFieldsX(CopyState cstate, char ***fields, int *nfields,
 					   int stop_processing_at_field)
@@ -6005,12 +6489,46 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 		int			fldct;
 		int			fieldno;
 		char	   *string;
+		bool		fast_row = false;
 
 		/* read raw fields in the next line */
 		if (cstate->dispatch_mode != COPY_EXECUTOR)
 		{
-			if (!NextCopyFromRawFieldsX(cstate, &field_strings, &fldct,
-										stop_processing_at_field))
+			if (cstate->fast_parse)
+			{
+				bool		done;
+
+				/* on input just throw the header line away */
+				if (cstate->cur_lineno == 0 && cstate->header_line)
+				{
+					cstate->cur_lineno++;
+					if (CopyReadLine(cstate))
+						return false;	/* done */
+				}
+
+				cstate->cur_lineno++;
+
+				done = CopyReadLine(cstate);
+				if (done && cstate->line_buf.len == 0)
+					return false;
+
+				fast_row = CopyFastParseFields(cstate, values, nulls,
+											   attnumlist, attr_count,
+											   stop_processing_at_field);
+				if (fast_row)
+					goto defaults;
+
+				/*
+				 * Fast-parse fallback: split the current line the regular
+				 * way (it is already in line_buf); the regular conversion
+				 * loop below provides the exact error messages and
+				 * semantics.
+				 */
+				fldct = CopyReadAttributesText(cstate, stop_processing_at_field);
+				field_strings = cstate->raw_fields;
+			}
+			else if (!NextCopyFromRawFieldsX(cstate, &field_strings, &fldct,
+											 stop_processing_at_field))
 				return false;
 		}
 		else
@@ -6032,11 +6550,17 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 			field_strings = cstate->raw_fields;
 		}
 
-		/* 
+		/*
+		 * The regular path: field-count checks and the per-field
+		 * conversion loop.  Skipped when the fast parse produced the row.
+		 */
+		if (!fast_row)
+		{
+		/*
 		 * Check for overflowing fields.
-		 * GPDB: Change below condition compared to upstream to 
-		 * greater than or equal to 0 as in QE, 
-		 * attr_count may be equal to 0, 
+		 * GPDB: Change below condition compared to upstream to
+		 * greater than or equal to 0 as in QE,
+		 * attr_count may be equal to 0,
 		 * when all fields are processed in the QD.
 		 */
 		if (fldct > attr_count)
@@ -6130,6 +6654,7 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 		}
 
 		Assert(fieldno == attr_count);
+		}							/* end of !fast_row regular path */
 	}
 	else if (attr_count)
 	{
@@ -6205,6 +6730,7 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 	 * (We could improve this, and compute immutable defaults that don't
 	 * affect which segment the row belongs to, in the QE.)
 	 */
+defaults:;
   if (cstate->dispatch_mode != COPY_EXECUTOR)
   {
 	for (i = 0; i < num_defaults; i++)
@@ -6956,6 +7482,47 @@ CopyReadLineText(CopyState cstate)
 				break;
 			}
 			need_data = false;
+		}
+
+		/*
+		 * Bulk scan: in plain text mode with a known LF line terminator,
+		 * a line containing no backslash can be transferred wholesale
+		 * with a couple of memchr calls.  Everything special (escapes,
+		 * the end-of-copy marker, CR-style line endings, unknown EOL on
+		 * the first line, ASCII-embedding encodings) is left to the
+		 * per-character loop below.
+		 */
+		if (!cstate->csv_mode && !cstate->encoding_embeds_ascii &&
+			cstate->eol_type == EOL_NL &&
+			raw_buf_ptr < copy_buf_len)
+		{
+			char	   *nl = memchr(copy_raw_buf + raw_buf_ptr, '\n',
+									 copy_buf_len - raw_buf_ptr);
+			int			nl_pos;
+
+			if (nl != NULL)
+			{
+				nl_pos = nl - copy_raw_buf;
+
+				if (raw_buf_ptr < nl_pos &&
+					memchr(copy_raw_buf + raw_buf_ptr, '\\',
+						   nl_pos - raw_buf_ptr) != NULL)
+				{
+					/*
+					 * A backslash anywhere in the line may be an escape
+					 * or the start of the end-of-copy marker; leave the
+					 * line to the per-character loop.
+					 */
+				}
+				else
+				{
+					/* consume through the newline; the tail REFILL
+					 * LINEBUF at the end of the function transfers the
+					 * line into line_buf */
+					raw_buf_ptr = nl_pos + 1;
+					break;
+				}
+			}
 		}
 
 		/* OK to fetch a character */

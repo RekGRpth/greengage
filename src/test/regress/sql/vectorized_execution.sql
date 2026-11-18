@@ -22,6 +22,8 @@ DROP TABLE IF EXISTS vector_drop_test CASCADE;
 DROP TABLE IF EXISTS vector_union_a, vector_union_b, vector_union_h, vector_union_hj CASCADE;
 DROP TABLE IF EXISTS vector_copy_test;
 DROP TABLE IF EXISTS vector_copy_heap;
+DROP TABLE IF EXISTS vector_copy_from;
+DROP TABLE IF EXISTS vector_copy_from2;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1119,6 +1121,34 @@ SET gp_vectorized_execution = off;
 SET gp_vectorized_execution = force;
 \copy vector_copy_heap TO STDOUT WITH (DELIMITER '|')
 RESET gp_vectorized_execution;
+-- ---- vectorized COPY FROM: batch text parse, identical loaded data ----
+CREATE TABLE vector_copy_from
+(i2 int2, i4 int4, i8 int8, b bool, d date, n numeric(12,2), nf numeric,
+ t text, vc varchar(10), v_dist text)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (v_dist);
+CREATE TABLE vector_copy_from2 (LIKE vector_copy_from) DISTRIBUTED BY (v_dist);
+SET gp_vectorized_execution = off;
+COPY vector_copy_from FROM STDIN WITH (DELIMITER '|');
+1|2|3|t|2021-02-28|1.50|123|hello|abc|dist
+-32768|-2147483648|-9223372036854775808|false|2020-02-29|-0.05|+42|\tabc\|back\\slash| x y |dist
+32767|2147483647|9223372036854775807|true|1999-12-31|9999999999.99|0.30|кириллица|nullfix|dist
+\N|\N|\N|\N|\N|\N|\N|\N|\N|\N
+7|7|7|TRUE|2021-01-01|007.00|007.000|leadzero||dist
+\.
+SET gp_vectorized_execution = force;
+COPY vector_copy_from2 FROM STDIN WITH (DELIMITER '|');
+1|2|3|t|2021-02-28|1.50|123|hello|abc|dist
+-32768|-2147483648|-9223372036854775808|false|2020-02-29|-0.05|+42|\tabc\|back\\slash| x y |dist
+32767|2147483647|9223372036854775807|true|1999-12-31|9999999999.99|0.30|кириллица|nullfix|dist
+\N|\N|\N|\N|\N|\N|\N|\N|\N|\N
+7|7|7|TRUE|2021-01-01|007.00|007.000|leadzero||dist
+\.
+-- both loads must produce byte-identical tables
+SET gp_vectorized_execution = off;
+COPY vector_copy_from TO STDOUT WITH (DELIMITER '|');
+COPY vector_copy_from2 TO STDOUT WITH (DELIMITER '|');
+RESET gp_vectorized_execution;
 RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
@@ -1145,3 +1175,5 @@ DROP TABLE vector_drop_test CASCADE;
 DROP TABLE vector_union_a, vector_union_b, vector_union_h, vector_union_hj CASCADE;
 DROP TABLE vector_copy_test;
 DROP TABLE vector_copy_heap;
+DROP TABLE vector_copy_from;
+DROP TABLE vector_copy_from2;
