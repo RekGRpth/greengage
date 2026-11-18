@@ -20,6 +20,8 @@ DROP TABLE IF EXISTS vector_append_parent CASCADE;
 DROP TABLE IF EXISTS vector_part_test CASCADE;
 DROP TABLE IF EXISTS vector_drop_test CASCADE;
 DROP TABLE IF EXISTS vector_union_a, vector_union_b, vector_union_h, vector_union_hj CASCADE;
+DROP TABLE IF EXISTS vector_copy_test;
+DROP TABLE IF EXISTS vector_copy_heap;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1049,6 +1051,74 @@ EXPLAIN (COSTS OFF) SELECT id, val FROM vector_aoco_test LIMIT 3;
 SET statement_mem = '256kB';
 EXPLAIN (COSTS OFF) SELECT val, count(*) FROM vector_aoco_test GROUP BY val;
 RESET statement_mem;
+-- ---- vectorized COPY TO: batch AOCS formatters, byte-identical output ----
+CREATE TABLE vector_copy_test
+(n_id numeric(12,2), n_small numeric(4,4), n_free numeric, d_val date,
+ b_val bool, i2 int2, i4 int4, i8 int8, t_val text, v_val varchar(10),
+ c_val bpchar(5), v_dist text)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (v_dist);
+-- one INSERT per row: single-row statements insert in statement order, so
+-- the AOCS row numbers (and hence the COPY TO output order) are stable
+INSERT INTO vector_copy_test VALUES
+('30.00', '0.0500', '123.456', '1993-06-16', true, 32767, 2147483647,
+ 9223372036854775807, E'a\tb', 'x', 'y', 'dist');
+INSERT INTO vector_copy_test VALUES
+('0.30', '0.0001', '0.00005', '1992-08-14', false, -32768, -2147483648,
+ -9223372036854775808, E'c\nd', '', '', 'dist');
+INSERT INTO vector_copy_test VALUES
+('-0.05', '-0.9999', '99999999999999999999999999999.123456789', '0044-03-15 BC',
+ NULL, 0, 0, 0, E'e\\f', 'abcdefghij', 'q', 'dist');
+INSERT INTO vector_copy_test VALUES
+('29034.60', '0.0000', 'NaN', 'infinity', NULL, NULL, NULL, NULL, 'g|h',
+ NULL, NULL, 'dist');
+INSERT INTO vector_copy_test VALUES
+('-29034.60', '0.9999', NULL, '-infinity', NULL, NULL, NULL, NULL, E'i j',
+ NULL, NULL, 'dist');
+INSERT INTO vector_copy_test VALUES
+(NULL, NULL, NULL, '5874897-12-31', NULL, NULL, NULL, NULL,
+ 'кириллица', NULL, NULL, 'dist');
+INSERT INTO vector_copy_test VALUES
+('NaN', '0.1234', '0.001', '1970-01-01', NULL, NULL, NULL, NULL,
+ E'lead\ttrail ', NULL, NULL, 'dist');
+INSERT INTO vector_copy_test VALUES
+('0.00', '0.5000', '9999999999.99', '2000-02-29', true, 1, 2, 3, '', '',
+ 'mid', 'dist');
+INSERT INTO vector_copy_test VALUES
+('-0.0001', '0.2500', '-45.005', '0001-01-01 BC', true, 7, 7, 7,
+ E'quote"q', 'lead ', 'c    ', 'dist');
+-- all rows share the distribution key, so the whole table lives on one
+-- segment; off and force must emit byte-identical output
+SET gp_vectorized_execution = off;
+\copy vector_copy_test TO STDOUT WITH (DELIMITER '|')
+SET gp_vectorized_execution = force;
+\copy vector_copy_test TO STDOUT WITH (DELIMITER '|')
+SET gp_vectorized_execution = off;
+\copy vector_copy_test (b_val, n_free, d_val, t_val, i8) TO STDOUT WITH (DELIMITER '|')
+SET gp_vectorized_execution = force;
+\copy vector_copy_test (b_val, n_free, d_val, t_val, i8) TO STDOUT WITH (DELIMITER '|')
+-- ISO DateStyle exercises the fast date formatter
+SET DateStyle = 'ISO, MDY';
+SET gp_vectorized_execution = off;
+\copy vector_copy_test TO STDOUT WITH (DELIMITER '|')
+SET gp_vectorized_execution = force;
+\copy vector_copy_test TO STDOUT WITH (DELIMITER '|')
+RESET DateStyle;
+-- non-ISO DateStyle must route date columns back to the output function
+SET DateStyle = German;
+SET gp_vectorized_execution = off;
+\copy vector_copy_test TO STDOUT WITH (DELIMITER '|')
+SET gp_vectorized_execution = force;
+\copy vector_copy_test TO STDOUT WITH (DELIMITER '|')
+RESET DateStyle;
+-- heap storage stays on the regular row-by-row path
+CREATE TABLE vector_copy_heap (LIKE vector_copy_test) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_heap SELECT * FROM vector_copy_test;
+SET gp_vectorized_execution = off;
+\copy vector_copy_heap TO STDOUT WITH (DELIMITER '|')
+SET gp_vectorized_execution = force;
+\copy vector_copy_heap TO STDOUT WITH (DELIMITER '|')
+RESET gp_vectorized_execution;
 RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
@@ -1073,3 +1143,5 @@ DROP TABLE vector_append_parent CASCADE;
 DROP TABLE vector_part_test CASCADE;
 DROP TABLE vector_drop_test CASCADE;
 DROP TABLE vector_union_a, vector_union_b, vector_union_h, vector_union_hj CASCADE;
+DROP TABLE vector_copy_test;
+DROP TABLE vector_copy_heap;

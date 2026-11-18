@@ -86,6 +86,10 @@
 #include "utils/resscheduler.h"
 #include "utils/string_utils.h"
 #include "partitioning/partdesc.h"
+#include "executor/vectorBatch.h"
+#include "utils/date.h"
+#include "utils/datetime.h"
+#include "utils/numeric.h"
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
@@ -99,6 +103,23 @@ typedef enum CopyInsertMethod
 	CIM_MULTI,					/* always use table_multi_insert */
 	CIM_MULTI_CONDITIONAL		/* use table_multi_insert only if valid */
 } CopyInsertMethod;
+
+/*
+ * Per-column formatter dispatch for the vectorized COPY TO path (see
+ * CopyToBatchGate).  Columns without a fast kernel stay on the regular
+ * output-function path; the output is byte-identical either way.
+ */
+typedef enum CopyBatchColumnKind
+{
+	COPY_BATCH_FMGR,			/* generic output function call */
+	COPY_BATCH_INT2,
+	COPY_BATCH_INT4,
+	COPY_BATCH_INT8,
+	COPY_BATCH_BOOL,
+	COPY_BATCH_DATE,			/* ISO DateStyle only */
+	COPY_BATCH_NUMERIC,
+	COPY_BATCH_TEXT				/* text/bpchar/varchar raw bytes */
+} CopyBatchColumnKind;
 
 /*
  * No more than this many tuples per CopyMultiInsertBuffer
@@ -3015,6 +3036,440 @@ CopyToQueryOnSegment(CopyState cstate)
 }
 
 /*
+ * Sign-aware integer-to-string helpers that return the digit length, so the
+ * COPY TO fast path can emit values into the row buffer without a second
+ * strlen() pass (the plain pg_itoa/pg_ltoa/pg_lltoa are NUL-terminating).
+ */
+static inline int
+CopyItoa16(int16 v, char *a)
+{
+	if (v >= 0)
+		return pg_ultoa_n((uint32) v, a);
+	a[0] = '-';
+	return 1 + pg_ultoa_n((uint32) - (int32) v, a + 1);
+}
+
+static inline int
+CopyItoa32(int32 v, char *a)
+{
+	if (v >= 0)
+		return pg_ultoa_n((uint32) v, a);
+	a[0] = '-';
+	return 1 + pg_ultoa_n((uint32) - (int64) v, a + 1);
+}
+
+static inline int
+CopyItoa64(int64 v, char *a)
+{
+	if (v >= 0)
+		return pg_ulltoa_n((uint64) v, a);
+	a[0] = '-';
+	return 1 + pg_ulltoa_n((uint64) 0 - (uint64) v, a + 1);
+}
+
+/*
+ * CopyAttributeOutTextLen: same escaping as CopyAttributeOutText, but takes
+ * an explicit byte length instead of relying on NUL termination, so text
+ * values can be emitted straight out of the batch scan buffers without a
+ * detoast/copy.  Only the safe-encoding loop is implemented; callers must
+ * gate on cstate->encoding_embeds_ascii (see CopyToBatchGate).
+ */
+static void
+CopyAttributeOutTextLen(CopyState cstate, const char *ptr, int len)
+{
+	const char *start;
+	const char *end = ptr + len;
+	char		c;
+	char		delimc = cstate->delim[0];
+	char		escapec = cstate->escape[0];
+
+#define COPY_DUMPSOFAR() \
+	do { \
+		if (ptr > start) \
+			CopySendData(cstate, start, ptr - start); \
+	} while (0)
+
+	if (cstate->escape_off)
+	{
+		CopySendData(cstate, ptr, len);
+		return;
+	}
+
+	start = ptr;
+	while (ptr < end)
+	{
+		c = *ptr;
+		if ((unsigned char) c < (unsigned char) 0x20)
+		{
+			/*
+			 * \r and \n must be escaped, the others are traditional.  We
+			 * prefer to dump these using the C-like notation, rather than
+			 * a backslash and the literal character.
+			 */
+			switch (c)
+			{
+				case '\b':
+					c = 'b';
+					break;
+				case '\f':
+					c = 'f';
+					break;
+				case '\n':
+					c = 'n';
+					break;
+				case '\r':
+					c = 'r';
+					break;
+				case '\t':
+					c = 't';
+					break;
+				case '\v':
+					c = 'v';
+					break;
+				default:
+					/* If it's the delimiter, must backslash it */
+					if (c == delimc)
+						break;
+					/* All ASCII control chars are length 1 */
+					ptr++;
+					continue;	/* fall to end of loop */
+			}
+			/* if we get here, we need to convert the control char */
+			COPY_DUMPSOFAR();
+			CopySendChar(cstate, escapec);
+			CopySendChar(cstate, c);
+			start = ++ptr;		/* do not include char in next run */
+		}
+		else if (c == escapec || c == delimc)
+		{
+			COPY_DUMPSOFAR();
+			CopySendChar(cstate, escapec);
+			start = ptr++;		/* we include char in next run */
+		}
+		else
+			ptr++;
+	}
+
+	COPY_DUMPSOFAR();
+#undef COPY_DUMPSOFAR
+}
+
+/*
+ * Returns true iff the COPY TO row loop can use the vectorized AOCS batch
+ * reader with the fast per-column formatters.  Anything unsupported keeps
+ * the plain row-by-row path; the output is byte-identical either way.
+ */
+static bool
+CopyToBatchGate(CopyState cstate, Relation rel)
+{
+	/* this is a perf feature enabled under gp_vectorized_execution */
+	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_OFF)
+		return false;
+
+	/* binary and CSV have their own per-value quoting/framing */
+	if (cstate->binary || cstate->csv_mode)
+		return false;
+
+	/*
+	 * The text escaping kernel reads batch values in server encoding and
+	 * emits them in the same encoding, so the file encoding must be the
+	 * database encoding (cstate->need_transcoding is also set for multibyte
+	 * encodings where no conversion actually happens), and it must not be
+	 * an encoding in which ASCII bytes can appear inside multibyte
+	 * characters.
+	 */
+	if (cstate->file_encoding != GetDatabaseEncoding() ||
+		cstate->encoding_embeds_ascii)
+		return false;
+
+	/* the batch reader is implemented for AO column storage */
+	if (!RelationStorageIsAoCols(rel))
+		return false;
+
+	/* only the plain top-level relation; partitioned parents fall back */
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+		return false;
+
+	/* the batch reader needs at least one projected column */
+	if (cstate->attnumlist == NIL)
+		return false;
+
+	return true;
+}
+
+/*
+ * Assign the formatter kind for every copied column.  Types without a
+ * dedicated kernel stay on COPY_BATCH_FMGR; date columns require the ISO
+ * DateStyle since the fast kernel only emits that format.
+ */
+static CopyBatchColumnKind *
+CopyToBatchAssignKinds(CopyState cstate, TupleDesc tupDesc)
+{
+	CopyBatchColumnKind *kinds = palloc(tupDesc->natts * sizeof(CopyBatchColumnKind));
+	ListCell   *cur;
+
+	foreach(cur, cstate->attnumlist)
+	{
+		int			attnum = lfirst_int(cur);
+		Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
+		CopyBatchColumnKind kind = COPY_BATCH_FMGR;
+
+		switch (attr->atttypid)
+		{
+			case INT2OID:
+				kind = COPY_BATCH_INT2;
+				break;
+			case INT4OID:
+				kind = COPY_BATCH_INT4;
+				break;
+			case INT8OID:
+				kind = COPY_BATCH_INT8;
+				break;
+			case BOOLOID:
+				kind = COPY_BATCH_BOOL;
+				break;
+			case DATEOID:
+				if (DateStyle == USE_ISO_DATES)
+					kind = COPY_BATCH_DATE;
+				break;
+			case NUMERICOID:
+				kind = COPY_BATCH_NUMERIC;
+				break;
+			case TEXTOID:
+			case BPCHAROID:
+			case VARCHAROID:
+				kind = COPY_BATCH_TEXT;
+				break;
+			default:
+				break;
+		}
+		kinds[attnum - 1] = kind;
+	}
+	return kinds;
+}
+
+/*
+ * Emit one row of a VectorBatch during CopyTo.  Must produce byte-identical
+ * output to CopyOneRowTo; the send/flush structure (delimiters, newlines,
+ * per-row progress) is intentionally the same, only the value access and the
+ * per-column formatting differ.
+ */
+static void
+CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
+				  const CopyBatchColumnKind *kinds)
+{
+	bool		need_delim = false;
+	ListCell   *cur;
+
+	foreach(cur, cstate->attnumlist)
+	{
+		int			attnum = lfirst_int(cur);
+		int			col = attnum - 1;
+		Datum		value = VectorBatchGetDatum(batch, col, row);
+		bool		isnull = VectorBatchIsNull(batch, col, row);
+
+		if (need_delim)
+			CopySendChar(cstate, cstate->delim[0]);
+		need_delim = true;
+
+		if (isnull)
+		{
+			CopySendString(cstate, cstate->null_print_client);
+			continue;
+		}
+
+		switch (kinds[col])
+		{
+			case COPY_BATCH_INT2:
+				{
+					char		tmp[MAXINT8LEN + 1];
+					int			len = CopyItoa16(DatumGetInt16(value), tmp);
+
+					CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_INT4:
+				{
+					char		tmp[MAXINT8LEN + 1];
+					int			len = CopyItoa32(DatumGetInt32(value), tmp);
+
+					CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_INT8:
+				{
+					char		tmp[MAXINT8LEN + 1];
+					int			len = CopyItoa64(DatumGetInt64(value), tmp);
+
+					CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_BOOL:
+				CopySendChar(cstate, DatumGetBool(value) ? 't' : 'f');
+				break;
+			case COPY_BATCH_DATE:
+				{
+					DateADT		dt = DatumGetInt32(value);
+					char		tmp[MAXDATELEN + 1];
+
+					if (DATE_NOT_FINITE(dt))
+					{
+						EncodeSpecialDate(dt, tmp);
+						CopySendData(cstate, tmp, strlen(tmp));
+					}
+					else
+					{
+						struct pg_tm tt,
+								   *tm = &tt;
+						char	   *p = tmp;
+
+						j2date(dt + POSTGRES_EPOCH_JDATE,
+							   &tm->tm_year, &tm->tm_mon, &tm->tm_mday);
+
+						/* same output as EncodeDateOnly with USE_ISO_DATES */
+						p = pg_ultostr_zeropad(p,
+											   (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
+						*p++ = '-';
+						p = pg_ultostr_zeropad(p, tm->tm_mon, 2);
+						*p++ = '-';
+						p = pg_ultostr_zeropad(p, tm->tm_mday, 2);
+						if (tm->tm_year <= 0)
+						{
+							memcpy(p, " BC", 3);	/* Don't copy NUL */
+							p += 3;
+						}
+						CopySendData(cstate, tmp, p - tmp);
+					}
+					break;
+				}
+			case COPY_BATCH_NUMERIC:
+				{
+					int64		mant;
+					int			scale;
+					int			dscale;
+					bool		decoded = numeric_decode_fast_datum(value, &mant,
+																	&scale, &dscale);
+
+					/*
+					 * The decoded mantissa covers every decimal digit of the
+					 * base-10000 fold, which can be more precision than the
+					 * display scale carries; numeric_out cuts those digits
+					 * (always zeroes in a canonical numeric).  Align the
+					 * exponent to dscale the same way before rendering.
+					 */
+					if (decoded && scale > dscale)
+					{
+						int64		div = 1;
+						int			extra = scale - dscale;
+
+						for (int i = 0; i < extra; i++)
+						{
+							if (div > PG_INT64_MAX / 10)
+							{
+								decoded = false;
+								break;
+							}
+							div *= 10;
+						}
+						if (decoded)
+							mant = mant / div;	/* truncate toward zero */
+					}
+					else if (decoded && scale < dscale)
+					{
+						if (!numeric_scale_fast(&mant, scale, dscale))
+							decoded = false;
+					}
+
+					if (decoded)
+					{
+						char		tmp[MAXINT8LEN + 1];
+						int			len = CopyItoa64(mant, tmp);
+						bool		negative = (tmp[0] == '-');
+						int			digits = len - (negative ? 1 : 0);
+						const char *digitsp = tmp + (negative ? 1 : 0);
+
+						/*
+						 * The value is mantissa * 10^-dscale, printed with
+						 * exactly dscale digits after the decimal point, the
+						 * same representation numeric_out produces.
+						 */
+						if (dscale > 0)
+						{
+							if (digits > dscale)
+							{
+								int			ipart = len - dscale;
+
+								CopySendData(cstate, tmp, ipart);
+								CopySendChar(cstate, '.');
+								CopySendData(cstate, tmp + ipart, dscale);
+							}
+							else
+							{
+								if (negative)
+									CopySendChar(cstate, '-');
+								CopySendString(cstate, "0.");
+								for (int z = digits; z < dscale; z++)
+									CopySendChar(cstate, '0');
+								CopySendData(cstate, digitsp, digits);
+							}
+						}
+						else
+							CopySendData(cstate, tmp, len);
+					}
+					else
+					{
+						/* NaN or a mantissa beyond int64: exact fmgr path */
+						char	   *string;
+
+						string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
+													value);
+						CopySendData(cstate, string, strlen(string));
+					}
+					break;
+				}
+			case COPY_BATCH_TEXT:
+				{
+					char	   *vp = (char *) DatumGetPointer(value);
+
+					if (VARATT_IS_EXTERNAL(vp) || VARATT_IS_COMPRESSED(vp))
+					{
+						/* cannot happen in AO column storage; be safe */
+						char	   *string;
+
+						string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
+													value);
+						CopyAttributeOutTextLen(cstate, string, strlen(string));
+					}
+					else
+						CopyAttributeOutTextLen(cstate, VARDATA_ANY(vp),
+												VARSIZE_ANY_EXHDR(vp));
+					break;
+				}
+			case COPY_BATCH_FMGR:
+				{
+					char	   *string;
+
+					string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
+												value);
+					CopyAttributeOutTextLen(cstate, string, strlen(string));
+					break;
+				}
+		}
+	}
+
+	/*
+	 * Finish off the row: write it to the destination, and update the count.
+	 * However, if we're in the context of a writable external table, we let
+	 * the caller do it - send the data to its local external source (see
+	 * external_insert() ).
+	 */
+	if (cstate->copy_dest != COPY_CALLBACK)
+	{
+		CopySendEndOfRow(cstate);
+	}
+}
+
+/*
  * Copy from relation or query TO file.
  */
 static uint64
@@ -3214,33 +3669,81 @@ CopyTo(CopyState cstate)
 					 * to the underlying CO AM layer to handle it - the behavior should be same
 					 * as SELECT * which is to choose one column to scan.
 					 */
-					scandesc = table_beginscan_es(rel, GetActiveSnapshot(), 0, NULL, 
-													cstate->attnumlist ? proj : NULL, 
+					scandesc = table_beginscan_es(rel, GetActiveSnapshot(), 0, NULL,
+													cstate->attnumlist ? proj : NULL,
 													NULL);
-					slot = table_slot_create(rel, NULL);
 
-					while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+					if (rel == cstate->rel && CopyToBatchGate(cstate, rel))
 					{
-						CHECK_FOR_INTERRUPTS();
+						VectorBatch	   *batch;
+						CopyBatchColumnKind *kinds;
+						MemoryContext	oldrowctx;
+						int				row;
 
-						/* Deconstruct the tuple ... */
-						slot_getallattrs(slot);
+						kinds = CopyToBatchAssignKinds(cstate, tupDesc);
+						batch = VectorBatchCreate(CurrentMemoryContext,
+												  RelationGetDescr(rel),
+												  VECTOR_BATCH_DEFAULT_CAPACITY,
+												  true);
 
-						/* Format and send the data */
-						CopyOneRowTo(cstate, slot);
+						/* generic output functions may palloc per value */
+						oldrowctx = MemoryContextSwitchTo(cstate->rowcontext);
 
-						/*
-						* Increment the number of processed tuples, and report the
-						* progress.
-						*/
-						pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
-													 ++processed);
+						while (aocs_getnext_batch((AOCSScanDesc) scandesc, batch))
+						{
+							MemoryContextReset(cstate->rowcontext);
+
+							for (row = 0; row < batch->nrows; row++)
+							{
+								CHECK_FOR_INTERRUPTS();
+
+								/* Format and send the data */
+								CopyBatchOneRowTo(cstate, batch, row, kinds);
+
+								/*
+								* Increment the number of processed tuples, and report the
+								* progress.
+								*/
+								pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+															 ++processed);
 #ifdef FAULT_INJECTOR
-						if (processed == 2)
-							SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
+								if (processed == 2)
+									SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
 #endif
+							}
+						}
+
+						MemoryContextSwitchTo(oldrowctx);
+						VectorBatchDestroy(batch);
+						pfree(kinds);
 					}
-					ExecDropSingleTupleTableSlot(slot);
+					else
+					{
+						slot = table_slot_create(rel, NULL);
+
+						while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+						{
+							CHECK_FOR_INTERRUPTS();
+
+							/* Deconstruct the tuple ... */
+							slot_getallattrs(slot);
+
+							/* Format and send the data */
+							CopyOneRowTo(cstate, slot);
+
+							/*
+							* Increment the number of processed tuples, and report the
+							* progress.
+							*/
+							pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+														 ++processed);
+#ifdef FAULT_INJECTOR
+							if (processed == 2)
+								SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
+#endif
+						}
+						ExecDropSingleTupleTableSlot(slot);
+					}
 					table_endscan(scandesc);
 					pfree(proj);
 					pfree(cstate->out_functions);
