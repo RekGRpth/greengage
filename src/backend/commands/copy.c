@@ -3173,6 +3173,62 @@ CopyAttributeOutTextLen(CopyState cstate, const char *ptr, int len)
 }
 
 /*
+ * CSV output for a length-delimited value: quotes it iff the value contains
+ * the delimiter, the quote, \n or \r, equals the null marker, is exactly
+ * "\." in a single-column copy, or force_quote is set; embedded quote and
+ * escape characters are escaped exactly like CopyAttributeOutCSV.  Only the
+ * safe-encoding case is implemented; callers gate on
+ * cstate->encoding_embeds_ascii.
+ */
+static void
+CopyAttributeOutCSVLeng(CopyState cstate, const char *ptr, int len,
+						bool force_quote, bool single_attr)
+{
+	char		delimc = cstate->delim[0];
+	char		quotec = cstate->quote[0];
+	char		escapec = cstate->escape[0];
+	bool		use_quote = force_quote;
+	const char *p;
+	const char *end = ptr + len;
+
+	if (!use_quote)
+	{
+		for (p = ptr; p < end; p++)
+		{
+			if (*p == delimc || *p == quotec || *p == '\n' || *p == '\r')
+			{
+				use_quote = true;
+				break;
+			}
+		}
+	}
+
+	if (!use_quote && len == cstate->null_print_len &&
+		memcmp(ptr, cstate->null_print, len) == 0)
+		use_quote = true;
+
+	if (!use_quote && single_attr && len == 2 && memcmp(ptr, "\\.", 2) == 0)
+		use_quote = true;
+
+	if (!use_quote)
+	{
+		CopySendData(cstate, ptr, len);
+		return;
+	}
+
+	CopySendChar(cstate, quotec);
+	for (p = ptr; p < end; p++)
+	{
+		char		c = *p;
+
+		if (c == quotec || c == escapec)
+			CopySendChar(cstate, escapec);
+		CopySendChar(cstate, c);
+	}
+	CopySendChar(cstate, quotec);
+}
+
+/*
  * Returns true iff the COPY TO row loop can use the vectorized AOCS batch
  * reader with the fast per-column formatters.  Anything unsupported keeps
  * the plain row-by-row path; the output is byte-identical either way.
@@ -3184,9 +3240,8 @@ CopyToBatchGate(CopyState cstate, Relation rel)
 	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_OFF)
 		return false;
 
-	/* binary and CSV have their own per-value quoting/framing */
-	if (cstate->binary || cstate->csv_mode)
-		return false;
+	/* binary has its own framing; a missing quote option cannot be fast */
+	if (cstate->binary || cstate->quote == NULL)
 
 	/*
 	 * The text escaping kernel reads batch values in server encoding and
@@ -3344,6 +3399,8 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 				  const CopyBatchColumnKind *kinds)
 {
 	bool		need_delim = false;
+	bool		csv = cstate->csv_mode;
+	bool		single_attr = list_length(cstate->attnumlist) == 1;
 	ListCell   *cur;
 
 	foreach(cur, cstate->attnumlist)
@@ -3352,6 +3409,7 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 		int			col = attnum - 1;
 		Datum		value = VectorBatchGetDatum(batch, col, row);
 		bool		isnull = VectorBatchIsNull(batch, col, row);
+		bool		force_quote = csv && cstate->force_quote_flags[attnum - 1];
 
 		if (need_delim)
 			CopySendChar(cstate, cstate->delim[0]);
@@ -3370,7 +3428,11 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 					char		tmp[MAXINT8LEN + 1];
 					int			len = CopyItoa16(DatumGetInt16(value), tmp);
 
-					CopySendData(cstate, tmp, len);
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
 					break;
 				}
 			case COPY_BATCH_INT4:
@@ -3378,7 +3440,11 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 					char		tmp[MAXINT8LEN + 1];
 					int			len = CopyItoa32(DatumGetInt32(value), tmp);
 
-					CopySendData(cstate, tmp, len);
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
 					break;
 				}
 			case COPY_BATCH_INT8:
@@ -3386,21 +3452,34 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 					char		tmp[MAXINT8LEN + 1];
 					int			len = CopyItoa64(DatumGetInt64(value), tmp);
 
-					CopySendData(cstate, tmp, len);
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
 					break;
 				}
 			case COPY_BATCH_BOOL:
-				CopySendChar(cstate, DatumGetBool(value) ? 't' : 'f');
+				if (csv)
+				{
+					char		c = DatumGetBool(value) ? 't' : 'f';
+
+					CopyAttributeOutCSVLeng(cstate, &c, 1, force_quote,
+											single_attr);
+				}
+				else
+					CopySendChar(cstate, DatumGetBool(value) ? 't' : 'f');
 				break;
 			case COPY_BATCH_DATE:
 				{
 					DateADT		dt = DatumGetInt32(value);
 					char		tmp[MAXDATELEN + 1];
+					int			len;
 
 					if (DATE_NOT_FINITE(dt))
 					{
 						EncodeSpecialDate(dt, tmp);
-						CopySendData(cstate, tmp, strlen(tmp));
+						len = strlen(tmp);
 					}
 					else
 					{
@@ -3423,8 +3502,14 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 							memcpy(p, " BC", 3);	/* Don't copy NUL */
 							p += 3;
 						}
-						CopySendData(cstate, tmp, p - tmp);
+						len = p - tmp;
 					}
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
 					break;
 				}
 			case COPY_BATCH_NUMERIC:
@@ -3434,6 +3519,8 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 					int			dscale;
 					bool		decoded = numeric_decode_fast_datum(value, &mant,
 																	&scale, &dscale);
+					char		nbuf[MAXINT8LEN + 4];
+					int			len = 0;
 
 					/*
 					 * The decoded mantissa covers every decimal digit of the
@@ -3468,9 +3555,9 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 					if (decoded)
 					{
 						char		tmp[MAXINT8LEN + 1];
-						int			len = CopyItoa64(mant, tmp);
+						int			tlen = CopyItoa64(mant, tmp);
 						bool		negative = (tmp[0] == '-');
-						int			digits = len - (negative ? 1 : 0);
+						int			digits = tlen - (negative ? 1 : 0);
 						const char *digitsp = tmp + (negative ? 1 : 0);
 
 						/*
@@ -3482,24 +3569,31 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 						{
 							if (digits > dscale)
 							{
-								int			ipart = len - dscale;
+								int			ipart = tlen - dscale;
 
-								CopySendData(cstate, tmp, ipart);
-								CopySendChar(cstate, '.');
-								CopySendData(cstate, tmp + ipart, dscale);
+								memcpy(nbuf, tmp, ipart);
+								nbuf[ipart] = '.';
+								memcpy(nbuf + ipart + 1, tmp + ipart, dscale);
+								len = ipart + 1 + dscale;
 							}
 							else
 							{
+								len = 0;
 								if (negative)
-									CopySendChar(cstate, '-');
-								CopySendString(cstate, "0.");
+									nbuf[len++] = '-';
+								nbuf[len++] = '0';
+								nbuf[len++] = '.';
 								for (int z = digits; z < dscale; z++)
-									CopySendChar(cstate, '0');
-								CopySendData(cstate, digitsp, digits);
+									nbuf[len++] = '0';
+								memcpy(nbuf + len, digitsp, digits);
+								len += digits;
 							}
 						}
 						else
-							CopySendData(cstate, tmp, len);
+						{
+							memcpy(nbuf, tmp, tlen);
+							len = tlen;
+						}
 					}
 					else
 					{
@@ -3508,8 +3602,22 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 
 						string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
 													value);
+						if (csv)
+						{
+							CopyAttributeOutCSVLeng(cstate, string,
+													strlen(string), force_quote,
+													single_attr);
+							break;
+						}
 						CopySendData(cstate, string, strlen(string));
+						break;
 					}
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, nbuf, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, nbuf, len);
 					break;
 				}
 			case COPY_BATCH_TEXT:
@@ -3523,8 +3631,18 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 
 						string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
 													value);
-						CopyAttributeOutTextLen(cstate, string, strlen(string));
+						if (csv)
+							CopyAttributeOutCSVLeng(cstate, string,
+													strlen(string),
+													force_quote, single_attr);
+						else
+							CopyAttributeOutTextLen(cstate, string,
+													strlen(string));
 					}
+					else if (csv)
+						CopyAttributeOutCSVLeng(cstate, VARDATA_ANY(vp),
+												VARSIZE_ANY_EXHDR(vp),
+												force_quote, single_attr);
 					else
 						CopyAttributeOutTextLen(cstate, VARDATA_ANY(vp),
 												VARSIZE_ANY_EXHDR(vp));
@@ -3536,7 +3654,11 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 
 					string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
 												value);
-					CopyAttributeOutTextLen(cstate, string, strlen(string));
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, string, strlen(string),
+												force_quote, single_attr);
+					else
+						CopyAttributeOutTextLen(cstate, string, strlen(string));
 					break;
 				}
 		}
@@ -6033,8 +6155,15 @@ CopyFromFastGate(CopyState cstate)
 	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_OFF)
 		return false;
 
-	/* text format only; escape processing stays on the regular path */
-	if (cstate->csv_mode || cstate->binary || cstate->escape_off)
+	/* binary and escapeless external-table input stay on the regular path */
+	if (cstate->binary || cstate->escape_off)
+		return false;
+
+	/*
+	 * CSV FROM keeps the regular path for now: a +1 slice on quoted
+	 * fields (the closing quote included) is not root-caused yet.
+	 */
+	if (cstate->csv_mode)
 		return false;
 
 	/*
@@ -6129,8 +6258,15 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 	bool		last_had_delim = false;
 	bool		delim_off = cstate->delim_off;
 	char		delimc = cstate->delim[0];
+	bool		csv = cstate->csv_mode;
+	char		quotec = csv ? cstate->quote[0] : '\0';
+	char		escapec = csv ? cstate->escape[0] : '\0';
 	ListCell   *cur;
 	int			fieldno = 0;
+
+	/* same special-escape suppression as the per-character loop */
+	if (quotec == escapec)
+		escapec = '\0';
 
 	/* FILL MISSING FIELDS changes the missing-field rules */
 	if (cstate->fill_missing)
@@ -6138,10 +6274,12 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 
 	/*
 	 * Single fused scan over the processed fields: record each field's end
-	 * pointer in raw_fields and bail out if a backslash shows up (escapes
-	 * and the end-of-copy marker rules live in the regular path).  The
-	 * remainder after the QD's processing limit is not scanned here; it is
-	 * forwarded raw.
+	 * pointer in raw_fields and bail out on anything the regular path must
+	 * handle (text-mode escapes and the end-of-copy marker; CSV fields with
+	 * doubled quotes, escapes or mixed quoting).  The remainder after the
+	 * QD's processing limit is not scanned here; it is forwarded raw.
+	 * In CSV mode only two field forms are accepted: fully unquoted, or a
+	 * single clean "inner" pair.
 	 */
 	limit = (stop_processing_at_field >= 0) ?
 		stop_processing_at_field : attr_count;
@@ -6155,17 +6293,32 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 			cstate->raw_fields = repalloc(cstate->raw_fields,
 										  cstate->max_fields * sizeof(char *));
 		}
-		while (p < line_end)
+		if (csv && p < line_end && *p == quotec)
 		{
-			char		c = *p;
+			char	   *inner = p + 1;
+			char	   *q1 = memchr(inner, quotec, line_end - inner);
 
-			if (c == delimc && !delim_off)
-				break;
-			if (c == '\\')
+			if (q1 == NULL ||
+				memchr(inner, escapec, q1 - inner) != NULL)
 				return false;
-			p++;
+			if (q1 + 1 < line_end && (delim_off || q1[1] != delimc))
+				return false;
+			p = (q1 + 1 < line_end) ? q1 + 1 : line_end;
 		}
-		cstate->raw_fields[nfields] = p;	/* end of field, exclusive */
+		else
+		{
+			while (p < line_end)
+			{
+				char		c = *p;
+
+				if (c == delimc && !delim_off)
+					break;
+				if (csv ? c == quotec : c == '\\')
+					return false;
+				p++;
+			}
+		}
+		cstate->raw_fields[nfields] = p;	/* end of field value, exclusive */
 		nfields++;
 		last_had_delim = (p < line_end);
 		if (!last_had_delim)
@@ -6193,17 +6346,32 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 		Form_pg_attribute att = TupleDescAttr(cstate->rel->rd_att, m);
 		const char *sp;
 		int			flen;
+		bool		quoted = false;
 
 		if (fieldno == limit)
 			break;
 
 		sp = p;
 		p = cstate->raw_fields[fieldno];
-		flen = p - sp;
 		fieldno++;
 
-		/* raw match against the null marker, like CopyReadAttributesText */
-		if (flen == cstate->null_print_len &&
+		if (csv && sp < p && *sp == quotec)
+		{
+			/* pass 1 validated this field: a clean "inner" pair */
+			char	   *q1;
+
+			sp++;
+			q1 = memchr(sp, quotec, p - sp);
+			flen = q1 - sp;
+			quoted = true;
+		}
+		else
+			flen = p - sp;
+		if (p < line_end)
+			p++;			/* skip the delimiter */
+
+		/* raw match against the null marker, like the regular split */
+		if (!quoted && flen == cstate->null_print_len &&
 			(flen == 0 || memcmp(sp, cstate->null_print, flen) == 0))
 			continue;			/* values[m] == 0, nulls[m] == true */
 
@@ -6593,7 +6761,9 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 				 * loop below provides the exact error messages and
 				 * semantics.
 				 */
-				fldct = CopyReadAttributesText(cstate, stop_processing_at_field);
+				fldct = cstate->csv_mode ?
+					CopyReadAttributesCSV(cstate, stop_processing_at_field) :
+					CopyReadAttributesText(cstate, stop_processing_at_field);
 				field_strings = cstate->raw_fields;
 			}
 			else if (!NextCopyFromRawFieldsX(cstate, &field_strings, &fldct,
@@ -7601,6 +7771,81 @@ CopyReadLineText(CopyState cstate)
 					break;
 				}
 			}
+		}
+		else if (false && cstate->csv_mode && !cstate->encoding_embeds_ascii &&
+				 cstate->eol_type == EOL_NL &&
+				 cstate->quote != NULL &&
+				 raw_buf_ptr < copy_buf_len)
+		{
+			/*
+			 * CSV bulk scan: with the default escape (equal to the quote,
+			 * so no special escape processing) the line end can be located
+			 * with strcspn jumps over the specials {quote, newline, \},
+			 * toggling the quote state only on the quote hits.  A \ jumps
+			 * to the per-character loop (a possible \. marker line);
+			 * running out of chunk before the newline does too, and the
+			 * per-character loop replays the same bytes from the line
+			 * start.  A non-default escape keeps its own state machine
+			 * and is left to the per-character loop entirely.
+			 */
+			int			p = raw_buf_ptr;
+			bool		in_quote = false;
+			int			nl_pos = -1;
+			bool		bail = false;
+			long		embedded_nl = 0;
+			char		quotec = cstate->quote[0];
+			char		escapec = cstate->escape[0];
+			char		scan_set[4];
+
+			if (quotec == escapec || escapec == '\0')
+				escapec = '\0';
+			else
+				bail = true;	/* non-default escape: per-character loop */
+
+			if (!bail)
+			{
+				scan_set[0] = quotec;
+				scan_set[1] = '\n';
+				scan_set[2] = '\\';
+				scan_set[3] = '\0';
+
+				while (p < copy_buf_len)
+				{
+					int			skip = strcspn(copy_raw_buf + p, scan_set);
+
+					p += skip;
+					if (p >= copy_buf_len)
+						break;	/* no specials left in the chunk */
+					if (copy_raw_buf[p] == '\\')
+					{
+						bail = true;
+						break;
+					}
+					if (copy_raw_buf[p] == '\n')
+					{
+						if (!in_quote)
+						{
+							nl_pos = p;
+							break;
+						}
+						embedded_nl++;	/* newline inside a quoted field */
+						p++;
+						continue;
+					}
+					/* a quote: toggle the state and skip it */
+					p++;
+					in_quote = !in_quote;
+				}
+			}
+
+			if (!bail && nl_pos >= 0)
+			{
+				if (embedded_nl)
+					cstate->cur_lineno += embedded_nl;
+				raw_buf_ptr = nl_pos + 1;
+				break;
+			}
+			/* otherwise the per-character loop replays from the line start */
 		}
 
 		/* OK to fetch a character */

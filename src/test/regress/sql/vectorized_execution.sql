@@ -26,6 +26,7 @@ DROP TABLE IF EXISTS vector_copy_from;
 DROP TABLE IF EXISTS vector_copy_from2;
 DROP TABLE IF EXISTS vector_copy_sreh;
 DROP TABLE IF EXISTS vector_copy_sreh2;
+DROP TABLE IF EXISTS vector_copy_csv;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1175,6 +1176,32 @@ SET gp_vectorized_execution = off;
 COPY vector_copy_sreh TO STDOUT WITH (DELIMITER '|');
 COPY vector_copy_sreh2 TO STDOUT WITH (DELIMITER '|');
 RESET gp_vectorized_execution;
+-- ---- vectorized COPY TO, CSV format: quoting must be byte-identical ----
+CREATE TABLE vector_copy_csv (i4 int4, d date, t text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_csv VALUES
+(1, '2021-02-28', 'plain', 'dk');
+INSERT INTO vector_copy_csv VALUES
+(2, '2020-02-29', 'has,comma', 'dk');
+INSERT INTO vector_copy_csv VALUES
+(3, '1999-12-31', E'has"quote', 'dk');
+INSERT INTO vector_copy_csv VALUES
+(4, '2021-01-01', E'line1\nline2', 'dk');
+INSERT INTO vector_copy_csv VALUES
+(5, NULL, '', 'dk');
+INSERT INTO vector_copy_csv VALUES
+(6, 'infinity', 'кириллица, да', 'dk');
+INSERT INTO vector_copy_csv VALUES
+(7, '1999-12-31', '\.', 'dk');
+SET gp_vectorized_execution = off;
+\copy vector_copy_csv TO STDOUT WITH (FORMAT csv)
+SET gp_vectorized_execution = force;
+\copy vector_copy_csv TO STDOUT WITH (FORMAT csv)
+SET gp_vectorized_execution = off;
+\copy vector_copy_csv TO STDOUT WITH (FORMAT csv, FORCE_QUOTE t)
+SET gp_vectorized_execution = force;
+\copy vector_copy_csv TO STDOUT WITH (FORMAT csv, FORCE_QUOTE t)
+RESET gp_vectorized_execution;
 RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
@@ -1205,3 +1232,4 @@ DROP TABLE vector_copy_from;
 DROP TABLE vector_copy_from2;
 DROP TABLE vector_copy_sreh;
 DROP TABLE vector_copy_sreh2;
+DROP TABLE vector_copy_csv;
