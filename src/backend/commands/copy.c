@@ -3267,10 +3267,77 @@ CopyToBatchAssignKinds(CopyState cstate, TupleDesc tupDesc)
 }
 
 /*
+ * Flush the accumulated batch buffer of CopyBatchOneRowTo rows to the
+ * destination.  Only COPY_FILE and COPY_NEW_FE defer their per-row sends;
+ * for those destinations this replaces the per-row CopySendEndOfRow with
+ * one send per batch (the bytes are identical, only the chunking differs).
+ */
+static void
+CopyFlushBatch(CopyState cstate)
+{
+	StringInfo	fe_msgbuf = cstate->fe_msgbuf;
+
+	if (fe_msgbuf->len == 0)
+		return;
+
+	switch (cstate->copy_dest)
+	{
+		case COPY_FILE:
+			if (fwrite(fe_msgbuf->data, fe_msgbuf->len, 1,
+					   cstate->copy_file) != 1 ||
+				ferror(cstate->copy_file))
+			{
+				if (cstate->is_program)
+				{
+					if (errno == EPIPE)
+					{
+						/*
+						 * The pipe will be closed automatically on error at
+						 * the end of transaction, but we might get a better
+						 * error message from the subprocess' exit code than
+						 * just "Broken Pipe"
+						 */
+						close_program_pipes(cstate, true);
+
+						/*
+						 * If close_program_pipes() didn't throw an error,
+						 * the program terminated normally, but closed the
+						 * pipe first. Restore errno, and throw an error.
+						 */
+						errno = EPIPE;
+					}
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not write to COPY program: %m")));
+				}
+				else
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not write to COPY file: %m")));
+			}
+			break;
+		case COPY_NEW_FE:
+			(void) pq_putmessage('d', fe_msgbuf->data, fe_msgbuf->len);
+			break;
+		default:
+			/* nothing deferred for other destinations */
+			return;
+	}
+
+	/* Update the progress */
+	cstate->bytes_processed += fe_msgbuf->len;
+	pgstat_progress_update_param(PROGRESS_COPY_BYTES_PROCESSED,
+								 cstate->bytes_processed);
+
+	resetStringInfo(fe_msgbuf);
+}
+
+/*
  * Emit one row of a VectorBatch during CopyTo.  Must produce byte-identical
- * output to CopyOneRowTo; the send/flush structure (delimiters, newlines,
- * per-row progress) is intentionally the same, only the value access and the
- * per-column formatting differ.
+ * output to CopyOneRowTo; only the value access and the per-column
+ * formatting differ.  For COPY_FILE and COPY_NEW_FE the row is only
+ * accumulated (the newline included) and the caller flushes once per batch
+ * with CopyFlushBatch; other destinations send per row as before.
  */
 static void
 CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
@@ -3476,15 +3543,15 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 	}
 
 	/*
-	 * Finish off the row: write it to the destination, and update the count.
-	 * However, if we're in the context of a writable external table, we let
-	 * the caller do it - send the data to its local external source (see
-	 * external_insert() ).
+	 * Terminate the row with a newline.  For COPY_FILE and COPY_NEW_FE the
+	 * accumulated buffer is flushed once per batch by CopyFlushBatch;
+	 * other destinations send per row as before (a writable external table
+	 * lets the caller do it, see external_insert()).
 	 */
-	if (cstate->copy_dest != COPY_CALLBACK)
-	{
+	if (cstate->copy_dest == COPY_FILE || cstate->copy_dest == COPY_NEW_FE)
+		CopySendChar(cstate, '\n');
+	else if (cstate->copy_dest != COPY_CALLBACK)
 		CopySendEndOfRow(cstate);
-	}
 }
 
 /*
@@ -3729,6 +3796,9 @@ CopyTo(CopyState cstate)
 									SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
 #endif
 							}
+
+							/* one send per batch for file and FE destinations */
+							CopyFlushBatch(cstate);
 						}
 
 						MemoryContextSwitchTo(oldrowctx);
@@ -5967,10 +6037,12 @@ CopyFromFastGate(CopyState cstate)
 	if (cstate->csv_mode || cstate->binary || cstate->escape_off)
 		return false;
 
-	/* single-row error handling needs its own per-line machinery */
-	if (cstate->cdbsreh)
-		return false;
-
+	/*
+	 * Single-row error handling works with the fast parse: clean rows are
+	 * never rejected by the kernels, and any doubtful line falls back to
+	 * the regular path, whose error is caught by the SREH machinery as
+	 * before.
+	 */
 	if (cstate->convert_select_flags)
 		return false;
 

@@ -24,6 +24,8 @@ DROP TABLE IF EXISTS vector_copy_test;
 DROP TABLE IF EXISTS vector_copy_heap;
 DROP TABLE IF EXISTS vector_copy_from;
 DROP TABLE IF EXISTS vector_copy_from2;
+DROP TABLE IF EXISTS vector_copy_sreh;
+DROP TABLE IF EXISTS vector_copy_sreh2;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1149,6 +1151,30 @@ SET gp_vectorized_execution = off;
 COPY vector_copy_from TO STDOUT WITH (DELIMITER '|');
 COPY vector_copy_from2 TO STDOUT WITH (DELIMITER '|');
 RESET gp_vectorized_execution;
+-- ---- vectorized COPY FROM with SEGMENT REJECT LIMIT ----
+CREATE TABLE vector_copy_sreh (i4 int4, t text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+CREATE TABLE vector_copy_sreh2 (LIKE vector_copy_sreh) DISTRIBUTED BY (v_dist);
+SET gp_vectorized_execution = off;
+COPY vector_copy_sreh FROM STDIN WITH (DELIMITER '|') SEGMENT REJECT LIMIT 100 ROWS;
+1|good1|dist
+abc|bad-int|dist
+2|good2|dist
+99999999999|overflow|dist
+3|good3|dist
+\.
+SET gp_vectorized_execution = force;
+COPY vector_copy_sreh2 FROM STDIN WITH (DELIMITER '|') SEGMENT REJECT LIMIT 100 ROWS;
+1|good1|dist
+abc|bad-int|dist
+2|good2|dist
+99999999999|overflow|dist
+3|good3|dist
+\.
+SET gp_vectorized_execution = off;
+COPY vector_copy_sreh TO STDOUT WITH (DELIMITER '|');
+COPY vector_copy_sreh2 TO STDOUT WITH (DELIMITER '|');
+RESET gp_vectorized_execution;
 RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
@@ -1177,3 +1203,5 @@ DROP TABLE vector_copy_test;
 DROP TABLE vector_copy_heap;
 DROP TABLE vector_copy_from;
 DROP TABLE vector_copy_from2;
+DROP TABLE vector_copy_sreh;
+DROP TABLE vector_copy_sreh2;
