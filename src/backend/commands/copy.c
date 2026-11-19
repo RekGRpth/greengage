@@ -6166,13 +6166,6 @@ CopyFromFastGate(CopyState cstate)
 		return false;
 
 	/*
-	 * CSV FROM keeps the regular path for now: a +1 slice on quoted
-	 * fields (the closing quote included) is not root-caused yet.
-	 */
-	if (cstate->csv_mode)
-		return false;
-
-	/*
 	 * Single-row error handling keeps the regular path: after a rejected
 	 * row the SREH continue leaves per-line state that the fast parse's
 	 * field walk does not fully restore, so subsequent rows can lose their
@@ -6190,14 +6183,9 @@ CopyFromFastGate(CopyState cstate)
 		return false;
 
 	/*
-	 * The fast parse covers utility/direct mode and the QD routing prefix.
-	 * COPY_DISPATCH is excluded for now: a NULL field in the QD's prefix
-	 * makes the pass-2 loop stop early and the dispatcher forwards the
-	 * residual line from a shifted offset, corrupting subsequent rows.
+	 * The fast parse covers utility/direct mode, the QD routing prefix
+	 * (whose residual fields the QE re-parses with the same kernels).
 	 */
-	if (cstate->dispatch_mode == COPY_DISPATCH)
-		return false;
-
 	return true;
 }
 
@@ -6487,14 +6475,15 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 					break;
 				}
 		}
-
-		/* the delimiter between fields is not part of the value */
-		if (p < line_end)
-			p++;
 	}
 
-	/* Bookkeeping identical to CopyReadAttributesText */
-	if (stop_processing_at_field >= 0 && fieldno == limit && last_had_delim)
+	/*
+	 * Bookkeeping identical to CopyReadAttributesText: when the QD stops at
+	 * its processing limit (including zero fields, i.e. replicated tables
+	 * forwarding the whole line), the residual for the QE starts at the
+	 * current position, flagged as after-a-delimiter.
+	 */
+	if (stop_processing_at_field >= 0)
 	{
 		cstate->stopped_processing_at_delim = true;
 		cstate->line_buf.cursor = p - cstate->line_buf.data;
