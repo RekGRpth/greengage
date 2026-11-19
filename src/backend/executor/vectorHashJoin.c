@@ -517,14 +517,15 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 					break;
 				}
 			}
-			if (matched && hj->js.ps.qual != NULL)
+			/*
+			 * The hashed key equality only locates candidates.  Like the
+			 * standard probe, the joinqual decides the match; the other qual
+			 * (ps.qual) only gates the emission and never un-matches a row.
+			 * The outer slot is filled from the batch without copies: it
+			 * only lives for the evaluations below.
+			 */
+			if (matched && (hj->js.joinqual != NULL || hj->js.ps.qual != NULL))
 			{
-				/*
-				 * Residual qual: evaluate it against the outer row and the
-				 * stored tuple, exactly like the standard probe.  The outer
-				 * slot is filled from the batch without copies: it only
-				 * lives for the evaluation below.
-				 */
 				TupleTableSlot *oslot = hj->hj_OuterTupleSlot;
 
 				ExecClearTuple(oslot);
@@ -542,8 +543,22 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				ResetExprContext(econtext);
 				econtext->ecxt_outertuple = oslot;
 				econtext->ecxt_innertuple = hslot;
-				if (!ExecQual(hj->js.ps.qual, econtext))
+				if (hj->js.joinqual != NULL &&
+					!ExecQual(hj->js.joinqual, econtext))
 					matched = false;
+				else if (hj->js.ps.qual != NULL &&
+						 !ExecQual(hj->js.ps.qual, econtext))
+				{
+					/*
+					 * Matched but filtered from the output.  A single-match
+					 * (SEMI) row is done; an INNER/LEFT candidate keeps the
+					 * bucket walk going, like the standard probe.
+					 */
+					state->row_matched = true;
+					if (state->semi_join)
+						break;
+					continue;
+				}
 			}
 			if (!matched)
 				continue;

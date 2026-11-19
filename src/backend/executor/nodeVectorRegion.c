@@ -728,16 +728,35 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 		}
 		if (state->hj != NULL && !state->nested_batches)
 		{
-			state->vhj = VectorHashJoinCreate(estate->es_query_cxt, state->hj);
-			if (state->vhj == NULL)
-				elog(ERROR, "vector region could not initialize its hash join");
 			/*
-			 * The build side may itself be a join chain (e.g. a NOT IN
-			 * anti-semi leaf); feed the hash build from its output batches
-			 * when it batch-probes.  On any failure the build stays with
-			 * the row-wise MultiExecHash pull.
+			 * An HJ-root region can drive its join from batches like an
+			 * aggregate-over-join region does: the probe feed comes from the
+			 * chain machinery and the output rows are the join batches
+			 * themselves.  Fall back to the per-row driver when the chain
+			 * is not batchable.
 			 */
-			VectorRegionInitBuildChain(state);
+			if (VectorRegionInitJoinChain(state))
+			{
+				state->output_ncols = state->join_batch->ncols;
+				state->output_attnos = MemoryContextAlloc(estate->es_query_cxt,
+													sizeof(int) * state->output_ncols);
+				for (col = 0; col < state->output_ncols; col++)
+					state->output_attnos[col] = col;
+				VectorRegionInitBuildChain(state);
+			}
+			else
+			{
+				state->vhj = VectorHashJoinCreate(estate->es_query_cxt, state->hj);
+				if (state->vhj == NULL)
+					elog(ERROR, "vector region could not initialize its hash join");
+				/*
+				 * The build side may itself be a join chain (e.g. a NOT IN
+				 * anti-semi leaf); feed the hash build from its output batches
+				 * when it batch-probes.  On any failure the build stays with
+				 * the row-wise MultiExecHash pull.
+				 */
+				VectorRegionInitBuildChain(state);
+			}
 		}
 	}
 }
@@ -1568,6 +1587,9 @@ VectorRegionExec(CustomScanState *node)
 
 	for (;;)
 	{
+		VectorBatch *out_batch;
+		int		   *cursor;
+
 		ExecClearTuple(slot);
 		if (state->sort != NULL)
 		{
@@ -1575,25 +1597,36 @@ VectorRegionExec(CustomScanState *node)
 			{
 				VectorRegionSortInput(state, state->output_attnos);
 				if (!VectorSortNextBatch(state->sort, state->batch,
-									 state->output_attnos))
+										 state->output_attnos))
 					return slot;
 				state->position = 0;
 			}
+			out_batch = state->batch;
+			cursor = &state->position;
 		}
-		else if (!VectorRegionNextBatch(state))
-			return slot;
+		else
+		{
+			if (!VectorRegionNextBatch(state))
+				return slot;
+			/*
+			 * A batch-driven HJ-root region outputs the join batches
+			 * themselves; everything else outputs the scan/adapter batch.
+			 */
+			out_batch = state->nested_batches ? state->join_batch : state->batch;
+			cursor = state->nested_batches ? &state->join_position : &state->position;
+		}
 
 		/* evaluate projection steps once per batch, after the qual filter */
 		if (state->proj != NULL)
 		{
 			for (col = 0; col < state->output_ncols; col++)
 				if (state->proj[col] != NULL)
-					VectorExprEval(state->batch, state->proj[col]);
+					VectorExprEval(out_batch, state->proj[col]);
 		}
 
-		while (state->position < state->batch->nselected)
+		while (*cursor < out_batch->nselected)
 		{
-			row = VectorBatchSelectedRow(state->batch, state->position++);
+			row = VectorBatchSelectedRow(out_batch, (*cursor)++);
 			if (state->limit != NULL)
 			{
 				VectorLimitResult action = VectorLimitNext(state->limit);
@@ -1609,8 +1642,8 @@ VectorRegionExec(CustomScanState *node)
 
 				if (attno >= 0)
 				{
-					slot->tts_values[col] = VectorBatchGetDatum(state->batch, attno, row);
-					slot->tts_isnull[col] = VectorBatchIsNull(state->batch, attno, row);
+					slot->tts_values[col] = VectorBatchGetDatum(out_batch, attno, row);
+					slot->tts_isnull[col] = VectorBatchIsNull(out_batch, attno, row);
 				}
 				else
 				{
