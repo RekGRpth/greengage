@@ -6166,12 +6166,12 @@ CopyFromFastGate(CopyState cstate)
 		return false;
 
 	/*
-	 * Single-row error handling keeps the regular path: after a rejected
-	 * row the SREH continue leaves per-line state that the fast parse's
-	 * field walk does not fully restore, so subsequent rows can lose their
-	 * first character in text columns.
+	 * Clean rows are never rejected by the fast kernels: anything doubtful
+	 * falls back to the regular per-field path, whose error is caught by
+	 * the SREH machinery as before.  Ignored input columns keep the regular
+	 * path.
 	 */
-	if (cstate->cdbsreh || cstate->convert_select_flags)
+	if (cstate->convert_select_flags)
 		return false;
 
 	/*
