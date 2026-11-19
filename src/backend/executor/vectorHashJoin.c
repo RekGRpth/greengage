@@ -72,6 +72,9 @@ struct VectorHashJoinState
 	bool		fill_outer;		/* LEFT: emit null-filled unmatched rows */
 	bool		fill_inner;		/* RIGHT: mark matches for the finish phase */
 	bool		row_matched;	/* current probe row already emitted a match */
+	bool		semi_join;		/* SEMI: emit the outer row on the first match */
+	bool		anti_join;		/* ANTI/LASJ: a matched row is never emitted */
+	bool		notin_join;		/* LASJ NOTIN: null probe keys never match */
 	bool		hash_direct;	/* single key: hash straight from the batch */
 	Datum		probe_key;		/* current probe key (survives a resume) */
 	/*
@@ -109,6 +112,7 @@ VectorHashJoinPlanIsSupported(HashJoin *join)
 		case JOIN_FULL:
 		case JOIN_SEMI:
 		case JOIN_ANTI:
+		case JOIN_LASJ_NOTIN:
 			return true;
 		default:
 			return false;
@@ -237,13 +241,18 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 	/*
 	 * INNER is the plain case.  LEFT fills unmatched probe rows with null
 	 * inner columns; RIGHT marks matched stored tuples and lets the normal
-	 * finish phase emit the unmatched inner rows.  Anything else stays on
-	 * the per-row path.
+	 * finish phase emit the unmatched inner rows.  SEMI emits the outer row
+	 * on the first match; ANTI and LASJ NOTIN never emit a matched row and
+	 * reuse the LEFT-style fill for unmatched ones.  Residual quals are
+	 * evaluated per key-equal candidate.  Anything else stays on the per-row
+	 * path.
 	 */
-	if ((join->join.jointype != JOIN_INNER &&
-		 join->join.jointype != JOIN_LEFT &&
-		 join->join.jointype != JOIN_RIGHT) ||
-		join->join.plan.qual != NIL)
+	if (join->join.jointype != JOIN_INNER &&
+		join->join.jointype != JOIN_LEFT &&
+		join->join.jointype != JOIN_RIGHT &&
+		join->join.jointype != JOIN_SEMI &&
+		join->join.jointype != JOIN_ANTI &&
+		join->join.jointype != JOIN_LASJ_NOTIN)
 		return false;
 
 	foreach(lc, join->hashclauses)
@@ -282,8 +291,14 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 	}
 	if (nkeys == 0)
 		return false;
-	state->fill_outer = (join->join.jointype == JOIN_LEFT);
+	state->fill_outer = (join->join.jointype == JOIN_LEFT ||
+						 join->join.jointype == JOIN_ANTI ||
+						 join->join.jointype == JOIN_LASJ_NOTIN);
 	state->fill_inner = (join->join.jointype == JOIN_RIGHT);
+	state->semi_join = (join->join.jointype == JOIN_SEMI);
+	state->anti_join = (join->join.jointype == JOIN_ANTI ||
+						join->join.jointype == JOIN_LASJ_NOTIN);
+	state->notin_join = (join->join.jointype == JOIN_LASJ_NOTIN);
 
 	foreach(lc, join->join.plan.targetlist)
 	{
@@ -378,6 +393,16 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				{
 					if (hashtable->hashStrict[0] && !hashtable->keepNulls)
 						continue;	/* strict key: never matches */
+					if (state->notin_join)
+					{
+						/*
+						 * OPT-3325: a null probe key drops the row when the
+						 * table is not empty; an empty table falls through
+						 * to the unmatched-row fill below.
+						 */
+						state->row_matched = (hashtable->totalTuples > 0);
+						continue;
+					}
 					hashvalue = 0;	/* null hashes as zero, like the interp */
 				}
 				else
@@ -400,6 +425,26 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				}
 				state->hash_slot->tts_nvalid = state->hash_slot_nvalid;
 				ExecStoreVirtualTuple(state->hash_slot);
+
+				if (state->notin_join)
+				{
+					/* OPT-3325, same drop rule as the direct path */
+					bool		keynull = false;
+
+					for (k = 0; k < state->nkeys; k++)
+					{
+						if (state->hash_slot->tts_isnull[state->outer_key_pos[k] - 1])
+						{
+							keynull = true;
+							break;
+						}
+					}
+					if (keynull)
+					{
+						state->row_matched = (hashtable->totalTuples > 0);
+						continue;
+					}
+				}
 
 				econtext->ecxt_outertuple = state->hash_slot;
 				if (!ExecHashGetHashValue(hashNode, hashtable, econtext,
@@ -472,12 +517,43 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 					break;
 				}
 			}
+			if (matched && hj->js.ps.qual != NULL)
+			{
+				/*
+				 * Residual qual: evaluate it against the outer row and the
+				 * stored tuple, exactly like the standard probe.  The outer
+				 * slot is filled from the batch without copies: it only
+				 * lives for the evaluation below.
+				 */
+				TupleTableSlot *oslot = hj->hj_OuterTupleSlot;
+
+				ExecClearTuple(oslot);
+				for (k = 0; k < state->outer_ncols; k++)
+				{
+					AttrNumber	attno = state->outer_attnos[k];
+
+					oslot->tts_values[k] = VectorBatchGetDatum(batch, attno - 1, row);
+					oslot->tts_isnull[k] = VectorBatchIsNull(batch, attno - 1, row);
+				}
+				oslot->tts_nvalid = state->outer_ncols;
+				ExecStoreVirtualTuple(oslot);
+				slot_getallattrs(hslot);
+
+				ResetExprContext(econtext);
+				econtext->ecxt_outertuple = oslot;
+				econtext->ecxt_innertuple = hslot;
+				if (!ExecQual(hj->js.ps.qual, econtext))
+					matched = false;
+			}
 			if (!matched)
 				continue;
 			/* the finish phase emits unmatched stored tuples only */
 			if (state->fill_inner)
 				HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(cursor));
 
+			state->row_matched = true;
+			if (state->anti_join)
+				break;		/* ANTI/LASJ: a matched row is never emitted */
 			for (c = 0; c < state->out_ncols; c++)
 			{
 				Datum		value;
@@ -498,7 +574,8 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				VectorBatchSetValue(out, c, nrows, value, isnull);
 			}
 			nrows++;
-			state->row_matched = true;
+			if (state->semi_join)
+				break;		/* SEMI: only the first match is emitted */
 		}
 
 		if (resume_stopped)
@@ -600,6 +677,17 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 						VectorHashJoinBuild(state);
 						state->built = true;
 						hashtable = state->hj->hj_HashTable;
+					}
+					/*
+					 * LASJ NOTIN with a null inner key: the whole join result
+					 * is empty (the build stopped at the null), like the
+					 * standard executor.
+					 */
+					if (state->notin_join &&
+						castNode(HashState, innerPlanState(state->hj))->hs_hashkeys_null)
+					{
+						state->done = true;
+						break;
 					}
 					if (hashtable->nbatch != 1 ||
 						hashtable->parallel_state != NULL ||
@@ -840,6 +928,17 @@ VectorHashJoinBuild(VectorHashJoinState *state)
 									PlanStateOperatorMemKB((PlanState *) hashNode));
 	node->hj_HashTable = hashtable;
 	hashNode->hashtable = hashtable;
+
+	/* CDB: the spill-reload path expects the stats workarea under EXPLAIN */
+	if ((node->js.ps.state->es_instrument & INSTRUMENT_CDB) != 0)
+		ExecHashTableExplainInit(hashNode, node, hashtable);
+
+	/*
+	 * LASJ NOTIN: stop the build at the first null inner key; the join's
+	 * result is empty in that case (same rule as the standard executor).
+	 */
+	hashNode->hs_quit_if_hashkeys_null =
+		(node->js.jointype == JOIN_LASJ_NOTIN);
 
 	SIMPLE_FAULT_INJECTOR("multi_exec_hash_large_vmem");
 

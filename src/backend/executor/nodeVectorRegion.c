@@ -97,6 +97,13 @@ typedef struct VectorRegionState
 	VectorHashJoinState *vhj;
 	VectorHashJoinState *build_vhj;
 	VectorBuildScanState *build_scan;
+	/*
+	 * Row source feeding a build chain whose leaf is neither a scan nor a
+	 * join: a Motion or a nested region's row output, converted to batches
+	 * by the row adapter (e.g. the NOT IN anti-semi leaf of q16-like
+	 * shapes).
+	 */
+	struct VectorRowLeafState *build_row_leaf;
 	VectorBatch *batch;
 	VectorBatch *join_batch;
 	bool		nested_batches;
@@ -724,6 +731,13 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			state->vhj = VectorHashJoinCreate(estate->es_query_cxt, state->hj);
 			if (state->vhj == NULL)
 				elog(ERROR, "vector region could not initialize its hash join");
+			/*
+			 * The build side may itself be a join chain (e.g. a NOT IN
+			 * anti-semi leaf); feed the hash build from its output batches
+			 * when it batch-probes.  On any failure the build stays with
+			 * the row-wise MultiExecHash pull.
+			 */
+			VectorRegionInitBuildChain(state);
 		}
 	}
 }
@@ -1174,6 +1188,20 @@ VectorRegionCreateBuildChain(VectorRegionState *region, HashJoinState *hj)
 		source = VectorBuildLeafSource;
 		source_arg = region->build_scan;
 	}
+	else if (IsA(outer, MotionState) || IsA(outer, CustomScanState))
+	{
+		region->build_row_leaf = MemoryContextAllocZero(
+			region->css.ss.ps.state->es_query_cxt,
+			sizeof(VectorRowLeafState));
+		region->build_row_leaf->input = outer;
+		region->build_row_leaf->batch = VectorBatchCreate(
+			region->css.ss.ps.state->es_query_cxt,
+			ExecGetResultType(outer),
+			VECTOR_BATCH_DEFAULT_CAPACITY,
+			false);
+		source = VectorRowLeafSource;
+		source_arg = region->build_row_leaf;
+	}
 	else
 		return NULL;
 	vhj = VectorHashJoinCreateBatch(region->css.ss.ps.state->es_query_cxt,
@@ -1183,6 +1211,8 @@ VectorRegionCreateBuildChain(VectorRegionState *region, HashJoinState *hj)
 		VectorHashJoinDestroy(outer_join);
 		VectorBuildScanDestroy(region->build_scan);
 		region->build_scan = NULL;
+		VectorRowLeafDestroy(region->build_row_leaf);
+		region->build_row_leaf = NULL;
 	}
 	return vhj;
 }
@@ -1205,6 +1235,8 @@ VectorRegionInitBuildChain(VectorRegionState *state)
 		/* the leaf may have been created before a deeper failure */
 		VectorBuildScanDestroy(state->build_scan);
 		state->build_scan = NULL;
+		VectorRowLeafDestroy(state->build_row_leaf);
+		state->build_row_leaf = NULL;
 		return;
 	}
 	VectorHashJoinSetBuildSource(state->vhj,
@@ -1612,6 +1644,7 @@ VectorRegionEnd(CustomScanState *node)
 		VectorHashJoinDestroy(state->build_vhj);
 	VectorBuildScanDestroy(state->build_scan);
 	VectorRowLeafDestroy(state->row_leaf);
+	VectorRowLeafDestroy(state->build_row_leaf);
 	if (state->proj != NULL)
 	{
 		int			col;

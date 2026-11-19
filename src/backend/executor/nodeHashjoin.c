@@ -2155,6 +2155,16 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 	uint32		hashvalue = 0;
 	bool		have_hash = false;
 
+	/*
+	 * LASJ NOTIN with a null inner key: the join result is empty (the
+	 * standard executor makes the same call right after the build).
+	 */
+	if (node->js.jointype == JOIN_LASJ_NOTIN && hashNode->hs_hashkeys_null)
+	{
+		node->hj_JoinState = HJ_NEED_NEW_OUTER;
+		return NULL;
+	}
+
 	if (hashtable->curbatch == -1 && !hashtable->first_pass)
 	{
 		hashtable->curbatch = 0;
@@ -2166,7 +2176,8 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 	{
 		int			batchno;
 		bool		hashkeys_null = false;
-		bool		keep_nulls = HJ_FILL_OUTER(node) || node->hj_nonequijoin;
+		bool		keep_nulls = HJ_FILL_OUTER(node) || node->hj_nonequijoin ||
+			node->js.jointype == JOIN_LASJ_NOTIN;
 
 		econtext->ecxt_outertuple = outer;
 		if (!have_hash &&
@@ -2174,6 +2185,17 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 								  node->hj_OuterHashKeys, true, keep_nulls,
 								  &hashvalue, &hashkeys_null))
 			return NULL;
+
+		/*
+		 * OPT-3325: a null probe key drops the row when the table is not
+		 * empty; an empty table falls through to the unmatched-row fill.
+		 */
+		if (hashkeys_null && node->js.jointype == JOIN_LASJ_NOTIN &&
+			!node->hj_InnerEmpty)
+		{
+			node->hj_JoinState = HJ_NEED_NEW_OUTER;
+			return NULL;
+		}
 
 		node->hj_OuterNotEmpty = true;
 		node->hj_MatchedOuter = false;
@@ -2214,7 +2236,8 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 				{
 					node->hj_MatchedOuter = true;
 					HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(node->hj_CurTuple));
-					if (node->js.jointype == JOIN_ANTI)
+					if (node->js.jointype == JOIN_ANTI ||
+						node->js.jointype == JOIN_LASJ_NOTIN)
 					{
 						node->hj_JoinState = HJ_NEED_NEW_OUTER;
 						continue;
