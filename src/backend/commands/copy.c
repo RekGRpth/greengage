@@ -6221,7 +6221,13 @@ CopyFromFastAssignKinds(CopyState cstate, TupleDesc tupDesc)
 				kind = COPY_FAST_DATE;
 				break;
 			case NUMERICOID:
-				kind = COPY_FAST_NUMERIC;
+				/*
+				 * The kernel parses plain integer/decimal text but does
+				 * not apply atttypmod (rounding/saturation), which
+				 * numeric_in performs; typmod'd columns keep the regular
+				 * input function.
+				 */
+				kind = attr->atttypmod >= 0 ? COPY_FAST_FMGR : COPY_FAST_NUMERIC;
 				break;
 			case TEXTOID:
 				kind = COPY_FAST_TEXT;
@@ -7738,6 +7744,7 @@ CopyReadLineText(CopyState cstate)
 	bool		first_char_in_line = true;
 	bool		in_quote = false,
 				last_was_esc = false;
+	bool		csv_bulk_at_line_start;
 	char		quotec = '\0';
 	char		escapec = '\0';
 
@@ -7776,6 +7783,15 @@ CopyReadLineText(CopyState cstate)
 	copy_raw_buf = cstate->raw_buf;
 	raw_buf_ptr = cstate->raw_buf_index;
 	copy_buf_len = cstate->raw_buf_len;
+
+	/*
+	 * The CSV bulk scan below derives the line end from the quote state,
+	 * so it is only valid at the start of a line; after the per-character
+	 * loop has consumed any characters the quote state is no longer
+	 * derivable from the remaining bytes.  The text bulk scan does not
+	 * need this: a newline always ends a line in text mode.
+	 */
+	csv_bulk_at_line_start = true;
 
 	for (;;)
 	{
@@ -7857,7 +7873,8 @@ CopyReadLineText(CopyState cstate)
 				}
 			}
 		}
-		else if (false && cstate->csv_mode && !cstate->encoding_embeds_ascii &&
+		else if (csv_bulk_at_line_start &&
+				 cstate->csv_mode && !cstate->encoding_embeds_ascii &&
 				 cstate->eol_type == EOL_NL &&
 				 cstate->quote != NULL &&
 				 raw_buf_ptr < copy_buf_len)
@@ -7934,6 +7951,7 @@ CopyReadLineText(CopyState cstate)
 		}
 
 		/* OK to fetch a character */
+		csv_bulk_at_line_start = false;
 		prev_raw_ptr = raw_buf_ptr;
 		c = copy_raw_buf[raw_buf_ptr++];
 
