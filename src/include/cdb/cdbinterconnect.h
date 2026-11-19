@@ -385,6 +385,17 @@ typedef struct ChunkSorterEntry
 	bool		end_of_stream;
 }	ChunkSorterEntry;
 
+/*
+ * A decoded vector-executor batch waiting on an unsorted motion
+ * receiver.  Populated only from TC_BATCH_* chunk sequences.
+ */
+struct VectorBatch;
+typedef struct ReadyBatch
+{
+	struct VectorBatch *batch;
+	struct ReadyBatch *next;
+} ReadyBatch;
+
 /* This is the entry data-structure for a motion node. */
 typedef struct MotionNodeEntry
 {
@@ -419,6 +430,13 @@ typedef struct MotionNodeEntry
 	 * have not yet been consumed.  If preserve_order is true, this is NULL.
 	 */
 	htup_fifo       ready_tuples;
+
+	/*
+	 * Batches decoded from TC_BATCH_* chunk sequences on an unsorted
+	 * receiver, consumed before the tuple FIFO by a vectorized consumer.
+	 */
+	ReadyBatch	   *ready_batch_head;
+	ReadyBatch	   *ready_batch_tail;
 
 	/*
 	 * Variable that records the total number of senders to this motion node.

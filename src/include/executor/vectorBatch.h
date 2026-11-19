@@ -14,6 +14,7 @@
 #define VECTORBATCH_H
 
 #include "access/tupdesc.h"
+#include "lib/stringinfo.h"
 #include "catalog/pg_type_d.h"
 #include "utils/memutils.h"
 #include "utils/float.h"
@@ -62,6 +63,18 @@ typedef struct VectorBatch
 extern VectorBatch *VectorBatchCreate(MemoryContext parent,
 									  TupleDesc tupdesc, int capacity,
 									  bool packed_i32);
+/*
+ * Batch interconnect codec: a columnar payload riding one
+ * START..MID*..END chunk sequence of a motion stream.  Encode takes an
+ * optional row-index list (for hash-redistribute partitioning); decode
+ * builds a plain (non-packed) batch owning its varlena memory in the
+ * batch's varlena context.
+ */
+extern void VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
+								  int ncols, const int *rows, int nrows);
+extern VectorBatch *VectorBatchDecodeRows(MemoryContext parent,
+										  TupleDesc tupdesc,
+										  const char *payload, int len);
 extern void VectorBatchDestroy(VectorBatch *batch);
 extern void VectorBatchReset(VectorBatch *batch);
 extern void VectorBatchSetRowCount(VectorBatch *batch, int nrows);

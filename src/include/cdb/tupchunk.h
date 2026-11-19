@@ -26,6 +26,14 @@ typedef enum TupleChunkType
 	TC_PARTIAL_END,				/* Contains the final portion of a tuple. */
 	TC_END_OF_STREAM,			/* Indicates "end of tuples" from this source. */
 	TC_EMPTY,					/* Empty tuple */
+	/*
+	 * A vectorized executor batch (columnar payload) split over a
+	 * START..MID*..END chunk sequence, like a large tuple.  The payload is
+	 * opaque to the interconnect; only the motion layer encodes/decodes it.
+	 */
+	TC_BATCH_START,
+	TC_BATCH_MID,
+	TC_BATCH_END,
 	TC_MAXVAL					/* For range checks on type values. */
 } TupleChunkType;
 

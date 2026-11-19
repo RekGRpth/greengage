@@ -19,6 +19,13 @@
 
 extern MotionState *ExecInitMotion(Motion *node, EState *estate, int eflags);
 extern void ExecEndMotion(MotionState *node);
+
+/* Batch interconnect: receive the next columnar batch from an unsorted
+ * motion, or NULL (*tuples_only marks a tuple stream the caller must
+ * read row-wise). */
+struct VectorBatch;
+extern struct VectorBatch *MotionStateRecvBatch(MotionState *node,
+												bool *tuples_only);
 extern void ExecReScanMotion(MotionState *node);
 
 extern void ExecSquelchMotion(MotionState *node);

@@ -33,6 +33,7 @@
 #include "executor/vectorBatch.h"
 #include "executor/vectorExpr.h"
 #include "executor/vectorHashJoin.h"
+#include "executor/nodeMotion.h"
 #include "nodes/extensible.h"
 #include "optimizer/optimizer.h"
 #include "utils/rel.h"
@@ -65,6 +66,20 @@ typedef struct VectorRowLeafState
 	bool		eof;
 } VectorRowLeafState;
 
+/*
+ * Adaptive leaf over a Motion receiver: the first pull decides whether
+ * the stream carries columnar batches (batch interconnect) or plain
+ * tuples; tuples fall back to the embedded row adapter, which picks up
+ * exactly the tuples the probe already saw.
+ */
+typedef struct VectorMotionLeafState
+{
+	MotionState *motion;
+	VectorRowLeafState row;		/* row.input == (PlanState *) motion */
+	int			decided;		/* 0 = first pull, 1 = batch, 2 = rows, 3 = eos */
+	VectorBatch *current;		/* handed out; destroyed on replace/EOF */
+} VectorMotionLeafState;
+
 typedef struct VectorRegionState
 {
 	CustomScanState css;
@@ -75,6 +90,7 @@ typedef struct VectorRegionState
 	 * batches by the row adapter.
 	 */
 	struct VectorRowLeafState *row_leaf;
+	struct VectorMotionLeafState *motion_leaf;
 	AppendState *append;
 	int			append_index;
 	VectorExprState **append_quals;
@@ -968,6 +984,57 @@ VectorRowLeafSource(void *arg, VectorBatch **batch)
 	return VectorRowLeafNext(leaf);
 }
 
+static bool
+VectorMotionLeafNext(void *arg)
+{
+	VectorMotionLeafState *leaf = (VectorMotionLeafState *) arg;
+
+	if (leaf->decided == 2)
+		return VectorRowLeafNext(&leaf->row);
+
+	if (leaf->decided == 3)
+		return false;
+
+	{
+		bool		tuples_only = false;
+		VectorBatch *batch = MotionStateRecvBatch(leaf->motion, &tuples_only);
+
+		if (batch == NULL)
+		{
+			leaf->decided = tuples_only ? 2 : 3;
+			if (leaf->current != NULL)
+			{
+				VectorBatchDestroy(leaf->current);
+				leaf->current = NULL;
+			}
+			return leaf->decided == 2 ? VectorRowLeafNext(&leaf->row) : false;
+		}
+
+		leaf->decided = 1;
+		if (leaf->current != NULL)
+			VectorBatchDestroy(leaf->current);
+		leaf->current = batch;
+		return true;
+	}
+}
+
+static bool
+VectorMotionLeafSource(void *arg, VectorBatch **batch)
+{
+	VectorMotionLeafState *leaf = (VectorMotionLeafState *) arg;
+
+	if (leaf->decided == 2)
+	{
+		*batch = leaf->row.batch;
+		return VectorRowLeafNext(&leaf->row);
+	}
+
+	if (!VectorMotionLeafNext(arg))
+		return false;
+	*batch = leaf->decided == 1 ? leaf->current : leaf->row.batch;
+	return true;
+}
+
 static VectorHashJoinState *
 VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 {
@@ -989,7 +1056,20 @@ VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 	}
 	else if (IsA(outer, SeqScanState))
 		region->scan = (SeqScanState *) outer;
-	else if (IsA(outer, MotionState) || IsA(outer, CustomScanState))
+	else if (IsA(outer, MotionState))
+	{
+		region->motion_leaf = MemoryContextAllocZero(region->css.ss.ps.state->es_query_cxt,
+													 sizeof(VectorMotionLeafState));
+		region->motion_leaf->motion = (MotionState *) outer;
+		region->motion_leaf->row.input = outer;
+		region->motion_leaf->row.batch = VectorBatchCreate(region->css.ss.ps.state->es_query_cxt,
+														   ExecGetResultType(outer),
+														   VECTOR_BATCH_DEFAULT_CAPACITY,
+														   false);
+		source = VectorMotionLeafSource;
+		source_arg = region->motion_leaf;
+	}
+	else if (IsA(outer, CustomScanState))
 	{
 		region->row_leaf = MemoryContextAllocZero(region->css.ss.ps.state->es_query_cxt,
 												  sizeof(VectorRowLeafState));
@@ -1678,6 +1758,8 @@ VectorRegionEnd(CustomScanState *node)
 	VectorBuildScanDestroy(state->build_scan);
 	VectorRowLeafDestroy(state->row_leaf);
 	VectorRowLeafDestroy(state->build_row_leaf);
+	if (state->motion_leaf != NULL && state->motion_leaf->current != NULL)
+		VectorBatchDestroy(state->motion_leaf->current);
 	if (state->proj != NULL)
 	{
 		int			col;
@@ -1796,4 +1878,74 @@ VectorRegionRestrPos(CustomScanState *node)
 		ExecMaterialRestrPos(state->material);
 	else
 		elog(ERROR, "vector region supports RestrPos only for Sort or Material");
+}
+
+/*
+ * Sender-side batch interconnect support: when this plan node is a
+ * vector region whose output rows are produced natively as batches (a
+ * plain scan region or a batch-driven HJ-root region, with no computed
+ * projection, limit or packed layout between the batch and the
+ * region's output), hand the next output batch out directly.  Returns
+ * false when the node is not such a region; *batch == NULL marks EOF.
+ */
+bool
+VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
+{
+	VectorRegionState *state;
+	int			col;
+
+	if (!IsA(ps, CustomScanState) ||
+		((CustomScanState *) ps)->methods != &vector_region_exec_methods)
+		return false;
+	state = (VectorRegionState *) ps;
+
+	/* an aggregate or sort consumes the join batches: row-wise output */
+	if (state->agg != NULL || state->sort != NULL)
+		return false;
+
+	if (state->nested_batches)
+	{
+		/* HJ-root region: join output batches are the region output. */
+		if (VectorHashJoinNextBatch(state->vhj))
+		{
+			*batch = state->join_batch;
+			return true;
+		}
+		*batch = NULL;
+		return true;
+	}
+
+	if (state->hj != NULL ||
+		state->scan == NULL || state->append != NULL ||
+		state->limit != NULL || state->packed_i32 ||
+		state->motion_leaf != NULL || state->row_leaf != NULL)
+		return false;
+
+	/* computed projections do not materialize into batch columns */
+	if (state->proj != NULL)
+		return false;
+
+	/* the motion output columns must be the batch columns as-is */
+	for (col = 0; col < state->output_ncols; col++)
+	{
+		if (state->output_attnos[col] != col)
+			return false;
+	}
+
+	while (VectorRegionNextScanBatch(state))
+	{
+		if (state->batch->nselected > 0)
+		{
+			/*
+			 * The motion encodes the batch before its next pull, so the
+			 * batch is consumed here like the join-chain leaf does;
+			 * without this NextScanBatch would keep returning it.
+			 */
+			state->position = state->batch->nselected;
+			*batch = state->batch;
+			return true;
+		}
+	}
+	*batch = NULL;
+	return true;
 }
