@@ -432,13 +432,6 @@ typedef struct MotionNodeEntry
 	htup_fifo       ready_tuples;
 
 	/*
-	 * Batches decoded from TC_BATCH_* chunk sequences on an unsorted
-	 * receiver, consumed before the tuple FIFO by a vectorized consumer.
-	 */
-	ReadyBatch	   *ready_batch_head;
-	ReadyBatch	   *ready_batch_tail;
-
-	/*
 	 * Variable that records the total number of senders to this motion node.
 	 * This is expected to always be (number of qExecs).
 	 */
@@ -475,6 +468,14 @@ typedef struct MotionNodeEntry
 	uint64          stat_tuples_available;  /* Total tuples awaiting receive. */
 	uint64          stat_tuples_available_hwm;              /* High-water-mark of this
 		* value. */
+
+	/*
+	 * Batches decoded from TC_BATCH_* chunk sequences on an unsorted
+	 * receiver, consumed before the tuple FIFO by a vectorized consumer.
+	 * Appended at the end to keep the struct layout stable for the ABI check.
+	 */
+	ReadyBatch	   *ready_batch_head;
+	ReadyBatch	   *ready_batch_tail;
 }       MotionNodeEntry;
 
 
