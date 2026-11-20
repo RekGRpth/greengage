@@ -234,6 +234,7 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 {
 	HashJoin   *join = (HashJoin *) state->hj->js.ps.plan;
 	ListCell   *lc;
+	ListCell   *collc;
 	int			nkeys = 0;
 	int			out_ncols = 0;
 	int			maxkey = 0;
@@ -255,13 +256,12 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 		join->join.jointype != JOIN_LASJ_NOTIN)
 		return false;
 
-	foreach(lc, join->hashclauses)
+	forboth(lc, join->hashclauses, collc, join->hashcollations)
 	{
 		OpExpr	   *op = lfirst_node(OpExpr, lc);
 		Var		   *ovar = NULL;
 		Var		   *ivar = NULL;
 		ListCell   *arglc;
-
 		if (list_length(op->args) != 2)
 			return false;
 		foreach(arglc, op->args)
@@ -285,7 +285,13 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 		state->outer_key_pos[nkeys] = ovar->varattno;
 		state->inner_key_attno[nkeys] = ivar->varattno;
 		fmgr_info(get_opcode(op->opno), &state->eq_fns[nkeys]);
-		state->eq_collations[nkeys] = exprCollation((Node *) op);
+		/*
+		 * The plan's hashcollations, like the standard executor's
+		 * hj_Collations, not the clause's inputcollid: ORCA leaves the
+		 * latter invalid on hash clauses, and the key equality would
+		 * fail with "could not determine which collation".
+		 */
+		state->eq_collations[nkeys] = lfirst_oid(collc);
 		nkeys++;
 		maxkey = Max(maxkey, ovar->varattno);
 	}

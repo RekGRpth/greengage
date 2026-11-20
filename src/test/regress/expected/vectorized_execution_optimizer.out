@@ -3931,6 +3931,45 @@ SELECT count(*) FROM vector_text_toast_test WHERE b = 'BP100';
 RESET gp_vectorized_execution;
 DROP TABLE vector_text_test;
 DROP TABLE vector_text_toast_test;
+-- ---- Hash join on text keys ----
+-- The batch probe's key equality must take the plan's hashcollations, like
+-- the standard executor's hj_Collations, not the clause inputcollid: ORCA
+-- leaves the latter invalid, and the vector join used to fail with "could
+-- not determine which collation" where the standard executor succeeded.
+CREATE TABLE vector_hj_text (k int, v text, b bpchar(10))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (k);
+INSERT INTO vector_hj_text
+SELECT i % 100, 'val' || (i % 100), 'BP' || (i % 100)
+FROM generate_series(1, 20000) AS i;
+ANALYZE vector_hj_text;
+SET gp_vectorized_execution = force;
+SELECT count(*), sum(length(a.v)) FROM vector_hj_text a JOIN vector_hj_text b ON a.v = b.v;
+  count  |   sum    
+---------+----------
+ 4000000 | 19600000
+(1 row)
+
+SELECT count(*), count(a.b) FROM vector_hj_text a JOIN vector_hj_text b ON a.k = b.k AND a.v = b.v;
+  count  |  count  
+---------+---------
+ 4000000 | 4000000
+(1 row)
+
+SELECT count(*) FROM vector_hj_text a JOIN vector_hj_text b ON a.b = b.b;
+  count  
+---------
+ 4000000
+(1 row)
+
+SELECT count(*) FROM vector_hj_text a LEFT JOIN vector_hj_text b ON a.v = b.v WHERE a.k < 0;
+ count 
+-------
+     0
+(1 row)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_hj_text;
 -- ---- Nested Loop prefetch rescan over a scan-root region ----
 -- A motion below the join sets prefetch_inner: the NL fetches one inner row
 -- under a fake outer and rescans immediately.  A scan-root vector region
