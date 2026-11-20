@@ -577,6 +577,14 @@ VectorExprPackedI32QualIsSupported(Expr *expr)
 				return false;
 		return true;
 	}
+	if (IsA(expr, List))
+	{
+		/* scan->plan.qual is an implicit-AND list, not a BoolExpr */
+		foreach(lc, (List *) expr)
+			if (!VectorExprPackedI32QualIsSupported((Expr *) lfirst(lc)))
+				return false;
+		return true;
+	}
 	if (!IsA(expr, OpExpr))
 		return false;
 	switch (((OpExpr *) expr)->opfuncid)
@@ -4669,6 +4677,404 @@ VectorExprGetDeferredNumeric(VectorExprState *state, int row, int64 *mant,
 	return true;
 }
 
+/*------------------------------------------------------------------------
+ * Dense qual evaluation for packed INT4/DATE comparisons.
+ *
+ * When the whole qual tree is a single packed INT4/DATE comparison, or an
+ * AND/OR chain of such comparisons, and the batch selection is known to be
+ * the identity, the filter computes one result mask over the batch and
+ * compacts the selection from it directly.  This skips the per-row boolean
+ * VectorValue writes, the null-bitmap updates and the second compaction
+ * pass of the generic path.  Operands are restricted to Var/Const (through
+ * RelabelType), which cannot raise errors or have side effects, so not
+ * short-circuiting them row-by-row is semantically identical.  A batch
+ * where any operand has NULLs is disqualified and goes the scalar way, and
+ * NaN-ordering FLOAT4 comparisons are never eligible.
+ *------------------------------------------------------------------------ */
+
+#define VECTOR_DENSE_MAX_WORDS	64	/* covers batches of up to 4096 rows */
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define VECTOR_DENSE_AVX2	1
+#include <immintrin.h>
+#endif
+
+static int32 vec_dense_compact_tab[256][8];
+static bool vec_dense_tab_ready = false;
+static int	vec_dense_avx2 = -1;	/* -1 unknown, 0 no, 1 yes */
+
+static void
+vec_dense_init_tab(void)
+{
+	uint32		m;
+	int			j,
+				pos;
+
+	if (vec_dense_tab_ready)
+		return;
+	for (m = 0; m < 256; m++)
+	{
+		pos = 0;
+		for (j = 0; j < 8; j++)
+			if ((m & ((uint32) 1 << j)) != 0)
+				vec_dense_compact_tab[m][pos++] = j;
+		for (; pos < 8; pos++)
+			vec_dense_compact_tab[m][pos] = 0;
+	}
+	vec_dense_tab_ready = true;
+}
+
+static bool
+vec_dense_operand(VectorExprStep *step)
+{
+	switch (step->kind)
+	{
+		case VEC_VAR:
+		case VEC_CONST:
+			/* uniform const arrays compare correctly as plain columns */
+			return step->value.i32_values != NULL;
+		case VEC_RELABEL:
+			return step->nargs == 1 && vec_dense_operand(step->args[0]);
+		default:
+			return false;
+	}
+}
+
+static bool
+vec_dense_compare_op(VectorCompareOp op)
+{
+	return (op >= VEC_COMPARE_INT4_EQ && op <= VEC_COMPARE_INT4_GE) ||
+		(op >= VEC_COMPARE_DATE_EQ && op <= VEC_COMPARE_DATE_GE);
+}
+
+static bool
+vec_dense_compare(VectorExprStep *step)
+{
+	return step->kind == VEC_FUNC &&
+		step->nargs == 2 &&
+		vec_dense_compare_op(step->u.func.compare) &&
+		vec_dense_operand(step->args[0]) &&
+		vec_dense_operand(step->args[1]);
+}
+
+/* 0 = ineligible tree, 1 = single compare, 2 = AND/OR chain of compares */
+static int
+vec_dense_class(VectorExprState *state)
+{
+	VectorExprStep *root = state->root;
+	int			i;
+
+	if (state->jit_func != NULL)
+		return 0;
+	if (vec_dense_compare(root))
+		return 1;
+	if ((root->kind == VEC_AND || root->kind == VEC_OR) && root->nargs > 0)
+	{
+		for (i = 0; i < root->nargs; i++)
+			if (!vec_dense_compare(root->args[i]))
+				return 0;
+		return 2;
+	}
+	return 0;
+}
+
+static bool
+vec_dense_has_nulls(VectorExprStep *cmp, int nrows)
+{
+	int			nwords = (nrows + 63) / 64;
+	int			w;
+
+	for (w = 0; w < nwords; w++)
+		if (cmp->args[0]->value.nulls[w] != 0 ||
+			cmp->args[1]->value.nulls[w] != 0)
+			return true;
+	return false;
+}
+
+static uint32
+vec_dense_cmp8_scalar(const int32 *l, const int32 *r, VectorCompareOp op)
+{
+	uint32		m = 0;
+	int			k;
+
+	for (k = 0; k < 8; k++)
+	{
+		int32		a = l[k];
+		int32		b = r[k];
+		bool		res;
+
+		switch (op)
+		{
+			case VEC_COMPARE_INT4_EQ:
+			case VEC_COMPARE_DATE_EQ:
+				res = a == b;
+				break;
+			case VEC_COMPARE_INT4_NE:
+			case VEC_COMPARE_DATE_NE:
+				res = a != b;
+				break;
+			case VEC_COMPARE_INT4_LT:
+			case VEC_COMPARE_DATE_LT:
+				res = a < b;
+				break;
+			case VEC_COMPARE_INT4_LE:
+			case VEC_COMPARE_DATE_LE:
+				res = a <= b;
+				break;
+			case VEC_COMPARE_INT4_GT:
+			case VEC_COMPARE_DATE_GT:
+				res = a > b;
+				break;
+			default:
+				res = a >= b;
+				break;
+		}
+		m |= (uint32) res << k;
+	}
+	return m;
+}
+
+#ifdef VECTOR_DENSE_AVX2
+
+/*
+ * The comparison body shared by the two AVX2 kernels below; expands to the
+ * 8-bit lane mask for one of eight packed rows.
+ */
+#define VEC_DENSE_AVX2_CMP8(lv, rv, op) \
+	({ \
+		__m256i m_; \
+		bool	invert_; \
+		switch (op) \
+		{ \
+			case VEC_COMPARE_INT4_EQ: \
+			case VEC_COMPARE_DATE_EQ: \
+				m_ = _mm256_cmpeq_epi32((lv), (rv)); invert_ = false; \
+				break; \
+			case VEC_COMPARE_INT4_NE: \
+			case VEC_COMPARE_DATE_NE: \
+				m_ = _mm256_cmpeq_epi32((lv), (rv)); invert_ = true; \
+				break; \
+			case VEC_COMPARE_INT4_LT: \
+			case VEC_COMPARE_DATE_LT: \
+				m_ = _mm256_cmpgt_epi32((rv), (lv)); invert_ = false; \
+				break; \
+			case VEC_COMPARE_INT4_LE: \
+			case VEC_COMPARE_DATE_LE: \
+				m_ = _mm256_cmpgt_epi32((lv), (rv)); invert_ = true; \
+				break; \
+			case VEC_COMPARE_INT4_GT: \
+			case VEC_COMPARE_DATE_GT: \
+				m_ = _mm256_cmpgt_epi32((lv), (rv)); invert_ = false; \
+				break; \
+			default: \
+				m_ = _mm256_cmpgt_epi32((rv), (lv)); invert_ = true; \
+				break; \
+		} \
+		((uint32) _mm256_movemask_ps(_mm256_castsi256_ps(m_)) ^ \
+		 (invert_ ? 0xff : 0)); \
+	})
+
+__attribute__((target("avx2")))
+static uint32
+vec_dense_cmp8_avx2(const int32 *l, const int32 *r, VectorCompareOp op)
+{
+	__m256i		lv = _mm256_loadu_si256((const __m256i *) l);
+	__m256i		rv = _mm256_loadu_si256((const __m256i *) r);
+
+	return VEC_DENSE_AVX2_CMP8(lv, rv, op);
+}
+
+__attribute__((target("avx2")))
+static uint32
+vec_dense_cmp8_const_avx2(const int32 *l, int32 rval, VectorCompareOp op)
+{
+	__m256i		lv = _mm256_loadu_si256((const __m256i *) l);
+	__m256i		rv = _mm256_set1_epi32(rval);
+
+	return VEC_DENSE_AVX2_CMP8(lv, rv, op);
+}
+#endif							/* VECTOR_DENSE_AVX2 */
+
+/*
+ * Compute the comparison result of one dense compare step for nrows into
+ * words, one bit per absolute row.  Full 8-row blocks go through the
+ * 8-wide kernels; the ragged tail is copied into padded stack buffers so
+ * neither kernel nor masked tail ever reads past nrows.
+ */
+static void
+vec_dense_cmp_words(VectorExprStep *cmp, int nrows, uint64 *words,
+					bool use_avx2)
+{
+	const int32 *l = cmp->args[0]->value.i32_values;
+	const int32 *r = cmp->args[1]->value.i32_values;
+	VectorCompareOp op = cmp->u.func.compare;
+	bool		rconst = cmp->args[1]->kind == VEC_CONST;
+	int			row = 0;
+
+	for (; row + 8 <= nrows; row += 8)
+	{
+		uint32		m8;
+
+#ifdef VECTOR_DENSE_AVX2
+		if (use_avx2)
+			m8 = rconst ?
+				vec_dense_cmp8_const_avx2(l + row, r[0], op) :
+				vec_dense_cmp8_avx2(l + row, r + row, op);
+		else
+#endif
+			m8 = vec_dense_cmp8_scalar(l + row, r + row, op);
+		words[row >> 6] |= (uint64) m8 << (row & 63);
+	}
+	if (row < nrows)
+	{
+		/*
+		 * Const operand arrays are filled to capacity, so reading them at
+		 * row offsets is safe; the ragged lanes are zero-padded here and
+		 * their mask bits dropped by the tail masking in the caller.
+		 */
+		int32		lbuf[8] = {0};
+		int32		rbuf[8] = {0};
+		int			ntail = nrows - row;
+		uint32		m8;
+
+		memcpy(lbuf, l + row, sizeof(int32) * ntail);
+		memcpy(rbuf, r + row, sizeof(int32) * ntail);
+		m8 = vec_dense_cmp8_scalar(lbuf, rbuf, op);
+		words[row >> 6] |= (uint64) m8 << (row & 63);
+	}
+}
+
+/*
+ * Try to filter the batch with the dense mask path.  Returns false when
+ * the tree shape, NULLs or batch size disqualify it (caller runs the
+ * generic scalar path).  On success the batch selection is compacted and
+ * nselected/sel_identity updated.
+ */
+static bool
+vec_dense_filter(VectorBatch *batch, VectorExprState *state)
+{
+	VectorExprStep *root = state->root;
+	int			n = batch->nselected;
+	int			nwords;
+	uint64		words[VECTOR_DENSE_MAX_WORDS];
+	bool		use_avx2;
+	int			a;
+
+	if (n == 0)
+		return true;
+	if (batch->capacity > VECTOR_DENSE_MAX_WORDS * 64)
+		return false;
+	if (vec_dense_class(state) == 0)
+		return false;
+
+	nwords = (n + 63) / 64;
+
+	/* NULL operands disqualify: the scalar path must see them */
+	if (root->kind == VEC_AND || root->kind == VEC_OR)
+	{
+		for (a = 0; a < root->nargs; a++)
+			if (vec_dense_has_nulls(root->args[a], n))
+				return false;
+	}
+	else if (vec_dense_has_nulls(root, n))
+		return false;
+
+	if (vec_dense_avx2 < 0)
+	{
+#ifdef VECTOR_DENSE_AVX2
+		vec_dense_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+		vec_dense_avx2 = 0;
+#endif
+	}
+	use_avx2 = vec_dense_avx2 > 0;
+	vec_dense_init_tab();
+
+	if (root->kind == VEC_AND || root->kind == VEC_OR)
+	{
+		bool		is_and = root->kind == VEC_AND;
+
+		for (a = 0; a < root->nargs; a++)
+		{
+			VectorExprStep *cmp = root->args[a];
+
+			if (a == 0)
+			{
+				memset(words, 0, sizeof(uint64) * nwords);
+				vec_dense_cmp_words(cmp, n, words, use_avx2);
+			}
+			else
+			{
+				uint64		cwords[VECTOR_DENSE_MAX_WORDS];
+				int			w;
+
+				memset(cwords, 0, sizeof(uint64) * nwords);
+				vec_dense_cmp_words(cmp, n, cwords, use_avx2);
+				for (w = 0; w < nwords; w++)
+					words[w] = is_and ? words[w] & cwords[w] :
+						words[w] | cwords[w];
+			}
+		}
+	}
+	else
+	{
+		memset(words, 0, sizeof(uint64) * nwords);
+		vec_dense_cmp_words(root, n, words, use_avx2);
+	}
+
+	/* compact the selection one mask byte (8 rows) at a time */
+	{
+		int32	   *sel = batch->selection;
+		int			write = 0;
+		int			row = 0;
+
+		for (; row + 8 <= n; row += 8)
+		{
+			uint32		m8 = (uint32) ((words[row >> 6] >> (row & 63)) & 0xff);
+
+			if (m8 == 0xff)
+			{
+				sel[write++] = row + 0;
+				sel[write++] = row + 1;
+				sel[write++] = row + 2;
+				sel[write++] = row + 3;
+				sel[write++] = row + 4;
+				sel[write++] = row + 5;
+				sel[write++] = row + 6;
+				sel[write++] = row + 7;
+			}
+			else if (m8 != 0)
+			{
+				const int32 *tab = vec_dense_compact_tab[m8];
+				int			cnt = __builtin_popcount(m8);
+				int			k;
+
+				for (k = 0; k < cnt; k++)
+					sel[write + k] = row + tab[k];
+				write += cnt;
+			}
+		}
+		if (row < n)
+		{
+			uint32		m8 = (uint32) (words[row >> 6] >> (row & 63));
+
+			m8 &= ((uint32) 1 << (n - row)) - 1;
+			if (m8 != 0)
+			{
+				const int32 *tab = vec_dense_compact_tab[m8];
+				int			cnt = __builtin_popcount(m8);
+				int			k;
+
+				for (k = 0; k < cnt; k++)
+					sel[write++] = row + tab[k];
+			}
+		}
+		batch->sel_identity = batch->sel_identity && write == n;
+		batch->nselected = write;
+	}
+	return true;
+}
+
 void
 VectorExprFilter(VectorBatch *batch, VectorExprState *state)
 {
@@ -4676,6 +5082,11 @@ VectorExprFilter(VectorBatch *batch, VectorExprState *state)
 	int			pos;
 
 	if (state == NULL)
+		return;
+
+	CHECK_FOR_INTERRUPTS();
+
+	if (batch->sel_identity && vec_dense_filter(batch, state))
 		return;
 
 	VectorExprEval(batch, state);
@@ -4687,5 +5098,6 @@ VectorExprFilter(VectorBatch *batch, VectorExprState *state)
 			DatumGetBool(value_get(&state->root->value, row)))
 			batch->selection[write++] = row;
 	}
+	batch->sel_identity = batch->sel_identity && write == batch->nselected;
 	batch->nselected = write;
 }

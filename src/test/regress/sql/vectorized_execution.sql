@@ -126,6 +126,26 @@ VALUES (1, '-Infinity', '-Infinity'), (2, '-0.0', '-0.0'), (3, 0.0, 0.0),
        (4, 1.5, 1.5), (5, 'Infinity', 'Infinity'),
        (6, 'NaN', 'NaN'), (7, 'NaN', 'NaN'), (8, NULL, NULL);
 ANALYZE vector_float_test;
+-- Dense qual evaluation: packed INT4/DATE comparisons compiled into batch
+-- result masks and a single selection compaction.  1003 rows cross the
+-- 64-row mask words and leave a 3-row ragged tail; NULLs in q disqualify
+-- the dense path batch-by-batch and fall back to the scalar filter.
+CREATE TABLE vector_dense_test (id int4, d date, q int4)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_dense_test
+SELECT g, DATE '2020-01-01' + (g % 400),
+       CASE WHEN g % 17 = 0 THEN NULL ELSE g % 250 END
+FROM generate_series(1, 1003) AS g;
+ANALYZE vector_dense_test;
+SELECT min(q), max(q) FROM vector_dense_test WHERE q < 100;
+SELECT min(q), max(q) FROM vector_dense_test WHERE q >= 10 AND q < 100;
+SELECT min(d), max(d) FROM vector_dense_test
+WHERE d >= DATE '2020-02-01' AND d < DATE '2020-06-01';
+SELECT min(q), max(q) FROM vector_dense_test WHERE q = 3 OR q = 7;
+SELECT q % 5 AS g, min(q), max(q) FROM vector_dense_test
+WHERE q >= 20 AND q < 200 GROUP BY g ORDER BY g;
+SELECT min(q), max(q) FROM vector_dense_test WHERE q IS NULL OR q >= 0;
 CREATE TABLE vector_limit_test (id int4, val text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test

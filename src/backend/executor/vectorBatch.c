@@ -110,6 +110,7 @@ VectorBatchReset(VectorBatch *batch)
 
 	batch->nrows = 0;
 	batch->nselected = 0;
+	batch->sel_identity = true; /* empty selection is trivially identity */
 	batch->gen++;
 	MemoryContextReset(batch->varlena_context);
 	for (col = 0; col < batch->ncols; col++)
@@ -127,6 +128,7 @@ VectorBatchSetRowCount(VectorBatch *batch, int nrows)
 
 	batch->nrows = nrows;
 	batch->nselected = nrows;
+	batch->sel_identity = true;
 	for (row = 0; row < nrows; row++)
 		batch->selection[row] = row;
 }
@@ -531,6 +533,7 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 
 		batch->nrows = nrows;
 		batch->nselected = nrows;
+		batch->sel_identity = true;
 		for (row = 0; row < nrows; row++)
 			batch->selection[row] = row;
 	}

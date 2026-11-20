@@ -58,6 +58,13 @@ typedef struct VectorBatch
 	bool		packed_i32;
 	TupleDesc	tupdesc;
 	MemoryContext varlena_context;
+	/*
+	 * Known-identity selection: selection[i] == i for all i < nselected.
+	 * Set by every batch fill, cleared by compaction; lets dense qual
+	 * kernels address column arrays contiguously.  Appended at the end of
+	 * the struct to keep the layout stable for the ABI check.
+	 */
+	bool		sel_identity;
 } VectorBatch;
 
 extern VectorBatch *VectorBatchCreate(MemoryContext parent,

@@ -126,6 +126,60 @@ VALUES (1, '-Infinity', '-Infinity'), (2, '-0.0', '-0.0'), (3, 0.0, 0.0),
        (4, 1.5, 1.5), (5, 'Infinity', 'Infinity'),
        (6, 'NaN', 'NaN'), (7, 'NaN', 'NaN'), (8, NULL, NULL);
 ANALYZE vector_float_test;
+-- Dense qual evaluation: packed INT4/DATE comparisons compiled into batch
+-- result masks and a single selection compaction.  1003 rows cross the
+-- 64-row mask words and leave a 3-row ragged tail; NULLs in q disqualify
+-- the dense path batch-by-batch and fall back to the scalar filter.
+CREATE TABLE vector_dense_test (id int4, d date, q int4)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_dense_test
+SELECT g, DATE '2020-01-01' + (g % 400),
+       CASE WHEN g % 17 = 0 THEN NULL ELSE g % 250 END
+FROM generate_series(1, 1003) AS g;
+ANALYZE vector_dense_test;
+SELECT min(q), max(q) FROM vector_dense_test WHERE q < 100;
+ min | max 
+-----+-----
+   0 |  99
+(1 row)
+
+SELECT min(q), max(q) FROM vector_dense_test WHERE q >= 10 AND q < 100;
+ min | max 
+-----+-----
+  10 |  99
+(1 row)
+
+SELECT min(d), max(d) FROM vector_dense_test
+WHERE d >= DATE '2020-02-01' AND d < DATE '2020-06-01';
+    min     |    max     
+------------+------------
+ 02-01-2020 | 05-31-2020
+(1 row)
+
+SELECT min(q), max(q) FROM vector_dense_test WHERE q = 3 OR q = 7;
+ min | max 
+-----+-----
+   3 |   7
+(1 row)
+
+SELECT q % 5 AS g, min(q), max(q) FROM vector_dense_test
+WHERE q >= 20 AND q < 200 GROUP BY g ORDER BY g;
+ g | min | max 
+---+-----+-----
+ 0 |  20 | 195
+ 1 |  21 | 196
+ 2 |  22 | 197
+ 3 |  23 | 198
+ 4 |  24 | 199
+(5 rows)
+
+SELECT min(q), max(q) FROM vector_dense_test WHERE q IS NULL OR q >= 0;
+ min | max 
+-----+-----
+   0 | 249
+(1 row)
+
 CREATE TABLE vector_limit_test (id int4, val text)
 WITH (appendonly = true, orientation = column) DISTRIBUTED REPLICATED;
 INSERT INTO vector_limit_test
@@ -1134,7 +1188,6 @@ SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
    n   | ?column? | ?column? | ?column? | ?column? | ?column? 
 -------+----------+----------+----------+----------+----------
- -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
    2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
      0 |        1 |       -1 |        0 |        0 |        0
@@ -1142,6 +1195,7 @@ SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
  1.200 |    2.200 |    0.200 |    3.600 |    2.400 | 1.440000
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
        |          |          |          |          |         
+ -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
 (8 rows)
 
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
