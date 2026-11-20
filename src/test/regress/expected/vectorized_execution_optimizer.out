@@ -2927,9 +2927,11 @@ WHERE a.id <= 2 AND b.id <= 3 ORDER BY a.id, b.id;
 ----+-----+----+-----
   1 | v1  |  1 | v1
   1 | v1  |  2 | v2
+  1 | v1  |  3 | v3
   2 | v2  |  1 | v1
   2 | v2  |  2 | v2
-(4 rows)
+  2 | v2  |  3 | v3
+(6 rows)
 
 SELECT h.id, r.id FROM vector_heap_test h JOIN vector_aoro_test r ON h.id = r.id
 ORDER BY h.id LIMIT 5;

@@ -1811,6 +1811,29 @@ VectorRegionRescan(CustomScanState *node)
 		outerPlanState(state->material) = state->mat_outer;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
+	if (state->scan != NULL && state->input == NULL &&
+		state->scan->ss.ss_currentScanDesc != NULL)
+	{
+		/*
+		 * A rescan must re-read the leaf from the start.  The NestLoop
+		 * prefetch path (any motion below the join makes it fetch one inner
+		 * row under a fake outer and rescan immediately) reaches here with
+		 * the current batch only partially consumed; resetting the batch
+		 * cursor alone would silently drop the rest of the batch because
+		 * the table scan keeps its position.  Close the scan descriptor:
+		 * the next fill re-opens it from the first row.
+		 */
+		table_endscan(state->scan->ss.ss_currentScanDesc);
+		state->scan->ss.ss_currentScanDesc = NULL;
+	}
+	if (state->material != NULL &&
+		state->material->tuplestorestate != NULL &&
+		!state->material->ts_destroyed)
+	{
+		/* rows cached by the previous scan iteration must not leak in */
+		tuplestore_clear(state->material->tuplestorestate);
+		state->material->eof_underlying = false;
+	}
 	if (state->sort != NULL)
 	{
 		/* same reset as ExecReScanSort, without recursing into the chain */
@@ -1847,6 +1870,17 @@ VectorRegionRescan(CustomScanState *node)
 		state->append_index = -1;
 		state->scan = (SeqScanState *) state->append->appendplans[0];
 		state->qual = state->append_quals[0];
+		/* rewind every child scan, not only the one current at rescan time */
+		for (int i = 0; i < state->append->as_nplans; i++)
+		{
+			SeqScanState *child = (SeqScanState *) state->append->appendplans[i];
+
+			if (child->ss.ss_currentScanDesc != NULL)
+			{
+				table_endscan(child->ss.ss_currentScanDesc);
+				child->ss.ss_currentScanDesc = NULL;
+			}
+		}
 	}
 	if (state->nestloop != NULL)
 		outerPlanState(state->nestloop) = state->nl_proxy;
