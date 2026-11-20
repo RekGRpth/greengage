@@ -14,6 +14,7 @@
 
 #include "access/htup_details.h"
 #include "access/tupconvert.h"
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "cdb/cdbvars.h"
@@ -36,6 +37,7 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
+#include "utils/pg_locale.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 
@@ -120,7 +122,11 @@ typedef enum VectorCompareOp
 	VEC_COMPARE_FLOAT8_LT,
 	VEC_COMPARE_FLOAT8_LE,
 	VEC_COMPARE_FLOAT8_GT,
-	VEC_COMPARE_FLOAT8_GE
+	VEC_COMPARE_FLOAT8_GE,
+	VEC_COMPARE_TEXT_EQ,
+	VEC_COMPARE_TEXT_NE,
+	VEC_COMPARE_BPCHAR_EQ,
+	VEC_COMPARE_BPCHAR_NE
 } VectorCompareOp;
 
 typedef enum VectorArithmeticOp
@@ -203,6 +209,17 @@ typedef struct VectorExprStep
 			bool		strict;
 			VectorCompareOp compare;
 			VectorArithmeticOp arithmetic;
+			/*
+			 * Text/bpchar equality fast path: a Const operand's bytes hoisted
+			 * at compile time (trailing spaces already stripped for bpchar),
+			 * or const_arg -1 when there is no usable Const operand.
+			 */
+			struct
+			{
+				int			const_arg;
+				const char *const_data;
+				int			const_len;
+			}			textcmp;
 		}			func;
 		NullTestType nulltesttype;
 		BoolTestType booltesttype;
@@ -902,6 +919,14 @@ vector_compare_op(Oid functionid)
 			return VEC_COMPARE_FLOAT8_GT;
 		case F_FLOAT8GE:
 			return VEC_COMPARE_FLOAT8_GE;
+		case F_TEXTEQ:
+			return VEC_COMPARE_TEXT_EQ;
+		case F_TEXTNE:
+			return VEC_COMPARE_TEXT_NE;
+		case F_BPCHAREQ:
+			return VEC_COMPARE_BPCHAR_EQ;
+		case F_BPCHARNE:
+			return VEC_COMPARE_BPCHAR_NE;
 		default:
 			return VEC_COMPARE_NONE;
 	}
@@ -985,6 +1010,65 @@ vector_arithmetic_op(Oid functionid)
 	}
 }
 
+/*
+ * Set up the text/bpchar equality fast path for a compare step.
+ *
+ * texteq/textne and bpchareq/bpcharne compare bits, not collation order,
+ * whenever the input collation is deterministic (that is exactly the branch
+ * the functions themselves take).  Under a nondeterministic collation (ICU)
+ * equality is collation-aware, so the step keeps the generic per-row call.
+ * An invalid collation likewise stays generic: the function raises that
+ * error itself.
+ *
+ * The bitwise path reads 1-byte and plain 4-byte varlenas in place; external
+ * and compressed values fall back to the original function per row.  A Const
+ * operand is unpacked once here, its trailing spaces stripped for bpchar the
+ * way bcTruelen does, so the per-row loop skips that scan on one side.
+ */
+static void
+setup_text_compare(VectorExprStep *step, Oid collation)
+{
+	bool		bpchar = (step->u.func.compare == VEC_COMPARE_BPCHAR_EQ ||
+						  step->u.func.compare == VEC_COMPARE_BPCHAR_NE);
+	int			i;
+
+	step->u.func.textcmp.const_arg = -1;
+	step->u.func.textcmp.const_data = NULL;
+	step->u.func.textcmp.const_len = 0;
+
+	if (!OidIsValid(collation) ||
+		!(lc_collate_is_c(collation) ||
+		  collation == DEFAULT_COLLATION_OID ||
+		  pg_newlocale_from_collation(collation)->deterministic))
+	{
+		step->u.func.compare = VEC_COMPARE_NONE;
+		return;
+	}
+
+	for (i = 0; i < step->nargs; i++)
+	{
+		VectorExprStep *arg = step->args[i];
+		struct varlena *v;
+		Size		len;
+		char	   *data;
+
+		if (arg->kind != VEC_CONST || value_is_null(&arg->value, 0))
+			continue;
+		v = (struct varlena *) DatumGetPointer(arg->value.values[0]);
+		if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))
+			v = pg_detoast_datum(v);
+		len = VARSIZE_ANY_EXHDR(v);
+		data = VARDATA_ANY(v);
+		if (bpchar)
+			while (len > 0 && data[len - 1] == ' ')
+				len--;
+		step->u.func.textcmp.const_arg = i;
+		step->u.func.textcmp.const_data = data;
+		step->u.func.textcmp.const_len = (int) len;
+		break;
+	}
+}
+
 static VectorExprStep *
 build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 				Oid collation, List *args, VectorBatch *batch,
@@ -1011,6 +1095,9 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 			return NULL;
 		argno++;
 	}
+	if (step->u.func.compare >= VEC_COMPARE_TEXT_EQ &&
+		step->u.func.compare <= VEC_COMPARE_BPCHAR_NE)
+		setup_text_compare(step, collation);
 	return step;
 }
 
@@ -1875,6 +1962,79 @@ numeric_compare_datums(Datum left, Datum right)
 	return cmp_numeric_datums(left, right);
 }
 
+/*
+ * One text/bpchar equality row: inline 1-byte and plain 4-byte varlenas are
+ * compared by bytes exactly as the functions' deterministic-collation branch
+ * does (bpchar after stripping trailing spaces).  External and compressed
+ * values, rare in batch columns, go to the original function for the row.
+ */
+static bool
+text_compare_eval(VectorExprStep *step, Datum ldatum, Datum rdatum)
+{
+	bool		negate = (step->u.func.compare == VEC_COMPARE_TEXT_NE ||
+						  step->u.func.compare == VEC_COMPARE_BPCHAR_NE);
+	bool		bpchar = (step->u.func.compare == VEC_COMPARE_BPCHAR_EQ ||
+						  step->u.func.compare == VEC_COMPARE_BPCHAR_NE);
+	int			const_arg = step->u.func.textcmp.const_arg;
+	struct varlena *v;
+	Size		len;
+	char	   *data;
+	bool		eq;
+
+	if (const_arg >= 0)
+	{
+		v = (struct varlena *) DatumGetPointer(const_arg == 0 ? rdatum : ldatum);
+		if (!VARATT_IS_EXTERNAL(v) && !VARATT_IS_COMPRESSED(v))
+		{
+			len = VARSIZE_ANY_EXHDR(v);
+			data = VARDATA_ANY(v);
+			if (bpchar)
+				while (len > 0 && data[len - 1] == ' ')
+					len--;
+			eq = (len == (Size) step->u.func.textcmp.const_len) &&
+				(len == 0 ||
+				 memcmp(data, step->u.func.textcmp.const_data, len) == 0);
+			return negate ? !eq : eq;
+		}
+	}
+	else
+	{
+		struct varlena *l = (struct varlena *) DatumGetPointer(ldatum);
+		struct varlena *r = (struct varlena *) DatumGetPointer(rdatum);
+		Size		llen;
+		Size		rlen;
+
+		if (!VARATT_IS_EXTERNAL(l) && !VARATT_IS_COMPRESSED(l) &&
+			!VARATT_IS_EXTERNAL(r) && !VARATT_IS_COMPRESSED(r))
+		{
+			llen = VARSIZE_ANY_EXHDR(l);
+			rlen = VARSIZE_ANY_EXHDR(r);
+			if (bpchar)
+			{
+				char	   *ldata = VARDATA_ANY(l);
+				char	   *rdata = VARDATA_ANY(r);
+
+				while (llen > 0 && ldata[llen - 1] == ' ')
+					llen--;
+				while (rlen > 0 && rdata[rlen - 1] == ' ')
+					rlen--;
+			}
+			eq = (llen == rlen) &&
+				(llen == 0 ||
+				 memcmp(VARDATA_ANY(l), VARDATA_ANY(r), llen) == 0);
+			return negate ? !eq : eq;
+		}
+	}
+
+	/* the rest: let the original function decide this row */
+	step->u.func.fcinfo->args[0].value = ldatum;
+	step->u.func.fcinfo->args[0].isnull = false;
+	step->u.func.fcinfo->args[1].value = rdatum;
+	step->u.func.fcinfo->args[1].isnull = false;
+	step->u.func.fcinfo->isnull = false;
+	return DatumGetBool(step->u.func.fn.fn_addr(step->u.func.fcinfo));
+}
+
 static void
 eval_compare_packed_int2(VectorExprStep *step, int32 *selection, int nselected)
 {
@@ -2180,6 +2340,13 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 			case VEC_COMPARE_FLOAT8_GE:
 				result = float8_cmp_internal(DatumGetFloat8(left->values[row]),
 										 DatumGetFloat8(right->values[row])) >= 0;
+				break;
+			case VEC_COMPARE_TEXT_EQ:
+			case VEC_COMPARE_TEXT_NE:
+			case VEC_COMPARE_BPCHAR_EQ:
+			case VEC_COMPARE_BPCHAR_NE:
+				result = text_compare_eval(step, left->values[row],
+										   right->values[row]);
 				break;
 			default:
 				pg_unreachable();

@@ -4762,6 +4762,149 @@ DROP TABLE vector_numeric_batch_test;
 DROP TABLE vector_numeric_wide_test;
 DROP TABLE vector_arithmetic_test;
 DROP TABLE vector_rle_test;
+-- ---- Text and bpchar equality ----
+-- texteq/textne and bpchareq/bpcharne take a bitwise path under a
+-- deterministic collation; padding, NULLs, empty strings and toasted values
+-- must match the row-wise executor exactly.
+CREATE TABLE vector_text_test (
+    id int,
+    t text,
+    v varchar(20),
+    b bpchar(10),
+    t2 text
+) WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (id);
+INSERT INTO vector_text_test
+SELECT i,
+    CASE WHEN i % 7 = 0 THEN NULL
+         WHEN i % 5 = 0 THEN ''
+         WHEN i % 3 = 0 THEN 'abc  '
+         ELSE 'brand#' || (i % 11) END,
+    CASE WHEN i % 4 = 0 THEN NULL ELSE 'v' || (i % 13) END,
+    CASE WHEN i % 6 = 0 THEN NULL
+         WHEN i % 4 = 0 THEN 'x'
+         ELSE 'BP' || (i % 9) END,
+    CASE WHEN i % 8 = 0 THEN NULL
+         ELSE 'brand#' || (i % 11) END
+FROM generate_series(1, 5000) AS i;
+ANALYZE vector_text_test;
+SET gp_vectorized_execution = force;
+-- constant comparisons: exact, padded, empty
+SELECT count(*) FROM vector_text_test WHERE t = 'brand#3';
+ count 
+-------
+   207
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE t <> 'brand#3';
+ count 
+-------
+  4079
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE t = '';
+ count 
+-------
+   858
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE t = 'abc';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE b = 'BP4';
+ count 
+-------
+   417
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE b <> 'BP4';
+ count 
+-------
+  3750
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE b = 'BP4   ';
+ count 
+-------
+   417
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE b = 'x';
+ count 
+-------
+   834
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE v = 'v5';
+ count 
+-------
+   289
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE v <> 'v5';
+ count 
+-------
+  3461
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE v = 'v5 ';
+ count 
+-------
+     0
+(1 row)
+
+-- column against column, NULLs on both sides
+SELECT count(*) FROM vector_text_test WHERE t = t2;
+ count 
+-------
+  2001
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE t <> t2;
+ count 
+-------
+  1749
+(1 row)
+
+SELECT count(*) FROM vector_text_test WHERE b = b;
+ count 
+-------
+  4167
+(1 row)
+
+-- values stored out-of-line (external TOAST) through a heap table
+CREATE TABLE vector_text_toast_test (id int, t text, b bpchar(10))
+DISTRIBUTED BY (id);
+INSERT INTO vector_text_toast_test
+SELECT i,
+    CASE WHEN i % 8 = 0 THEN repeat('z' || (i % 3), 1000) ELSE 'short' || i END,
+    'BP' || i
+FROM generate_series(1, 1000) AS i;
+ANALYZE vector_text_toast_test;
+SELECT count(*) FROM vector_text_toast_test WHERE t = repeat('z1', 1000);
+ count 
+-------
+    42
+(1 row)
+
+SELECT count(*) FROM vector_text_toast_test WHERE t = 'short42';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM vector_text_toast_test WHERE b = 'BP100';
+ count 
+-------
+     1
+(1 row)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_text_test;
+DROP TABLE vector_text_toast_test;
 -- ---- Nested Loop prefetch rescan over a scan-root region ----
 -- A motion below the join sets prefetch_inner: the NL fetches one inner row
 -- under a fake outer and rescans immediately.  A scan-root vector region
