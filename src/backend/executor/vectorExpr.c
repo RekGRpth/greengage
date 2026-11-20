@@ -227,6 +227,27 @@ typedef struct VectorExprStep
 				const char *const_data;
 				int			const_len;
 			}			textcmp;
+			/*
+			 * LIKE fast path over constant patterns of literals and %:
+			 * the pattern compiled into ordered pieces with anchor flags.
+			 * Patterns with _ or an escape character, dynamic patterns,
+			 * and nondeterministic collations stay on the generic
+			 * matcher, which also raises their errors.
+			 */
+			struct
+			{
+			bool		like_simple;
+			bool		like_negate;
+			bool		like_match_all;
+			struct
+			{
+				const char *data;
+				int			len;
+			}		   *like_pieces;
+			int			like_npieces;
+			bool		like_start_anchored;
+			bool		like_end_anchored;
+			}			like;
 		}			func;
 		NullTestType nulltesttype;
 		BoolTestType booltesttype;
@@ -1106,6 +1127,75 @@ setup_text_compare(VectorExprStep *step, Oid collation)
 	}
 }
 
+/*
+ * Compile a constant LIKE pattern into ordered literal pieces.  Only
+ * patterns of literals and % qualify: '_' or the escape character send
+ * the step to the generic matcher, which also evaluates the pattern's
+ * own errors (a trailing escape) the way like.c raises them.  LIKE
+ * matches bytes; a nondeterministic collation is rejected by the
+ * generic path, so it must stay there.
+ */
+static void
+setup_text_like(VectorExprStep *step, Oid functionid, Oid collation)
+{
+	VectorExprStep *patarg = step->args[1];
+	struct varlena *pat;
+	const char *pbytes;
+	Size		plen;
+	Size		i;
+	int			npieces = 0;
+	bool		saw_percent = false;
+
+	step->u.func.like.like_simple = false;
+	step->u.func.like.like_pieces = NULL;
+	step->u.func.like.like_npieces = 0;
+	if (functionid != F_TEXTLIKE && functionid != F_TEXTNLIKE)
+		return;
+	if (step->nargs != 2 || patarg->kind != VEC_CONST ||
+		value_is_null(&patarg->value, 0))
+		return;
+	if (!vector_collation_deterministic(collation))
+		return;
+	pat = (struct varlena *) DatumGetPointer(patarg->value.values[0]);
+	if (VARATT_IS_EXTERNAL(pat) || VARATT_IS_COMPRESSED(pat))
+		pat = pg_detoast_datum(pat);
+	pbytes = VARDATA_ANY(pat);
+	plen = VARSIZE_ANY_EXHDR(pat);
+	for (i = 0; i < plen; i++)
+		if (pbytes[i] == '_' || pbytes[i] == '\\')
+			return;
+	step->u.func.like.like_pieces =
+		(void *) palloc(sizeof(*step->u.func.like.like_pieces) *
+						(plen / 2 + 2));
+	i = 0;
+	while (i < plen)
+	{
+		Size		start;
+
+		if (pbytes[i] == '%')
+		{
+			saw_percent = true;
+			i++;
+			continue;
+		}
+		start = i;
+		while (i < plen && pbytes[i] != '%')
+			i++;
+		if (i > start)
+		{
+			step->u.func.like.like_pieces[npieces].data = pbytes + start;
+			step->u.func.like.like_pieces[npieces].len = (int) (i - start);
+			npieces++;
+		}
+	}
+	step->u.func.like.like_npieces = npieces;
+	step->u.func.like.like_match_all = (npieces == 0 && saw_percent);
+	step->u.func.like.like_start_anchored = (plen > 0 && pbytes[0] != '%');
+	step->u.func.like.like_end_anchored = (plen > 0 && pbytes[plen - 1] != '%');
+	step->u.func.like.like_negate = (functionid == F_TEXTNLIKE);
+	step->u.func.like.like_simple = true;
+}
+
 static int
 cmp_i64(const void *a, const void *b)
 {
@@ -1294,6 +1384,9 @@ build_func_step(Oid functionid, Oid resulttype, int32 resulttypmod,
 	if (step->u.func.compare >= VEC_COMPARE_TEXT_EQ &&
 		step->u.func.compare <= VEC_COMPARE_BPCHAR_NE)
 		setup_text_compare(step, collation);
+	if (step->u.func.compare == VEC_COMPARE_NONE &&
+		step->u.func.arithmetic == VEC_ARITHMETIC_NONE)
+		setup_text_like(step, functionid, collation);
 	return step;
 }
 
@@ -2344,6 +2437,70 @@ saop_set_eval(VectorExprStep *step, VectorExprStep *arg, int row,
 	return true;
 }
 
+/*
+ * Ordered literal-piece match, LIKE's semantics for patterns of literals
+ * and %: every piece occurs in order, non-overlapping; the first piece is
+ * pinned to the start unless the pattern begins with %, the last is
+ * pinned to the end unless it ends with %.  Byte comparison is exactly
+ * what the single-byte and UTF-8 matchers do for literal runs.
+ */
+static bool
+like_pieces_match(VectorExprStep *step, const char *data, Size len)
+{
+	const char *from = data;
+	Size		from_len = len;
+	int			i;
+
+	if (step->u.func.like.like_match_all)
+		return true;
+	if (step->u.func.like.like_npieces == 0)
+		return len == 0;
+	for (i = 0; i < step->u.func.like.like_npieces; i++)
+	{
+		const char *pd = step->u.func.like.like_pieces[i].data;
+		int			plen = step->u.func.like.like_pieces[i].len;
+		Size		maxstart;
+
+		if (from_len < (Size) plen)
+			return false;
+		maxstart = from_len - plen;
+		if (i == 0 && step->u.func.like.like_start_anchored)
+		{
+			if (memcmp(from, pd, plen) != 0)
+				return false;
+			from += plen;
+			from_len -= plen;
+			continue;
+		}
+		{
+			bool		found = false;
+			Size		off = (i == step->u.func.like.like_npieces - 1 &&
+							 step->u.func.like.like_end_anchored) ? maxstart : 0;
+
+			for (;;)
+			{
+				const char *h = memchr(from + off, pd[0], maxstart - off + 1);
+
+				if (h == NULL)
+					break;
+				if (plen == 1 || memcmp(h, pd, plen) == 0)
+				{
+					from = h + plen;
+					from_len = (data + len) - from;
+					found = true;
+					break;
+				}
+				off = (Size) (h - from) + 1;
+				if (off > maxstart)
+					break;
+			}
+			if (!found)
+				return false;
+		}
+	}
+	return true;
+}
+
 static void
 eval_compare_packed_int2(VectorExprStep *step, int32 *selection, int nselected)
 {
@@ -2661,6 +2818,47 @@ eval_compare(VectorExprStep *step, int32 *selection, int nselected)
 				pg_unreachable();
 		}
 		value_set(&step->value, row, BoolGetDatum(result), false);
+	}
+}
+
+static void
+eval_like_step(VectorExprStep *step, int32 *selection, int nselected)
+{
+	VectorValue *str = &step->args[0]->value;
+	FunctionCallInfo fcinfo = step->u.func.fcinfo;
+	int			pos;
+
+	for (pos = 0; pos < nselected; pos++)
+	{
+		int			row = selection[pos];
+		struct varlena *v;
+		bool		match;
+
+		if (value_is_null(&step->args[0]->value, row) ||
+			value_is_null(&step->args[1]->value, row))
+		{
+			value_set(&step->value, row, (Datum) 0, true);
+			continue;
+		}
+		v = (struct varlena *) DatumGetPointer(str->values[row]);
+		if (!VARATT_IS_EXTERNAL(v) && !VARATT_IS_COMPRESSED(v))
+		{
+			match = like_pieces_match(step, VARDATA_ANY(v),
+									  VARSIZE_ANY_EXHDR(v));
+			if (step->u.func.like.like_negate)
+				match = !match;
+			value_set(&step->value, row, BoolGetDatum(match), false);
+			continue;
+		}
+		/* rest: an external or compressed value - the matcher decides */
+		fcinfo->args[0].value = str->values[row];
+		fcinfo->args[0].isnull = false;
+		fcinfo->args[1].value = step->args[1]->value.values[row];
+		fcinfo->args[1].isnull = false;
+		fcinfo->isnull = false;
+		value_set(&step->value, row,
+				  BoolGetDatum(DatumGetBool(step->u.func.fn.fn_addr(fcinfo))),
+				  fcinfo->isnull);
 	}
 }
 
@@ -3542,6 +3740,11 @@ eval_func(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 	if (step->u.func.arithmetic != VEC_ARITHMETIC_NONE)
 	{
 		eval_arithmetic(step, batch, selection, nselected);
+		return;
+	}
+	if (step->u.func.like.like_simple)
+	{
+		eval_like_step(step, selection, nselected);
 		return;
 	}
 

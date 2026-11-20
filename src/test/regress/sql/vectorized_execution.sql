@@ -1334,6 +1334,43 @@ SELECT count(*) FROM vector_in_set WHERE tbig IN ('big1','big5');
 SELECT count(*) FROM vector_in_set WHERE tbig IN (repeat('x',3000));
 RESET gp_vectorized_execution;
 DROP TABLE vector_in_set;
+-- ---- LIKE over constant patterns ----
+-- Patterns of literals and % compile into ordered pieces matched by
+-- memchr/memcmp; patterns with _ or an escape character, dynamic
+-- patterns, and nondeterministic collations stay on the generic matcher.
+CREATE TABLE vector_like (t text, c bpchar(12), v text)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (t);
+INSERT INTO vector_like
+SELECT CASE WHEN i % 11 = 0 THEN NULL
+            WHEN i % 7 = 0 THEN ''
+            WHEN i % 5 = 0 THEN 'express requests are carefully express'
+            WHEN i % 3 = 0 THEN 'Customer#XComplaints'
+            ELSE 'ord' || (i % 13) || 'x' || (i % 17) || 'final' END,
+       CASE WHEN i % 4 = 0 THEN NULL ELSE 'BC' || (i % 6) END,
+       CASE WHEN i % 8 = 0 THEN repeat('y', 2500) ELSE 'va' || (i % 9) || 'l' END
+FROM generate_series(1, 9000) AS i;
+ANALYZE vector_like;
+SET gp_vectorized_execution = force;
+SELECT count(*) FROM vector_like WHERE t LIKE '%express%';
+SELECT count(*) FROM vector_like WHERE t NOT LIKE '%express%';
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord%';
+SELECT count(*) FROM vector_like WHERE t LIKE '%final';
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord%x%final';
+SELECT count(*) FROM vector_like WHERE t LIKE '%';
+SELECT count(*) FROM vector_like WHERE t LIKE '';
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord1x2final';
+SELECT count(*) FROM vector_like WHERE t LIKE '%Customer%Complaints%';
+SELECT count(*) FROM vector_like WHERE t LIKE '%express%express';
+SELECT count(*) FROM vector_like WHERE t LIKE 'exp_ress%';
+SELECT count(*) FROM vector_like WHERE t LIKE 'exp\%ress%';
+SELECT count(*) FROM vector_like WHERE c LIKE 'BC1%';
+SELECT count(*) FROM vector_like WHERE c NOT LIKE 'BC1%';
+SELECT count(*) FROM vector_like WHERE v LIKE 'va3%';
+SELECT count(*) FROM vector_like WHERE v LIKE '%y%';
+SELECT count(*) FROM vector_like WHERE t IS NOT NULL AND t LIKE '%' || 'express' || '%';
+RESET gp_vectorized_execution;
+DROP TABLE vector_like;
 -- ---- Nested Loop prefetch rescan over a scan-root region ----
 -- A motion below the join sets prefetch_inner: the NL fetches one inner row
 -- under a fake outer and rescans immediately.  A scan-root vector region
