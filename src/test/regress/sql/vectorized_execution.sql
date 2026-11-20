@@ -27,6 +27,7 @@ DROP TABLE IF EXISTS vector_copy_from2;
 DROP TABLE IF EXISTS vector_copy_sreh;
 DROP TABLE IF EXISTS vector_copy_sreh2;
 DROP TABLE IF EXISTS vector_copy_csv;
+DROP TABLE IF EXISTS vector_nl_prefetch;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1221,6 +1222,26 @@ DROP TABLE vector_numeric_batch_test;
 DROP TABLE vector_numeric_wide_test;
 DROP TABLE vector_arithmetic_test;
 DROP TABLE vector_rle_test;
+-- ---- Nested Loop prefetch rescan over a scan-root region ----
+-- A motion below the join sets prefetch_inner: the NL fetches one inner row
+-- under a fake outer and rescans immediately.  A scan-root vector region
+-- must rewind its scan on rescan, not drop the rest of the current batch.
+CREATE TABLE vector_nl_prefetch (a int, v numeric(12,2))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO vector_nl_prefetch
+SELECT i, (i % 1000)::numeric(12,2) FROM generate_series(1, 50000) AS i;
+ANALYZE vector_nl_prefetch;
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT (a % 7) AS g, count(*) FROM vector_nl_prefetch
+WHERE (a % 5) <> 0 AND v > (SELECT avg(v) FROM vector_nl_prefetch)
+GROUP BY g ORDER BY g;
+SELECT (a % 7) AS g, count(*) FROM vector_nl_prefetch
+WHERE (a % 5) <> 0 AND v > (SELECT avg(v) FROM vector_nl_prefetch)
+GROUP BY g ORDER BY g;
+RESET gp_vectorized_execution;
+DROP TABLE vector_nl_prefetch;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
 DROP TABLE vector_part_test CASCADE;
