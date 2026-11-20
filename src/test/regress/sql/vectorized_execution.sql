@@ -1299,6 +1299,41 @@ SELECT count(*) FROM vector_hj_text a JOIN vector_hj_text b ON a.b = b.b;
 SELECT count(*) FROM vector_hj_text a LEFT JOIN vector_hj_text b ON a.v = b.v WHERE a.k < 0;
 RESET gp_vectorized_execution;
 DROP TABLE vector_hj_text;
+-- ---- IN lists over constant sets ----
+-- ScalarArrayOp with a constant array compares by bits: integer-family
+-- words against a sorted unique set, text/bpchar elements unpacked once
+-- (bpchar trimmed); NULL elements keep the three-valued semantics, and
+-- external/compressed values fall back to the per-element function calls.
+CREATE TABLE vector_in_set (i2 int2, i4 int4, i8 int8, b bool, d date,
+                            t text, v varchar(20), c bpchar(10), tbig text)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (i4);
+INSERT INTO vector_in_set
+SELECT (i % 50)::int2, i % 100, (i % 70)::int8, (i % 2 = 0),
+       date '2020-01-01' + (i % 40),
+       CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN '' ELSE 't' || (i % 9) END,
+       CASE WHEN i % 4 = 0 THEN NULL ELSE 'v' || (i % 11) END,
+       CASE WHEN i % 6 = 0 THEN NULL ELSE 'BP' || (i % 8) END,
+       CASE WHEN i % 8 = 0 THEN repeat('x', 3000) ELSE 'big' || (i % 6) END
+FROM generate_series(1, 9000) AS i;
+ANALYZE vector_in_set;
+SET gp_vectorized_execution = force;
+SELECT count(*) FROM vector_in_set WHERE i4 IN (1,2,3,99,100,50,49,48,47,46,45,44,43,42,41,40,39,38);
+SELECT count(*) FROM vector_in_set WHERE i4 NOT IN (1,2,3);
+SELECT count(*) FROM vector_in_set WHERE i2 IN (1::int2,2::int2,49::int2);
+SELECT count(*) FROM vector_in_set WHERE i8 IN (1::int8,69::int8);
+SELECT count(*) FROM vector_in_set WHERE b IN (true,false);
+SELECT count(*) FROM vector_in_set WHERE d IN (date '2020-01-02', date '2020-02-05');
+SELECT count(*) FROM vector_in_set WHERE t IN ('t1','t2');
+SELECT count(*) FROM vector_in_set WHERE t NOT IN ('t1','t2');
+SELECT count(*) FROM vector_in_set WHERE v IN ('v1',NULL,'v2');
+SELECT count(*) FROM vector_in_set WHERE v NOT IN ('v1',NULL,'v2');
+SELECT count(*) FROM vector_in_set WHERE c IN ('BP1','BP7   ');
+SELECT count(*) FROM vector_in_set WHERE c NOT IN ('BP1');
+SELECT count(*) FROM vector_in_set WHERE tbig IN ('big1','big5');
+SELECT count(*) FROM vector_in_set WHERE tbig IN (repeat('x',3000));
+RESET gp_vectorized_execution;
+DROP TABLE vector_in_set;
 -- ---- Nested Loop prefetch rescan over a scan-root region ----
 -- A motion below the join sets prefetch_inner: the NL fetches one inner row
 -- under a fake outer and rescans immediately.  A scan-root vector region

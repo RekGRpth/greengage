@@ -168,6 +168,13 @@ typedef enum VectorArithmeticOp
 	VEC_ARITHMETIC_FLOAT4_DIV
 } VectorArithmeticOp;
 
+typedef enum VectorSetOpKind
+{
+	VEC_SET_NONE = 0,
+	VEC_SET_INT,			/* constant set of integer-family words */
+	VEC_SET_TEXT			/* constant set of text/bpchar byte strings */
+} VectorSetOpKind;
+
 typedef struct VectorValue
 {
 	Oid			typid;
@@ -238,6 +245,24 @@ typedef struct VectorExprStep
 			char		typalign;
 			bool		const_array;
 			bool		useOr;		/* = ANY when set, <> ALL otherwise */
+			/*
+			 * Constant-set fast path: non-null elements hoisted at compile
+			 * time into a sorted int64 array (VEC_SET_INT) or an array of
+			 * byte strings with bpchar elements already trimmed
+			 * (VEC_SET_TEXT); set_anynull records that a NULL element was
+			 * seen, which the decision logic needs for the three-valued
+			 * semantics.
+			 */
+			int			set_kind;
+			int64	   *set_i64;	/* sorted, unique */
+			struct
+			{
+				const char *data;
+				int			len;
+			}		   *set_text;
+			int			set_n;	/* entries in set_i64 or set_text */
+			bool		set_anynull;
+			bool		set_bpchar;
 		}			saop;
 		struct
 		{
@@ -1011,6 +1036,21 @@ vector_arithmetic_op(Oid functionid)
 }
 
 /*
+ * True when the collation's equality is bitwise, i.e. the collation is
+ * deterministic (the branch texteq/bpchareq and this file's text fast
+ * paths take).  An invalid collation is not: the function raises that
+ * error itself.
+ */
+static bool
+vector_collation_deterministic(Oid collation)
+{
+	return OidIsValid(collation) &&
+		(lc_collate_is_c(collation) ||
+		 collation == DEFAULT_COLLATION_OID ||
+		 pg_newlocale_from_collation(collation)->deterministic);
+}
+
+/*
  * Set up the text/bpchar equality fast path for a compare step.
  *
  * texteq/textne and bpchareq/bpcharne compare bits, not collation order,
@@ -1036,10 +1076,7 @@ setup_text_compare(VectorExprStep *step, Oid collation)
 	step->u.func.textcmp.const_data = NULL;
 	step->u.func.textcmp.const_len = 0;
 
-	if (!OidIsValid(collation) ||
-		!(lc_collate_is_c(collation) ||
-		  collation == DEFAULT_COLLATION_OID ||
-		  pg_newlocale_from_collation(collation)->deterministic))
+	if (!vector_collation_deterministic(collation))
 	{
 		step->u.func.compare = VEC_COMPARE_NONE;
 		return;
@@ -1067,6 +1104,165 @@ setup_text_compare(VectorExprStep *step, Oid collation)
 		step->u.func.textcmp.const_len = (int) len;
 		break;
 	}
+}
+
+static int
+cmp_i64(const void *a, const void *b)
+{
+	int64		la = *(const int64 *) a;
+	int64		lb = *(const int64 *) b;
+
+	return (la > lb) - (la < lb);
+}
+
+/*
+ * Set up the constant-set fast path for a ScalarArrayOp step: IN (...)
+ * and NOT IN (...) over a constant array whose elements can be compared
+ * by their bits under a deterministic collation.  Integer-family words
+ * widen into a sorted unique int64 array; text/bpchar elements are
+ * unpacked once, bpchar elements trimmed the way bcTruelen does.  NULL
+ * elements are not stored: only set_anynull records them, which is all
+ * the three-valued decision needs (a decisive element settles the row
+ * regardless of NULLs, an undecided row with a NULL element is NULL).
+ * Anything else leaves the step on the generic per-element call path.
+ */
+static void
+setup_saop_set(VectorExprStep *step, Oid elemtype, Oid collation, Oid opfuncid)
+{
+	int			nelems = step->u.saop.nelems;
+	int			n = 0;
+	int			i;
+
+	step->u.saop.set_kind = VEC_SET_NONE;
+	step->u.saop.set_i64 = NULL;
+	step->u.saop.set_text = NULL;
+	step->u.saop.set_n = 0;
+	step->u.saop.set_anynull = false;
+	step->u.saop.set_bpchar = false;
+
+	if (!step->u.saop.const_array || nelems == 0)
+		return;
+
+	for (i = 0; i < nelems; i++)
+		if (step->u.saop.elem_nulls[i])
+			step->u.saop.set_anynull = true;
+
+	switch (elemtype)
+	{
+		case INT2OID:
+			if (opfuncid != F_INT2EQ)
+				return;
+			break;
+		case INT4OID:
+			if (opfuncid != F_INT4EQ)
+				return;
+			break;
+		case INT8OID:
+			if (opfuncid != F_INT8EQ)
+				return;
+			break;
+		case BOOLOID:
+			if (opfuncid != F_BOOLEQ)
+				return;
+			break;
+		case DATEOID:
+			if (opfuncid != F_DATE_EQ)
+				return;
+			break;
+		case TIMESTAMPOID:
+			if (opfuncid != 2052 /* timestamp_eq */ )
+				return;
+			break;
+		case TIMESTAMPTZOID:
+			if (opfuncid != F_TIMESTAMP_EQ /* timestamptz_eq */ )
+				return;
+			break;
+		case TEXTOID:
+		case VARCHAROID:
+			if (opfuncid != F_TEXTEQ ||
+				!vector_collation_deterministic(collation))
+				return;
+			break;
+		case BPCHAROID:
+			if (opfuncid != F_BPCHAREQ ||
+				!vector_collation_deterministic(collation))
+				return;
+			step->u.saop.set_bpchar = true;
+			break;
+		default:
+			return;
+	}
+
+	if (elemtype == TEXTOID || elemtype == VARCHAROID || elemtype == BPCHAROID)
+	{
+		step->u.saop.set_text =
+			(void *) palloc(sizeof(*step->u.saop.set_text) *
+							Max(nelems, 1));
+		for (i = 0; i < nelems; i++)
+		{
+			struct varlena *v;
+			Size		len;
+			char	   *data;
+
+			if (step->u.saop.elem_nulls[i])
+				continue;
+			v = (struct varlena *) DatumGetPointer(step->u.saop.elems[i]);
+			if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))
+				v = pg_detoast_datum(v);
+			len = VARSIZE_ANY_EXHDR(v);
+			data = VARDATA_ANY(v);
+			if (step->u.saop.set_bpchar)
+				while (len > 0 && data[len - 1] == ' ')
+					len--;
+			step->u.saop.set_text[n].data = data;
+			step->u.saop.set_text[n].len = (int) len;
+			n++;
+		}
+		step->u.saop.set_n = n;
+		step->u.saop.set_kind = VEC_SET_TEXT;
+		return;
+	}
+
+	step->u.saop.set_i64 = (int64 *) palloc(sizeof(int64) * Max(nelems, 1));
+	for (i = 0; i < nelems; i++)
+	{
+		Datum		d;
+
+		if (step->u.saop.elem_nulls[i])
+			continue;
+		d = step->u.saop.elems[i];
+		switch (elemtype)
+		{
+			case INT2OID:
+				step->u.saop.set_i64[n] = DatumGetInt16(d);
+				break;
+			case INT4OID:
+				step->u.saop.set_i64[n] = DatumGetInt32(d);
+				break;
+			case BOOLOID:
+				step->u.saop.set_i64[n] = DatumGetBool(d) ? 1 : 0;
+				break;
+			case DATEOID:
+				step->u.saop.set_i64[n] = DatumGetDateADT(d);
+				break;
+			default:	/* int8, timestamp, timestamptz */
+				step->u.saop.set_i64[n] = DatumGetInt64(d);
+				break;
+		}
+		n++;
+	}
+	qsort(step->u.saop.set_i64, n, sizeof(int64), cmp_i64);
+	/* drop duplicates in place */
+	if (n > 0)
+	{
+		int			w = 1;
+
+		for (i = 1; i < n; i++)
+			if (step->u.saop.set_i64[i] != step->u.saop.set_i64[w - 1])
+				step->u.saop.set_i64[w++] = step->u.saop.set_i64[i];
+		step->u.saop.set_n = w;
+	}
+	step->u.saop.set_kind = VEC_SET_INT;
 }
 
 static VectorExprStep *
@@ -1344,10 +1540,13 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->u.saop.typalign = elemalign;
 				step->u.saop.const_array = IsA(array_expr, Const);
 				if (IsA(array_expr, Const) && !((Const *) array_expr)->constisnull)
+				{
 					deconstruct_array(DatumGetArrayTypeP(((Const *) array_expr)->constvalue),
 									  elemtype, elmlen, elembyval, elemalign,
 									  &step->u.saop.elems, &step->u.saop.elem_nulls,
 									  &step->u.saop.nelems);
+					setup_saop_set(step, elemtype, sa->inputcollid, sa->opfuncid);
+				}
 				step->u.saop.useOr = sa->useOr;
 				fmgr_info(sa->opfuncid, &step->u.saop.fn);
 				step->u.saop.fcinfo = palloc0(SizeForFunctionCallInfo(2));
@@ -2033,6 +2232,116 @@ text_compare_eval(VectorExprStep *step, Datum ldatum, Datum rdatum)
 	step->u.func.fcinfo->args[1].isnull = false;
 	step->u.func.fcinfo->isnull = false;
 	return DatumGetBool(step->u.func.fn.fn_addr(step->u.func.fcinfo));
+}
+
+/*
+ * One constant-set SAOP row: returns true when the set path decided the
+ * row (*decided false/true, or NULL through *isnull_out).  Returns false
+ * for rows the set cannot take (external/compressed text values), leaving
+ * them to the generic per-element function calls.
+ */
+static bool
+saop_set_eval(VectorExprStep *step, VectorExprStep *arg, int row,
+			  bool *decided, bool *isnull_out)
+{
+	bool		found = false;
+	int			e;
+
+	if (step->u.saop.set_kind == VEC_SET_INT)
+	{
+		VectorValue *v = &arg->value;
+		int64		key;
+
+		switch (v->typid)
+		{
+			case INT2OID:
+				key = v->i16_values != NULL ? v->i16_values[row] :
+					DatumGetInt16(v->values[row]);
+				break;
+			case INT4OID:
+				key = v->i32_values != NULL ? v->i32_values[row] :
+					DatumGetInt32(v->values[row]);
+				break;
+			case BOOLOID:
+				key = DatumGetBool(v->values[row]) ? 1 : 0;
+				break;
+			case DATEOID:
+				key = v->i32_values != NULL ? v->i32_values[row] :
+					DatumGetDateADT(v->values[row]);
+				break;
+			default:	/* int8, timestamp, timestamptz */
+				key = DatumGetInt64(v->values[row]);
+				break;
+		}
+		if (step->u.saop.set_n <= 16)
+		{
+			for (e = 0; e < step->u.saop.set_n; e++)
+				if (step->u.saop.set_i64[e] == key)
+				{
+					found = true;
+					break;
+				}
+		}
+		else
+		{
+			int64	   *lo = step->u.saop.set_i64;
+			int64	   *hi = lo + step->u.saop.set_n;
+
+			while (hi > lo)
+			{
+				int64	   *mid = lo + (hi - lo) / 2;
+
+				if (*mid < key)
+					lo = mid + 1;
+				else if (*mid > key)
+					hi = mid;
+				else
+				{
+					found = true;
+					break;
+				}
+			}
+		}
+	}
+	else if (step->u.saop.set_kind == VEC_SET_TEXT)
+	{
+		struct varlena *v =
+			(struct varlena *) DatumGetPointer(arg->value.values[row]);
+		Size		len;
+		char	   *data;
+
+		if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))
+			return false;
+		len = VARSIZE_ANY_EXHDR(v);
+		data = VARDATA_ANY(v);
+		if (step->u.saop.set_bpchar)
+			while (len > 0 && data[len - 1] == ' ')
+				len--;
+		for (e = 0; e < step->u.saop.set_n; e++)
+			if (len == (Size) step->u.saop.set_text[e].len &&
+				(len == 0 ||
+				 memcmp(data, step->u.saop.set_text[e].data, len) == 0))
+			{
+				found = true;
+				break;
+			}
+	}
+	else
+		return false;
+
+	if (found)
+	{
+		/* a match decides = ANY true, <> ALL false */
+		*decided = step->u.saop.useOr;
+	}
+	else if (step->u.saop.set_anynull)
+	{
+		*decided = false;
+		*isnull_out = true;
+	}
+	else
+		*decided = !step->u.saop.useOr;
+	return true;
 }
 
 static void
@@ -3510,6 +3819,20 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 					{
 						value_set(&step->value, row, (Datum) 0, true);
 						continue;
+					}
+					if (step->u.saop.set_kind != VEC_SET_NONE)
+					{
+						bool		decided = false;
+						bool		isnull = false;
+
+						if (saop_set_eval(step, arg, row, &decided, &isnull))
+						{
+							value_set(&step->value, row,
+									  isnull ? (Datum) 0 : BoolGetDatum(decided),
+									  isnull);
+							continue;
+						}
+						/* rows the set cannot take fall to the element loop */
 					}
 					if (!step->u.saop.const_array)
 						deconstruct_array(DatumGetArrayTypeP(array->value.values[row]),
