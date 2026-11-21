@@ -184,7 +184,8 @@ jit_compile_expr(struct ExprState *state)
 void *
 jit_compile_vector_expr(struct VectorExprState *state)
 {
-	if (provider_init())
+	/* a provider may predate the vector-expr callback */
+	if (provider_init() && provider.compile_vector_expr)
 		return provider.compile_vector_expr(state);
 	return NULL;
 }

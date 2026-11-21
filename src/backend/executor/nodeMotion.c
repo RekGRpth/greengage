@@ -1368,7 +1368,9 @@ execMotionSenderBatch(MotionState *node)
 
 		/* the motion's output is the region's output: a column prefix */
 		if (outncols > batch->ncols)
-			break;
+			elog(ERROR,
+				 "motion batch encode: %d motion output columns exceed the batch's %d columns",
+				 outncols, batch->ncols);
 
 		MemoryContextReset(tmpcxt);
 		oldcxt = MemoryContextSwitchTo(tmpcxt);

@@ -2882,6 +2882,15 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
 	VectorColumn *col = arg->column_cache;
 
 	/*
+	 * The JIT-compiled evaluator calls this for every selected row without
+	 * the scalar loop's null pre-check; a null input carries Datum 0, which
+	 * is not decodable.  Report the row as not-fast-path and let the callers
+	 * store/fallback on the null bit.
+	 */
+	if (value_is_null(&arg->value, row))
+		return false;
+
+	/*
 	 * A deferred arithmetic child left its fast-path result decoded: the
 	 * value is mant * 10^-dscale at its display scale, exactly what the
 	 * parent needs; no Numeric was built and there is nothing to decode.
