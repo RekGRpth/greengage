@@ -1090,6 +1090,14 @@ VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 		VectorHashJoinDestroy(outer_join);
 		VectorRowLeafDestroy(region->row_leaf);
 		region->row_leaf = NULL;
+		if (region->motion_leaf != NULL)
+		{
+			if (region->motion_leaf->current != NULL)
+				VectorBatchDestroy(region->motion_leaf->current);
+			VectorBatchDestroy(region->motion_leaf->row.batch);
+			pfree(region->motion_leaf);
+			region->motion_leaf = NULL;
+		}
 	}
 	return vhj;
 }
@@ -1233,10 +1241,20 @@ VectorBuildScanNext(VectorBuildScanState *vs)
 			vs->scan->ss.ss_currentScanDesc = scandesc;
 			MemoryContextSwitchTo(oldcontext);
 		}
-		if (!aocs_getnext_batch((AOCSScanDesc) scandesc, vs->batch))
 		{
-			vs->eof = true;
-			return false;
+			bool		got;
+			Instrumentation *instr = vs->scan->ss.ps.instrument;
+
+			if (instr)
+				InstrStartNode(instr);
+			got = aocs_getnext_batch((AOCSScanDesc) scandesc, vs->batch);
+			if (instr)
+				InstrStopNode(instr, got ? (uint64) vs->batch->nrows : 0);
+			if (!got)
+			{
+				vs->eof = true;
+				return false;
+			}
 		}
 		VectorExprFilter(vs->batch, vs->qual);
 		if (vs->batch->nselected > 0)
@@ -1420,7 +1438,17 @@ VectorRegionNextScanBatch(VectorRegionState *state)
 
 			if (RelationIsAoCols(state->scan->ss.ss_currentRelation))
 			{
-				if (!aocs_getnext_batch((AOCSScanDesc) scandesc, fill))
+				bool		got;
+				Instrumentation *instr = state->scan->ss.ps.instrument;
+
+				/* the region drives the leaf directly, so ExecProcNode's
+				 * instrumentation never runs; approximate it per batch */
+				if (instr)
+					InstrStartNode(instr);
+				got = aocs_getnext_batch((AOCSScanDesc) scandesc, fill);
+				if (instr)
+					InstrStopNode(instr, got ? (uint64) fill->nrows : 0);
+				if (!got)
 				{
 					state->eof = true;
 					break;
@@ -1758,8 +1786,14 @@ VectorRegionEnd(CustomScanState *node)
 	VectorBuildScanDestroy(state->build_scan);
 	VectorRowLeafDestroy(state->row_leaf);
 	VectorRowLeafDestroy(state->build_row_leaf);
-	if (state->motion_leaf != NULL && state->motion_leaf->current != NULL)
-		VectorBatchDestroy(state->motion_leaf->current);
+	if (state->motion_leaf != NULL)
+	{
+		if (state->motion_leaf->current != NULL)
+			VectorBatchDestroy(state->motion_leaf->current);
+		VectorBatchDestroy(state->motion_leaf->row.batch);
+		pfree(state->motion_leaf);
+		state->motion_leaf = NULL;
+	}
 	if (state->proj != NULL)
 	{
 		int			col;

@@ -975,6 +975,12 @@ VectorizePlan(PlannedStmt *stmt)
 	ctx.stmt = stmt;
 	ctx.next_plan_node_id = 1;
 	max_plan_node_id_walker((Node *) stmt->planTree, &ctx);
+	/*
+	 * set_plan_references assigns ids from one shared counter, main tree
+	 * first and subplans after, so subplan ids start right where the main
+	 * tree ends; regions must not reuse them.
+	 */
+	max_plan_node_id_walker((Node *) stmt->subplans, &ctx);
 
 	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_AUTO)
 	{

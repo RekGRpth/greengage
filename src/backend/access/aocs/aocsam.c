@@ -1871,6 +1871,19 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 				   firstRowNum + nthStart - 1);
 	}
 
+	/*
+	 * The fill below consumes the current block of every projected column;
+	 * account the reads exactly like the per-row and plain batch paths.
+	 */
+	for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
+	{
+		AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
+
+		AOCSScanDesc_UpdateTotalBytesRead(scan, attno);
+		pgstat_count_buffer_read_ao(scan->rs_base.rs_rd,
+									RelationGuessNumberOfBlocksFromSize(scan->totalBytesRead));
+	}
+
 	for (i = 0; i < scan->columnScanInfo.num_proj_atts; i++)
 	{
 		AttrNumber	attno = scan->columnScanInfo.proj_atts[i];
