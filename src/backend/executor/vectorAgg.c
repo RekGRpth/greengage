@@ -989,7 +989,12 @@ fast_convert(VectorAggState *state)
 		if (entry != NULL && isnew)
 			entry->additional = &t->states[(Size) i * t->ntrans];
 	}
-	agg->hash_ngroups_current += t->nentries;
+	/*
+	 * The groups were already counted in hash_ngroups_current when the fast
+	 * table created them (VectorAggInitPergroup mirrors
+	 * initialize_hash_entry); counting nentries here as well would double
+	 * the group count and skew the spill-partition sizing.
+	 */
 	t->converted = true;
 	t->mem_used -= sizeof(uint32) * t->nbuckets;
 	pfree(t->buckets);
@@ -1496,15 +1501,26 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			pergroupstate->transValueIsNull = false;
 			return true;
 		case VEC_AGG_SUM_FLOAT4:
+			/*
+			 * sum(float4) has transtype float4 and no finalfn: the
+			 * accumulation must round to float4 on every step, exactly like
+			 * float4pl, and the transition value must be a float4 datum.
+			 */
+			if (pergroupstate->noTransValue)
+				pergroupstate->transValue = Float4GetDatum(DatumGetFloat4(value));
+			else
+				pergroupstate->transValue = Float4GetDatum(float4_pl(
+					DatumGetFloat4(pergroupstate->transValue),
+					DatumGetFloat4(value)));
+			pergroupstate->noTransValue = false;
+			pergroupstate->transValueIsNull = false;
+			return true;
 		case VEC_AGG_SUM_FLOAT8:
 			if (pergroupstate->noTransValue)
-				pergroupstate->transValue = pertrans->aggref->aggfnoid == VEC_AGG_SUM_FLOAT4 ?
-					Float8GetDatum((float8) DatumGetFloat4(value)) : value;
+				pergroupstate->transValue = value;
 			else
 				pergroupstate->transValue = Float8GetDatum(
-					DatumGetFloat8(pergroupstate->transValue) +
-					(pertrans->aggref->aggfnoid == VEC_AGG_SUM_FLOAT4 ?
-					 (float8) DatumGetFloat4(value) : DatumGetFloat8(value)));
+					DatumGetFloat8(pergroupstate->transValue) + DatumGetFloat8(value));
 			pergroupstate->noTransValue = false;
 			pergroupstate->transValueIsNull = false;
 			return true;
@@ -1689,11 +1705,12 @@ advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 			{
 				float4		input = packed_float4(value);
 
+				/* transtype is float4: round on every step like float4pl */
 				if (pergroupstate->noTransValue)
-					pergroupstate->transValue = Float8GetDatum((float8) input);
+					pergroupstate->transValue = Float4GetDatum(input);
 				else
-					pergroupstate->transValue = Float8GetDatum(
-						DatumGetFloat8(pergroupstate->transValue) + (float8) input);
+					pergroupstate->transValue = Float4GetDatum(float4_pl(
+						DatumGetFloat4(pergroupstate->transValue), input));
 				pergroupstate->noTransValue = false;
 				pergroupstate->transValueIsNull = false;
 				break;

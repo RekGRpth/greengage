@@ -2478,6 +2478,14 @@ like_pieces_match(VectorExprStep *step, const char *data, Size len)
 				return false;
 			from += plen;
 			from_len -= plen;
+			/*
+			 * A single start-and-end anchored piece is an equality test:
+			 * the value must end where the piece ends, which the
+			 * end-anchored search below never gets to check for i == 0.
+			 */
+			if (i == step->u.func.like.like_npieces - 1 &&
+				step->u.func.like.like_end_anchored && from_len != 0)
+				return false;
 			continue;
 		}
 		{

@@ -805,6 +805,35 @@ VectorSortFallback(VectorSortState *state)
 	state->native = false;
 }
 
+/*
+ * A packed column compares as a raw integer, so a sort key on one may only
+ * use the type's default ordering operators; a custom opclass with
+ * different semantics keeps the column in the datum layout, where the
+ * SortSupport comparator decides.
+ */
+static bool
+vector_sort_packable_key(Sort *sort, int col, Oid typid)
+{
+	Oid			op = InvalidOid;
+	int			key;
+
+	if (typid != INT2OID && typid != INT4OID &&
+		typid != DATEOID && typid != FLOAT4OID)
+		return false;
+	for (key = 0; key < sort->numCols; key++)
+		if (sort->sortColIdx[key] - 1 == col)
+			op = sort->sortOperators[key];
+	if (op == InvalidOid)
+		return true;		/* not a sort key: never compared packed */
+	if (typid == INT2OID)
+		return op == 95 || op == 520;	/* int2lt, int2gt */
+	if (typid == INT4OID)
+		return op == 97 || op == 521;	/* int4lt, int4gt */
+	if (typid == FLOAT4OID)
+		return op == 622 || op == 623;	/* float4lt, float4gt */
+	return op == 1095 || op == 1097;	/* date_lt, date_gt */
+}
+
 static void
 VectorSortGrow(VectorSortState *state)
 {
@@ -823,13 +852,16 @@ VectorSortGrow(VectorSortState *state)
 	{
 		VectorSortColumn *column = &state->columns[col];
 		Size		nullsize = sizeof(uint64) * VECTOR_BATCH_NULLWORDS(new_capacity);
+		Sort	   *sort = (Sort *) state->node->ss.ps.plan;
+		bool		packable = vector_sort_packable_key(sort, col,
+														   column->typid);
 
 		if (column->values == NULL && column->i32_values == NULL &&
 			column->i16_values == NULL)
 		{
-			if (state->packed_i32 && column->typid == INT2OID)
+			if (state->packed_i32 && packable && column->typid == INT2OID)
 				column->i16_values = palloc0(sizeof(int16) * new_capacity);
-			else if (state->packed_i32 &&
+			else if (state->packed_i32 && packable &&
 					 (column->typid == INT4OID || column->typid == DATEOID ||
 					  column->typid == FLOAT4OID))
 				column->i32_values = palloc0(sizeof(int32) * new_capacity);

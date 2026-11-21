@@ -449,6 +449,36 @@ SELECT a FROM vector_arithmetic_test ORDER BY a DESC NULLS LAST;
 SELECT s FROM vector_arithmetic_test ORDER BY s DESC NULLS LAST;
 SELECT f4 FROM vector_float_test ORDER BY f4 DESC NULLS LAST;
 SELECT d FROM vector_time_test ORDER BY d DESC NULLS LAST;
+-- A custom btree opclass on a packed type keeps its own ordering: with a
+-- non-default ordering operator the column leaves the packed layout, and
+-- the SortSupport comparator decides.
+CREATE FUNCTION vector_int4_rev_cmp(int4, int4) RETURNS int4
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END $$;
+CREATE OPERATOR <<< (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4gt);
+CREATE OPERATOR <<= (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4ge);
+CREATE OPERATOR >>= (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4le);
+CREATE OPERATOR >>> (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4lt);
+CREATE OPERATOR CLASS vector_int4_rev_ops FOR TYPE int4 USING btree AS
+	OPERATOR 1 <<<,
+	OPERATOR 2 <<=,
+	OPERATOR 3 =,
+	OPERATOR 4 >>=,
+	OPERATOR 5 >>>,
+	FUNCTION 1 vector_int4_rev_cmp(int4, int4);
+CREATE TABLE vector_rev_sort (a int4, k int4)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (k);
+INSERT INTO vector_rev_sort SELECT g, 1 FROM generate_series(1, 50) g;
+SET gp_vectorized_execution = force;
+SELECT a FROM vector_rev_sort ORDER BY a USING <<< NULLS LAST LIMIT 5;
+SET gp_vectorized_execution = force;
+DROP TABLE vector_rev_sort;
+DROP OPERATOR CLASS vector_int4_rev_ops USING btree;
+DROP OPERATOR <<< (int4, int4);
+DROP OPERATOR <<= (int4, int4);
+DROP OPERATOR >>= (int4, int4);
+DROP OPERATOR >>> (int4, int4);
+DROP FUNCTION vector_int4_rev_cmp(int4, int4);
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
 SELECT var_pop(id::int2), var_samp(id::int2), stddev(id::int2),
        stddev_pop(id::int2), stddev_samp(id::int2)
@@ -501,6 +531,25 @@ SELECT sum(f4 * 2), min(f4), max(f4) FROM vector_float_test
 WHERE f4 > 0.0 AND f4 < 'Infinity';
 SELECT f4, min(f4), max(f4) FROM vector_float_test
 GROUP BY f4 ORDER BY f4 NULLS LAST;
+-- sum(float4) has transtype float4 and no finalfn: every accumulation
+-- step must round to float4 the way float4pl does, not accumulate in
+-- float8 and truncate at the end.
+CREATE TABLE vector_f4sum (x float4, k int4)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (k);
+INSERT INTO vector_f4sum VALUES (16777216.0, 1);
+INSERT INTO vector_f4sum VALUES (1.0, 1);
+INSERT INTO vector_f4sum VALUES (1.0, 1);
+INSERT INTO vector_f4sum VALUES (2.5, 1);
+INSERT INTO vector_f4sum VALUES (-0.5, 1);
+SET gp_vectorized_execution = force;
+SELECT sum(x) FROM vector_f4sum;
+SELECT sum(x * 2) FROM vector_f4sum;
+SELECT sum(x) FROM vector_f4sum WHERE x > 100;
+SET gp_vectorized_execution = off;
+SELECT sum(x) FROM vector_f4sum;
+SELECT sum(x * 2) FROM vector_f4sum;
+SELECT sum(x) FROM vector_f4sum WHERE x > 100;
+SET gp_vectorized_execution = force;
 SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
 SELECT f4 / 0 FROM vector_float_test WHERE id = 4;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
@@ -1452,6 +1501,12 @@ SELECT count(*) FROM vector_like WHERE t LIKE 'ord%x%final';
 SELECT count(*) FROM vector_like WHERE t LIKE '%';
 SELECT count(*) FROM vector_like WHERE t LIKE '';
 SELECT count(*) FROM vector_like WHERE t LIKE 'ord1x2final';
+-- literal patterns without % are equality tests: a proper prefix of an
+-- existing value must not match
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord1x2fina';
+SELECT count(*) FROM vector_like WHERE t NOT LIKE 'ord1x2fina';
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord';
+SELECT count(*) FROM vector_like WHERE v LIKE 'va3';
 SELECT count(*) FROM vector_like WHERE t LIKE '%Customer%Complaints%';
 SELECT count(*) FROM vector_like WHERE t LIKE '%express%express';
 SELECT count(*) FROM vector_like WHERE t LIKE 'exp_ress%';
@@ -1499,3 +1554,4 @@ DROP TABLE vector_copy_numeric;
 DROP TABLE vector_copy_bin;
 DROP TABLE vector_copy_fn;
 DROP TABLE vector_copy_fn2;
+DROP TABLE vector_f4sum;
