@@ -446,6 +446,18 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 
 		if (kind == 0)
 		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, col);
+
+			/*
+			 * Fixed-width values land in a Datum; the wire typlen must match
+			 * the attribute and fit the slot, or a malformed chunk would
+			 * overflow the stack buffer.
+			 */
+			if (typlen <= 0 || typlen > (int16) sizeof(Datum) ||
+				typlen != attr->attlen)
+				elog(ERROR,
+					 "corrupt vector batch chunk: typlen %d for column %d (attlen %d)",
+					 typlen, col, (int) attr->attlen);
 			if (p + (size_t) nrows * typlen > end)
 				elog(ERROR, "malformed vector batch chunk");
 			for (row = 0; row < nrows; row++)

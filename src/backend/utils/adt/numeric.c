@@ -6386,6 +6386,10 @@ init_var_from_datum(Datum value, NumericVar *dest)
 	else
 		return false;
 
+	/* a truncated payload cannot carry even the sign header */
+	if (len < (int32) sizeof(uint16))
+		return false;
+
 	memcpy(&header, data, sizeof(uint16));
 	dest->buf = dest->ndb;
 	if ((header & NUMERIC_SIGN_MASK) == NUMERIC_SHORT)

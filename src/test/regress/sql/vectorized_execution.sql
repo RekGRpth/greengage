@@ -1345,6 +1345,22 @@ plain,"plain",dist
 SET gp_vectorized_execution = off;
 COPY vector_copy_fn TO STDOUT WITH (DELIMITER '|');
 COPY vector_copy_fn2 TO STDOUT WITH (DELIMITER '|');
+SET gp_vectorized_execution = force;
+-- ---- vectorized COPY FROM: fast numeric builder overflow falls back ----
+-- A mantissa that fits the int64 accumulator can still overflow the
+-- display-scale padding of the fast numeric builder; such fields keep
+-- their full precision through the regular input function.
+CREATE TABLE vector_copy_numovf (n numeric, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_numovf VALUES ('0', 'dist');
+COPY vector_copy_numovf FROM STDIN WITH (DELIMITER '|');
+1234567890123456.7|dist
+42.5|dist
+\.
+SET gp_vectorized_execution = off;
+COPY (SELECT n, v_dist FROM vector_copy_numovf ORDER BY n) TO STDOUT WITH (DELIMITER '|');
+SET gp_vectorized_execution = force;
+COPY (SELECT n, v_dist FROM vector_copy_numovf ORDER BY n) TO STDOUT WITH (DELIMITER '|');
 RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
@@ -1554,4 +1570,5 @@ DROP TABLE vector_copy_numeric;
 DROP TABLE vector_copy_bin;
 DROP TABLE vector_copy_fn;
 DROP TABLE vector_copy_fn2;
+DROP TABLE vector_copy_numovf;
 DROP TABLE vector_f4sum;

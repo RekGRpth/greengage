@@ -605,6 +605,32 @@ find_output_aggref(Plan *plan, int attno, Plan **child)
 }
 
 /*
+ * An aggregate is memory-intensive when it computes an ordered aggregate
+ * (IsAggMemoryIntensive in memquota.c); the same condition re-checked for
+ * the wrapper so a vectorized region keeps the replaced node's class.
+ */
+static bool
+vectorize_ordered_agg_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *aggref = (Aggref *) node;
+
+		if (aggref->aggorder || aggref->aggdistinct)
+			return true;
+	}
+	return expression_tree_walker(node, vectorize_ordered_agg_walker, context);
+}
+
+static bool
+vectorize_has_ordered_aggs(Node *node)
+{
+	return vectorize_ordered_agg_walker(node, NULL);
+}
+
+/*
  * Build a scan-only region.  The original SeqScan remains a custom child so
  * executor initialization keeps its relation lock and EXPLAIN shows the leaf.
  */
@@ -698,9 +724,26 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.extParam = root->extParam;
 	cs->scan.plan.allParam = root->allParam;
 	cs->scan.plan.operatorMemKB = memory_quota_kb(root);
-	if ((IsA(root, Agg) && ((Agg *) root)->aggstrategy == AGG_HASHED) ||
-		IsA(root, HashJoin) || IsA(root, Sort) || IsA(root, Unique) ||
-		IsA(root, MergeJoin) || IsA(root, Material))
+	/*
+	 * Carry the replaced node's blocking/memory-intensive classification
+	 * onto the wrapper, mirroring IsAggBlockingOperator/IsAggMemoryIntensive
+	 * in memquota.c, so the memory quota walkers see the same shape they
+	 * would without vectorization.
+	 */
+	if (IsA(root, Agg))
+	{
+		Agg	   *agg = (Agg *) root;
+
+		if (agg->aggstrategy == AGG_PLAIN ||
+			(agg->aggstrategy == AGG_HASHED && !agg->streaming))
+			cs->flags |= CUSTOMSCAN_GP_BLOCKING;
+		if (agg->aggstrategy == AGG_HASHED || agg->aggstrategy == AGG_MIXED ||
+			vectorize_has_ordered_aggs((Node *) agg->plan.targetlist) ||
+			vectorize_has_ordered_aggs((Node *) agg->plan.qual))
+			cs->flags |= CUSTOMSCAN_GP_MEMORY_INTENSIVE;
+	}
+	else if (IsA(root, HashJoin) || IsA(root, Sort) || IsA(root, Unique) ||
+			 IsA(root, MergeJoin) || IsA(root, Material))
 		cs->flags |= CUSTOMSCAN_GP_MEMORY_INTENSIVE | CUSTOMSCAN_GP_BLOCKING;
 
 	ctx->wrapped++;

@@ -6154,7 +6154,19 @@ CopyFastNumeric(const char *p, int len, Datum *out)
 		return false;
 	if (neg)
 		acc = -acc;
-	*out = PointerGetDatum(numeric_build_fast(acc, dscale));
+	/*
+	 * The display-scale padding inside numeric_build_fast can overflow for
+	 * a mantissa that fit the accumulator; let the caller fall back to the
+	 * regular numeric_in, which builds the value without the fast-path
+	 * limits.
+	 */
+	{
+		Numeric		num = numeric_build_fast(acc, dscale);
+
+		if (num == NULL)
+			return false;
+		*out = PointerGetDatum(num);
+	}
 	return true;
 }
 
