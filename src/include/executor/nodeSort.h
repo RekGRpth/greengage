@@ -41,6 +41,8 @@ extern TupleTableSlot *VectorSortNext(SortState *node);
 extern bool VectorSortNextBatch(SortState *node, struct VectorBatch *batch,
 								const int *output_attnos);
 extern void VectorSortReset(SortState *node);
+extern void VectorSortMarkPos(SortState *node);
+extern void VectorSortRestrPos(SortState *node);
 extern void VectorSortDestroy(SortState *node);
 extern TupleTableSlot *VectorSortExec(PlanState *pstate);
 

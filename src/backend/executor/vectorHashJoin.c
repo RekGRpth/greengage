@@ -317,6 +317,8 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 			return false;
 		if (v->varno == OUTER_VAR)
 		{
+			if (v->varattno > state->outer_ncols)
+				return false;
 			state->out_is_outer[out_ncols] = true;
 			state->out_src[out_ncols] = v->varattno;
 			state->out_batch_col[out_ncols] =
@@ -558,8 +560,13 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 					/*
 					 * Matched but filtered from the output.  A single-match
 					 * (SEMI) row is done; an INNER/LEFT candidate keeps the
-					 * bucket walk going, like the standard probe.
+					 * bucket walk going, like the standard probe.  The join
+					 * condition passed, so the stored tuple must be marked
+					 * matched for the fill-inner finish phase exactly like
+					 * the standard probe marks it before otherqual runs.
 					 */
+					if (state->fill_inner)
+						HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(cursor));
 					state->row_matched = true;
 					if (state->semi_join)
 						break;

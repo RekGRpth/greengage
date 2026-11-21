@@ -203,6 +203,7 @@ VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
 	memcpy(dst->selection, src->selection, sizeof(int32) * src->nrows);
 	dst->nrows = src->nrows;
 	dst->nselected = src->nselected;
+	dst->sel_identity = src->sel_identity;
 }
 
 /*

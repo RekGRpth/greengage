@@ -1912,7 +1912,7 @@ VectorRegionMarkPos(CustomScanState *node)
 	VectorRegionState *state = (VectorRegionState *) node;
 
 	if (state->sort != NULL)
-		ExecSortMarkPos(state->sort);
+		VectorSortMarkPos(state->sort);
 	else if (state->material != NULL)
 		ExecMaterialMarkPos(state->material);
 	else
@@ -1925,7 +1925,7 @@ VectorRegionRestrPos(CustomScanState *node)
 	VectorRegionState *state = (VectorRegionState *) node;
 
 	if (state->sort != NULL)
-		ExecSortRestrPos(state->sort);
+		VectorSortRestrPos(state->sort);
 	else if (state->material != NULL)
 		ExecMaterialRestrPos(state->material);
 	else

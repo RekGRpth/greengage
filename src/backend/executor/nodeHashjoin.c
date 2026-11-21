@@ -2153,7 +2153,6 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 	ExprContext *econtext = node->js.ps.ps_ExprContext;
 	HashJoinTable hashtable = node->hj_HashTable;
 	uint32		hashvalue = 0;
-	bool		have_hash = false;
 
 	/*
 	 * LASJ NOTIN with a null inner key: the join result is empty (the
@@ -2180,8 +2179,7 @@ VectorHashJoinProbeEof(HashJoinState *node, TupleTableSlot *outer, bool outer_eo
 			node->js.jointype == JOIN_LASJ_NOTIN;
 
 		econtext->ecxt_outertuple = outer;
-		if (!have_hash &&
-			!ExecHashGetHashValue(hashNode, hashtable, econtext,
+		if (!ExecHashGetHashValue(hashNode, hashtable, econtext,
 								  node->hj_OuterHashKeys, true, keep_nulls,
 								  &hashvalue, &hashkeys_null))
 			return NULL;

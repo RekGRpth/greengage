@@ -633,6 +633,7 @@ typedef struct VectorSortState
 	int64		nrows;
 	int64		capacity;
 	int64		position;
+	int64		mark_position;	/* native mark/restore cursor, -1 = none */
 	int64		mem_limit;
 	bool		native;
 	bool		packed_i32;
@@ -775,6 +776,8 @@ VectorSortFallback(VectorSortState *state)
 	int			col;
 
 	Assert(state->native);
+	if (state->mark_position >= 0)
+		elog(ERROR, "vector sort cannot spill with a mark position saved");
 	VectorSortBegin(node);
 	for (row = 0; row < state->nrows; row++)
 	{
@@ -803,6 +806,7 @@ VectorSortFallback(VectorSortState *state)
 	state->capacity = 0;
 	state->position = 0;
 	state->native = false;
+	state->mark_position = -1;
 }
 
 /*
@@ -1043,6 +1047,7 @@ VectorSortFinish(SortState *node)
 			qsort_arg(state->order, state->nrows, sizeof(int32),
 					  VectorSortCompare, state);
 		state->position = 0;
+		state->mark_position = -1;
 		node->sort_Done = true;
 		node->bounded_Done = node->bounded;
 		node->bound_Done = node->bound;
@@ -1193,6 +1198,41 @@ VectorSortReset(SortState *node)
 	state->nrows = 0;
 	state->capacity = 0;
 	state->position = 0;
+	state->mark_position = -1;
+}
+
+/*
+ * Mark/restore for a region-driven native sort: the rows are fully stored,
+ * so saving the output cursor is enough.  A non-native sort (row input or
+ * after a mid-stream fallback to tuplesort) delegates to the standard
+ * implementation, which handles tuplesortstate properly.
+ */
+void
+VectorSortMarkPos(SortState *node)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+
+	if (state != NULL && state->native)
+	{
+		state->mark_position = state->position;
+		return;
+	}
+	ExecSortMarkPos(node);
+}
+
+void
+VectorSortRestrPos(SortState *node)
+{
+	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
+
+	if (state != NULL && state->native)
+	{
+		if (state->mark_position < 0)
+			elog(ERROR, "vector sort restore without mark");
+		state->position = state->mark_position;
+		return;
+	}
+	ExecSortRestrPos(node);
 }
 
 void
