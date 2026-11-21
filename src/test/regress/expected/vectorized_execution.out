@@ -4799,6 +4799,102 @@ line2",dk
 RESET gp_vectorized_execution;
 RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
+-- ---- vectorized COPY TO: untypmod'd numeric with an exotic display scale ----
+-- The fast numeric formatter renders into a fixed buffer; display scales it
+-- cannot hold must take the exact output function instead of overrunning it.
+CREATE TABLE vector_copy_numeric (n numeric, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+-- one INSERT per row: single-row statements insert in statement order, so
+-- the AOCS row numbers (and hence the COPY TO output order) are stable
+INSERT INTO vector_copy_numeric VALUES
+('0.1000000000000000000000001', 'dist');
+INSERT INTO vector_copy_numeric VALUES
+(('-2.' || repeat('9', 30))::numeric, 'dist');
+INSERT INTO vector_copy_numeric VALUES
+(42, 'dist');
+SET gp_vectorized_execution = off;
+\copy vector_copy_numeric TO STDOUT WITH (DELIMITER '|')
+0.1000000000000000000000001|dist
+-2.999999999999999999999999999999|dist
+42|dist
+SET gp_vectorized_execution = force;
+\copy vector_copy_numeric TO STDOUT WITH (DELIMITER '|')
+0.1000000000000000000000001|dist
+-2.999999999999999999999999999999|dist
+42|dist
+RESET gp_vectorized_execution;
+-- ---- vectorized COPY TO, binary format: only the regular path may write
+-- the binary framing; off and force must produce byte-identical files ----
+CREATE TABLE vector_copy_bin (i4 int4, t text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_bin VALUES (1, 'x', 'dist'), (2, 'y', 'dist');
+SET gp_vectorized_execution = off;
+COPY vector_copy_bin TO '/tmp/vector_copy_bin.data' WITH (FORMAT binary);
+SELECT encode(pg_read_binary_file('/tmp/vector_copy_bin.data'), 'hex');
+                                                                 encode                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------
+ 5047434f50590aff0d0a00000000000000000000030000000400000001000000017800000004646973740003000000040000000200000001790000000464697374ffff
+(1 row)
+
+SET gp_vectorized_execution = force;
+COPY vector_copy_bin TO '/tmp/vector_copy_bin.data' WITH (FORMAT binary);
+SELECT encode(pg_read_binary_file('/tmp/vector_copy_bin.data'), 'hex');
+                                                                 encode                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------
+ 5047434f50590aff0d0a00000000000000000000030000000400000001000000017800000004646973740003000000040000000200000001790000000464697374ffff
+(1 row)
+
+RESET gp_vectorized_execution;
+CREATE TABLE vector_copy_bin_in (LIKE vector_copy_bin) DISTRIBUTED BY (v_dist);
+COPY vector_copy_bin_in FROM '/tmp/vector_copy_bin.data' WITH (FORMAT binary);
+SELECT i4, t FROM vector_copy_bin_in ORDER BY i4;
+ i4 | t 
+----+---
+  1 | x
+  2 | y
+(2 rows)
+
+DROP TABLE vector_copy_bin_in;
+\! rm -f /tmp/vector_copy_bin.data
+-- ---- vectorized COPY TO, CSV under a client encoding different from the
+-- database encoding: the batch formatter has no transcoder, so the regular
+-- per-attribute conversion must handle these ----
+CREATE TABLE vector_copy_enc (t text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_enc VALUES ('Ã¤Ã¶Ã¼ Ã© Ã¨', 'dist'), ('plain', 'dist');
+SET gp_vectorized_execution = off;
+\encoding LATIN1
+\copy vector_copy_enc TO STDOUT WITH (FORMAT csv)
+äöü é è,dist
+plain,dist
+\encoding UTF8
+SET gp_vectorized_execution = force;
+\encoding LATIN1
+\copy vector_copy_enc TO STDOUT WITH (FORMAT csv)
+äöü é è,dist
+plain,dist
+\encoding UTF8
+RESET gp_vectorized_execution;
+DROP TABLE vector_copy_enc;
+-- ---- vectorized COPY FROM: FORCE_NOT_NULL / FORCE_NULL rewrite null-marker
+-- matches in the regular conversion loop, which the fast parse skips ----
+CREATE TABLE vector_copy_fn (a text, b text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+CREATE TABLE vector_copy_fn2 (LIKE vector_copy_fn)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+SET gp_vectorized_execution = off;
+COPY vector_copy_fn FROM STDIN WITH (FORMAT csv, NULL 'NULL', FORCE_NOT_NULL(a), FORCE_NULL(b));
+SET gp_vectorized_execution = force;
+COPY vector_copy_fn2 FROM STDIN WITH (FORMAT csv, NULL 'NULL', FORCE_NOT_NULL(a), FORCE_NULL(b));
+-- both loads must produce byte-identical tables
+SET gp_vectorized_execution = off;
+COPY vector_copy_fn TO STDOUT WITH (DELIMITER '|');
+NULL|\N|dist
+plain|plain|dist
+COPY vector_copy_fn2 TO STDOUT WITH (DELIMITER '|');
+NULL|\N|dist
+plain|plain|dist
+RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
 DROP TABLE vector_join_l;
@@ -5290,3 +5386,7 @@ DROP TABLE vector_copy_from2;
 DROP TABLE vector_copy_sreh;
 DROP TABLE vector_copy_sreh2;
 DROP TABLE vector_copy_csv;
+DROP TABLE vector_copy_numeric;
+DROP TABLE vector_copy_bin;
+DROP TABLE vector_copy_fn;
+DROP TABLE vector_copy_fn2;

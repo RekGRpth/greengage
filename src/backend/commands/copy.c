@@ -3245,6 +3245,7 @@ CopyToBatchGate(CopyState cstate, Relation rel)
 
 	/* binary has its own framing; a missing quote option cannot be fast */
 	if (cstate->binary || cstate->quote == NULL)
+		return false;
 
 	/*
 	 * The text escaping kernel reads batch values in server encoding and
@@ -3524,6 +3525,14 @@ CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
 																	&scale, &dscale);
 					char		nbuf[MAXINT8LEN + 4];
 					int			len = 0;
+
+					/*
+					 * nbuf must hold a sign, "0." and dscale digits (3 + dscale
+					 * bytes at most); leave the exotic display scales to the
+					 * exact fmgr output path below.
+					 */
+					if (dscale > MAXINT8LEN)
+						decoded = false;
 
 					/*
 					 * The decoded mantissa covers every decimal digit of the
@@ -6172,6 +6181,13 @@ CopyFromFastGate(CopyState cstate)
 	 * path.
 	 */
 	if (cstate->convert_select_flags)
+		return false;
+
+	/*
+	 * FORCE_NOT_NULL / FORCE_NULL rewrite null-marker matches in the regular
+	 * per-field conversion loop, which the fast path skips.
+	 */
+	if (cstate->force_notnull != NIL || cstate->force_null != NIL)
 		return false;
 
 	/*

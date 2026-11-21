@@ -1853,8 +1853,26 @@ VectorRegionRescan(CustomScanState *node)
 	if (state->build_vhj != NULL)
 	{
 		VectorHashJoinReset(state->build_vhj);
-		state->build_scan->eof = false;
+		if (state->build_scan != NULL)
+			state->build_scan->eof = false;
 	}
+	if (state->motion_leaf != NULL)
+	{
+		/*
+		 * The adaptive Motion leaf must decide again on the first pull of
+		 * the re-run chain: a stale EOS decision or a handed-out batch would
+		 * make every execution after the first read an empty stream.
+		 */
+		state->motion_leaf->decided = 0;
+		if (state->motion_leaf->current != NULL)
+		{
+			VectorBatchDestroy(state->motion_leaf->current);
+			state->motion_leaf->current = NULL;
+		}
+		state->motion_leaf->row.eof = false;
+	}
+	if (state->build_row_leaf != NULL)
+		state->build_row_leaf->eof = false;
 	if (state->vagg != NULL)
 		VectorAggReset(state->vagg);
 	else if (state->vhj == NULL)

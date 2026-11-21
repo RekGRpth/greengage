@@ -281,8 +281,7 @@ UpdateMotionLayerNode(MotionLayerState *mlStates, int16 motNodeID, bool preserve
 	{
 		/* Create a tuple-store for the motion node's incoming tuples. */
 		pEntry->ready_tuples = htfifo_create();
-	pEntry->ready_batch_head = NULL;
-	pEntry->ready_batch_tail = NULL;
+		/* ready_batch_head/tail stay NULL: mnEntries is zero-allocated */
 	}
 	else
 		pEntry->ready_tuples = NULL;
