@@ -1448,8 +1448,16 @@ execMotionSenderBatch(MotionState *node)
 			ExecSquelchNode(outerNode);
 			break;
 		}
-		node->numTuplesFromChild += nrows;
-		node->numTuplesToAMS += nrows;
+		/*
+		 * Non-designated GATHER_SINGLE segments drop the batch without
+		 * sending; count only what actually enters the motion layer, like
+		 * the row path.
+		 */
+		if (designated || motion->motionType == MOTIONTYPE_HASH)
+		{
+			node->numTuplesFromChild += nrows;
+			node->numTuplesToAMS += nrows;
+		}
 
 		if (!VectorRegionPullOutputBatch(outerNode, &batch))
 			break;				/* cannot happen: pulled true once */

@@ -19,6 +19,8 @@
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
 #include "cdb/memquota.h"
+#include "utils/resgroup.h"
+#include "utils/resource_manager.h"
 #include "catalog/pg_am.h"
 #include "executor/nodeVectorRegion.h"
 #include "executor/nodeLimit.h"
@@ -986,6 +988,19 @@ VectorizePlan(PlannedStmt *stmt)
 	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_AUTO)
 	{
 		uint64		bytes = (uint64) statement_mem * 1024L;
+
+		/*
+		 * The gate below validates workset estimates against the memory
+		 * the query will actually hold: PortalStart replaces query_mem
+		 * with the resource manager grant before ExecutorStart re-runs
+		 * this very assignment.  At plan time only the fixed-mem
+		 * resource group configuration is knowable (the dynamic group
+		 * cap needs the not-yet-assigned group); a dynamically capped
+		 * group can still grant less, which the runtime spill then
+		 * handles.
+		 */
+		if (IsResGroupEnabled() && gp_resgroup_memory_query_fixed_mem > 0)
+			bytes = Min(bytes, (uint64) gp_resgroup_memory_query_fixed_mem * 1024L);
 
 		if (IsResManagerMemoryPolicyAuto())
 			PolicyAutoAssignOperatorMemoryKB(stmt, bytes);
