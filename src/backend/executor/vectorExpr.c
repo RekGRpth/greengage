@@ -4559,7 +4559,12 @@ VectorExprEvalSelection(VectorBatch *batch, VectorExprState *state,
 
 	CHECK_FOR_INTERRUPTS();
 	oldcontext = MemoryContextSwitchTo(batch->varlena_context);
-	if (state->jit_func != NULL)
+	/*
+	 * A zero count (an aggregate FILTER rejecting every row) must not
+	 * reach the compiled loop: it reads selection[0] before checking the
+	 * count, and the caller's buffer is uninitialized there.
+	 */
+	if (state->jit_func != NULL && nselected > 0)
 	{
 		state->jit_rt.expr = state;
 		state->jit_rt.batch = batch;

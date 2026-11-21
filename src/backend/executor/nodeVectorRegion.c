@@ -498,7 +498,34 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 				needs_row_reader = true;
 			if (equalTupleDescs(RelationGetDescr(firstrel),
 								RelationGetDescr(childrel), false))
-				continue;		/* identical layout: shared batch */
+			{
+				/*
+				 * Identical layout: shared batch.  A non-AO child still
+				 * gets its own row-reader deform set so it does not pay
+				 * for columns only its siblings reference.
+				 */
+				if (!RelationIsAoCols(childrel))
+				{
+					Bitmapset *attrs = NULL;
+					bool	   *read_attrs = MemoryContextAllocZero(estate->es_query_cxt,
+														   sizeof(bool) * natts);
+					int			a;
+
+					pull_varattnos((Node *) childplan->plan.targetlist,
+								   childplan->scanrelid, &attrs);
+					pull_varattnos((Node *) childplan->plan.qual,
+								   childplan->scanrelid, &attrs);
+					while ((a = bms_first_member(attrs)) > 0)
+					{
+						a += FirstLowInvalidHeapAttributeNumber;
+						if (a > 0 && a <= natts)
+							read_attrs[a - 1] = true;
+					}
+					bms_free(attrs);
+					state->append_read_attrs[i] = read_attrs;
+				}
+				continue;
+			}
 
 			remap = MemoryContextAllocZero(estate->es_query_cxt,
 										   sizeof(AttrNumber) * natts);
@@ -633,21 +660,10 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 											 sizeof(bool) * natts);
 			pull_varattnos((Node *) scan->plan.targetlist, scan->scanrelid, &attrs);
 			pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &attrs);
-			if (state->append != NULL)
-			{
-				int			i;
-
-				for (i = 1; i < state->append->as_nplans; i++)
-				{
-					SeqScanState *childscan = (SeqScanState *) state->append->appendplans[i];
-					SeqScan   *childplan = (SeqScan *) childscan->ss.ps.plan;
-
-					pull_varattnos((Node *) childplan->plan.targetlist,
-								   childplan->scanrelid, &attrs);
-					pull_varattnos((Node *) childplan->plan.qual,
-								   childplan->scanrelid, &attrs);
-				}
-			}
+			/*
+			 * Siblings carry their own deform sets (append_read_attrs);
+			 * only this child's referenced attributes belong here.
+			 */
 			for (col = 0; col < natts; col++)
 				state->read_attrs[col] =
 					bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
@@ -866,8 +882,9 @@ VectorRegionReadRowScan(VectorRegionState *state, TableScanDesc scandesc,
 	TupleTableSlot *slot = state->scan->ss.ss_ScanTupleSlot;
 	bool	   *read_attrs = state->read_attrs;
 
-	/* a divergent append child deforms its own attribute set */
-	if (batch != state->batch && state->append != NULL)
+	/* an append child with its own attribute set deforms only those */
+	if (state->append != NULL &&
+		state->append_read_attrs[state->append_index] != NULL)
 		read_attrs = state->append_read_attrs[state->append_index];
 
 	return VectorScanRowsToBatch(batch, slot, scandesc,

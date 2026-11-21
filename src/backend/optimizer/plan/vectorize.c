@@ -694,7 +694,8 @@ make_region(VectorizeContext *ctx, Plan *root)
 	rte = makeNode(RangeTblEntry);
 	rte->rtekind = RTE_NAMEDTUPLESTORE;
 	rte->enrname = "vector_region";
-	rte->enrtuples = root->plan_rows;
+	rte->enrtuples = root->plan_rows > (double) INT_MAX ?
+		INT_MAX : (int) root->plan_rows;
 	rte->eref = makeAlias("vector_region", colnames);
 	rte->coltypes = coltypes;
 	rte->coltypmods = coltypmods;

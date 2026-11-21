@@ -550,6 +550,14 @@ SELECT sum(x) FROM vector_f4sum;
 SELECT sum(x * 2) FROM vector_f4sum;
 SELECT sum(x) FROM vector_f4sum WHERE x > 100;
 SET gp_vectorized_execution = force;
+-- ---- vectorized aggregates under JIT: a FILTER rejecting every row of a
+-- batch must not reach the compiled evaluation loop with a zero selection ----
+SET jit = on;
+SET jit_above_cost = 0;
+SELECT sum(x * 2) FILTER (WHERE false) FROM vector_f4sum;
+SELECT sum(x * 2) FILTER (WHERE x > 100) FROM vector_f4sum;
+RESET jit;
+RESET jit_above_cost;
 SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
 SELECT f4 / 0 FROM vector_float_test WHERE id = 4;
 SELECT min(f4), max(f4), min(f8), max(f8) FROM vector_float_test;
