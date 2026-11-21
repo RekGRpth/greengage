@@ -25,6 +25,8 @@
 #include "executor/execdebug.h"
 #include "executor/execUtils.h"
 #include "executor/nodeMotion.h"
+#include "executor/vectorBatch.h"
+#include "executor/nodeVectorRegion.h"
 #include "lib/binaryheap.h"
 #include "utils/tuplesort.h"
 #include "miscadmin.h"
@@ -49,6 +51,7 @@
  * FUNCTIONS PROTOTYPES
  */
 static TupleTableSlot *execMotionSender(MotionState *node);
+static bool execMotionSenderBatch(MotionState *node);
 static TupleTableSlot *execMotionUnsortedReceiver(MotionState *node);
 static TupleTableSlot *execMotionSortedReceiver(MotionState *node);
 
@@ -219,6 +222,17 @@ execMotionSender(MotionState *node)
 				motion->motionType == MOTIONTYPE_BROADCAST ||
 				(motion->motionType == MOTIONTYPE_EXPLICIT && motion->segidColIdx > 0));
 	Assert(node->ps.state->interconnect_context);
+
+	/*
+	 * A vectorized child region can feed this motion directly with
+	 * columnar batches: encode once and send one chunk sequence per
+	 * batch (per route for hash-redistribute).
+	 */
+	if (execMotionSenderBatch(node))
+	{
+		doSendEndOfStream(motion, node);
+		return NULL;
+	}
 
 	while (!done)
 	{
@@ -1298,4 +1312,191 @@ ExecSquelchMotion(MotionState *node)
 	SendStopMessage(node->ps.state->motionlayer_context,
 					node->ps.state->interconnect_context,
 					motion->motionID);
+}
+
+/*
+ * Try to drive this motion's sender from the child's output batches
+ * (vectorized executor regions).  Returns true when the whole input
+ * was consumed this way; false when the child is not a batch-producing
+ * region and the caller must fall back to the per-row loop.
+ *
+ * Only unsorted gather and hash-redistribute motions take the batch
+ * path for now; broadcast and explicit motions stay per-row.
+ */
+static bool
+execMotionSenderBatch(MotionState *node)
+{
+	Motion	   *motion = (Motion *) node->ps.plan;
+	PlanState  *outerNode = outerPlanState(node);
+	VectorBatch *batch;
+	MemoryContext tmpcxt;
+	MemoryContext oldcxt;
+	StringInfoData buf;
+	TupleTableSlot *scratch = NULL;
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	bool		designated = true;
+
+	if ((motion->motionType != MOTIONTYPE_GATHER &&
+		 motion->motionType != MOTIONTYPE_GATHER_SINGLE &&
+		 motion->motionType != MOTIONTYPE_HASH) ||
+		motion->sendSorted)
+		return false;
+
+	if (!VectorRegionPullOutputBatch(outerNode, &batch))
+		return false;
+
+	if (motion->motionType == MOTIONTYPE_GATHER_SINGLE &&
+		GpIdentity.segindex != (gp_session_id % node->numInputSegs))
+		designated = false;		/* consume and drop, like the row path */
+
+	if (motion->motionType == MOTIONTYPE_HASH)
+		scratch = MakeSingleTupleTableSlot(ExecGetResultType(outerNode),
+										   &TTSOpsVirtual);
+
+	tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "Motion batch encode",
+								   ALLOCSET_DEFAULT_MINSIZE,
+								   ALLOCSET_DEFAULT_INITSIZE,
+								   ALLOCSET_DEFAULT_MAXSIZE);
+	initStringInfo(&buf);
+
+	while (batch != NULL)
+	{
+		int			nrows = batch->nselected;
+		int			outncols = ExecGetResultType((PlanState *) node)->natts;
+		SendReturnCode sendRC = SEND_COMPLETE;
+
+		/* the motion's output is the region's output: a column prefix */
+		if (outncols > batch->ncols)
+			elog(ERROR,
+				 "motion batch encode: %d motion output columns exceed the batch's %d columns",
+				 outncols, batch->ncols);
+
+		MemoryContextReset(tmpcxt);
+		oldcxt = MemoryContextSwitchTo(tmpcxt);
+		resetStringInfo(&buf);
+
+		if (motion->motionType == MOTIONTYPE_HASH)
+		{
+			/* partition the batch rows by hash route */
+			int			nroutes = node->numHashSegments;
+			int		   *counts;
+			int		  **lists;
+			int			row;
+			int			i;
+
+			CheckAndSendRecordCache(node->ps.state->motionlayer_context,
+									node->ps.state->interconnect_context,
+									motion->motionID, 0);
+			counts = (int *) palloc0(sizeof(int) * nroutes);
+			lists = (int **) palloc0(sizeof(int *) * nroutes);
+			for (i = 0; i < nroutes; i++)
+				lists[i] = (int *) palloc(sizeof(int) * Max(nrows, 1));
+
+			for (row = 0; row < nrows; row++)
+			{
+				int			r = VectorBatchSelectedRow(batch, row);
+				uint32		hval;
+				int			col;
+
+				ExecClearTuple(scratch);
+				for (col = 0; col < outncols; col++)
+				{
+					scratch->tts_values[col] = VectorBatchGetDatum(batch, col, r);
+					scratch->tts_isnull[col] = VectorBatchIsNull(batch, col, r);
+				}
+				scratch->tts_nvalid = outncols;
+				ExecStoreVirtualTuple(scratch);
+
+				econtext->ecxt_outertuple = scratch;
+				hval = evalHashKey(econtext, node->hashExprs, node->cdbhash);
+				Assert(hval < (uint32) nroutes);
+				lists[hval][counts[hval]++] = r;
+			}
+
+			for (i = 0; i < nroutes; i++)
+			{
+				if (counts[i] == 0)
+					continue;
+				resetStringInfo(&buf);
+				VectorBatchEncodeRows(&buf, batch, outncols, lists[i], counts[i]);
+				sendRC = SendBatchChunk(node->ps.state->motionlayer_context,
+										node->ps.state->interconnect_context,
+										motion->motionID,
+										buf.data, buf.len, (int16) i);
+				if (sendRC != SEND_COMPLETE)
+					break;
+			}
+		}
+		else if (designated)
+		{
+			CheckAndSendRecordCache(node->ps.state->motionlayer_context,
+									node->ps.state->interconnect_context,
+									motion->motionID, 0);
+			VectorBatchEncodeRows(&buf, batch, outncols, NULL, nrows);
+			sendRC = SendBatchChunk(node->ps.state->motionlayer_context,
+									node->ps.state->interconnect_context,
+									motion->motionID,
+									buf.data, buf.len, 0);
+		}
+
+		MemoryContextSwitchTo(oldcxt);
+
+		if (sendRC != SEND_COMPLETE)
+		{
+			node->stopRequested = true;
+			ExecSquelchNode(outerNode);
+			break;
+		}
+		node->numTuplesFromChild += nrows;
+		node->numTuplesToAMS += nrows;
+
+		if (!VectorRegionPullOutputBatch(outerNode, &batch))
+			break;				/* cannot happen: pulled true once */
+	}
+
+	if (scratch != NULL)
+		ExecDropSingleTupleTableSlot(scratch);
+	MemoryContextDelete(tmpcxt);
+
+	return true;
+}
+
+/*
+ * MotionState-facing batch receive for a vectorized consumer above
+ * this motion.  Returns a decoded batch, or NULL with *tuples_only set
+ * when the stream carries tuple chunks (caller falls back to rows), or
+ * NULL at end of stream.
+ */
+VectorBatch *
+MotionStateRecvBatch(MotionState *node, bool *tuples_only)
+{
+	Motion	   *motion = (Motion *) node->ps.plan;
+
+	if (node->stopRequested || motion->sendSorted ||
+		(node->ps.state->interconnect_context == NULL &&
+		 node->ps.state->es_interconnect_is_setup))
+	{
+		if (tuples_only != NULL)
+			*tuples_only = true;	/* let the caller use rows */
+		return NULL;
+	}
+
+	if (node->ps.state->interconnect_context == NULL)
+	{
+		/* same graceful-abort scenario as execMotionUnsortedReceiver */
+		if (!node->ps.state->es_interconnect_is_setup &&
+			node->ps.state->dispatcherState &&
+			!node->ps.state->es_got_eos)
+		{
+			if (tuples_only != NULL)
+				*tuples_only = true;
+			return NULL;
+		}
+		ereport(ERROR, (errmsg("Interconnect is down unexpectedly.")));
+	}
+
+	return RecvBatchFrom(node->ps.state->motionlayer_context,
+						 node->ps.state->interconnect_context,
+						 motion->motionID, tuples_only);
 }

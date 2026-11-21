@@ -409,6 +409,16 @@ extern bool create_restartpoint_on_ckpt_record_replay;
 #define OPTIMIZER_GPDB_CALIBRATED       1       /* GPDB's calibrated cost model */
 #define OPTIMIZER_GPDB_EXPERIMENTAL     2       /* GPDB's experimental cost model */
 
+/* vectorized execution mode */
+#define GP_VECTORIZED_EXECUTION_OFF		0
+#define GP_VECTORIZED_EXECUTION_FORCE	1
+#define GP_VECTORIZED_EXECUTION_AUTO	2
+
+extern int	gp_vectorized_execution;
+extern int	gp_vectorized_min_rows;
+extern double gp_vectorized_cost_op_factor;
+extern double gp_vectorized_cost_margin;
+extern bool gp_vectorized_explain_decisions;
 
 /* Optimizer related gucs */
 extern bool	optimizer;

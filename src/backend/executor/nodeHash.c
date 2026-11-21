@@ -52,16 +52,10 @@
 #include "cdb/cdbvars.h"
 
 static void ExecHashIncreaseNumBatches(HashJoinTable hashtable);
-static void ExecHashIncreaseNumBuckets(HashJoinTable hashtable);
 static void ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable);
 static void ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable);
 static void ExecHashBuildSkewHash(HashJoinTable hashtable, Hash *node,
 								  int mcvsToUse);
-static void ExecHashSkewTableInsert(HashState *hashState,
-									HashJoinTable hashtable,
-									TupleTableSlot *slot,
-									uint32 hashvalue,
-									int bucketNumber);
 static void ExecHashRemoveNextSkewBucket(HashState *hashState, HashJoinTable hashtable);
 
 static void ExecHashTableExplainEnd(PlanState *planstate, struct StringInfoData *buf);
@@ -1634,7 +1628,7 @@ ExecParallelHashMergeCounters(HashJoinTable hashtable)
  *		increase the original number of buckets in order to reduce
  *		number of tuples per bucket
  */
-static void
+void
 ExecHashIncreaseNumBuckets(HashJoinTable hashtable)
 {
 	HashMemoryChunk chunk;
@@ -3042,7 +3036,7 @@ ExecHashGetSkewBucket(HashJoinTable hashtable, uint32 hashvalue)
  * This should generally match up with the current-batch case in
  * ExecHashTableInsert.
  */
-static void
+void
 ExecHashSkewTableInsert(HashState *hashState,
 						HashJoinTable hashtable,
 						TupleTableSlot *slot,

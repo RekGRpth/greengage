@@ -39,6 +39,7 @@
 #include "catalog/indexing.h"
 #include "catalog/storage_tablespace.h"
 #include "commands/tablespace.h"
+#include "executor/nodeVectorRegion.h"
 
 #include "libpq/auth.h"
 #include "libpq/hba.h"
@@ -684,6 +685,9 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	SessionState_Init();
 	/* Initialize memory protection */
 	GPMemoryProtect_Init();
+
+	/* The built-in vector region provider must also be known on QEs. */
+	RegisterVectorRegionScanMethods();
 
 #ifdef USE_ORCA
 	if (Gp_role == GP_ROLE_DISPATCH)

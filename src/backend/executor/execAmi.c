@@ -812,6 +812,16 @@ ExecSquelchNode(PlanState *node)
 			 */
 			ExecShutdownForeignScan((ForeignScanState *) node);
 			break;
+		case T_CustomScanState:
+			{
+				CustomScanState *css = (CustomScanState *) node;
+				ListCell   *cell;
+
+				ExecShutdownCustomScan(css);
+				foreach(cell, css->custom_ps)
+					ExecSquelchNode((PlanState *) lfirst(cell));
+				break;
+			}
 		case T_DynamicForeignScanState:
 			/* TODO: Add logic to shutdown the dynamic foreign scan for cases of parallel
 			 * execution (currently unsupported in Orca)

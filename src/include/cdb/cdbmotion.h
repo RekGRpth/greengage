@@ -118,6 +118,31 @@ extern MinimalTuple RecvTupleFrom(MotionLayerState *mlStates,
 								  int16 motNodeID,
 								  int16 srcRoute);
 
+/*
+ * Batch interconnect: send one columnar batch payload (already encoded
+ * by VectorBatchEncodeRows) to a single route split over TC_BATCH_*
+ * chunks, and receive the next decoded batch on an unsorted receiver.
+ * The payload may be routed per caller (hash-redistribute partitions
+ * before encoding); broadcast replicates by calling once per route.
+ */
+extern SendReturnCode SendBatchChunk(MotionLayerState *mlStates,
+									 ChunkTransportState *transportStates,
+									 int16 motNodeID,
+									 const char *payload, int32 len,
+									 int16 targetRoute);
+struct VectorBatch;
+/*
+ * Returns the next decoded batch, or NULL.  *tuples_only (when not
+ * NULL) is set when the stream turned out to carry tuple chunks: the
+ * tuples are left in the tuple FIFO and the caller must fall back to
+ * the per-row receive path for the rest of the stream.
+ */
+extern struct VectorBatch *RecvBatchFrom(MotionLayerState *mlStates,
+										 ChunkTransportState *transportStates,
+										 int16 motNodeID,
+										 bool *tuples_only);
+
+
 extern void SendStopMessage(MotionLayerState *mlStates,
 							ChunkTransportState *transportStates,
 							int16 motNodeID);

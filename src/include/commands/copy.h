@@ -193,9 +193,9 @@ typedef struct CopyStateData
 
 	TransitionCaptureState *transition_capture;
 
-	StringInfo	dispatch_msgbuf; /* used in COPY_DISPATCH mode, to construct message
-								  * to send to QE. */
-	
+	StringInfo	dispatch_msgbuf; /* used in COPY_DISPATCH mode, to construct
+								 * message frames to send to QE. */
+
 	/* Error handling options */
 	CopyErrMode	errMode;
 	struct CdbSreh *cdbsreh; /* single row error handler */
@@ -260,6 +260,16 @@ typedef struct CopyStateData
 	CdbCopy    *cdbCopy;
 
 	bool		delim_off;		/* delimiter is set to OFF? */
+	bool		fast_parse;		/* COPY FROM fast text parse enabled */
+	int		   *fast_kinds;		/* per-column fast input kernel (CopyFastKind) */
+
+	/*
+	 * Per-segment buffers coalescing forwarded row frames (COPY_DISPATCH
+	 * COPY FROM).  Appended at the end to keep the struct layout stable
+	 * for the ABI check.
+	 */
+	StringInfo *dispatch_batch;
+	int			dispatch_nbatch;	/* number of slots in dispatch_batch */
 
 /* end Greengage Database specific variables */
 } CopyStateData;

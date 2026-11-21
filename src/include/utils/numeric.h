@@ -138,6 +138,12 @@ extern float8 numeric_li_fraction(Numeric x, Numeric x0, Numeric x1,
 								  bool *eq_bounds, bool *eq_abscissas);
 extern Numeric numeric_li_value(float8 f, Numeric y0, Numeric y1);
 extern void do_numeric_accum(NumericAggState *state, Numeric newval);
+extern void do_numeric_accum_datum(NumericAggState *state, Datum newval);
+extern void do_numeric_accum_fast(NumericAggState *state, int64 mantissa,
+								  int dscale);
+extern bool numeric_decode_fast_datum(Datum value, int64 *mantissa,
+									  int *scale, int *dscale);
+extern int cmp_numeric_datums(Datum num1, Datum num2);
 /*
  * Utility functions in numeric.c
  */
@@ -150,6 +156,13 @@ extern char *numeric_normalize(Numeric num);
 
 extern Numeric numeric_add_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);
+extern bool numeric_decode_fast(Numeric num, int64 *mantissa, int *scale,
+								int *dscale);
+extern bool numeric_scale_fast(int64 *mantissa, int scale, int target);
+extern bool numeric_round_scale_fast(int64 *mantissa, int scale, int target);
+extern bool numeric_mul_fast(int64 left, int64 right, int scale, int dscale,
+							 int64 *mantissa);
+extern Numeric numeric_build_fast(int64 mantissa, int dscale);
 extern Numeric numeric_sub_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);
 extern Numeric numeric_mul_opt_error(Numeric num1, Numeric num2,

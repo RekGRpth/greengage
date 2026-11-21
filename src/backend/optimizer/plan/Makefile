@@ -18,7 +18,7 @@ OBJS = analyzejoins.o createplan.o initsplan.o planagg.o planmain.o planner.o \
 	setrefs.o subselect.o \
 	planshare.o \
 	joinpartprune.o \
-	transform.o
+	transform.o vectorize.o
 
 ifeq ($(enable_orca),yes)
 OBJS += orca.o

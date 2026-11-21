@@ -548,3 +548,25 @@ ExecSquelchMaterial(MaterialState *node)
 		ExecSquelchNode(outerPlanState(node));
 	}
 }
+
+bool
+VectorMaterialPlanIsSupported(Material *node)
+{
+	return node->plan.qual == NIL && node->plan.initPlan == NIL &&
+		node->plan.extParam == NULL && node->plan.allParam == NULL;
+}
+
+TupleTableSlot *
+VectorMaterialNext(MaterialState *node, PlanState *outer_proxy,
+				   PlanState *outer_original)
+{
+	TupleTableSlot *result = ExecMaterial((PlanState *) node);
+
+	if (TupIsNull(result))
+	{
+		outerPlanState(node) = outer_original;
+		ExecSquelchMaterial(node);
+		outerPlanState(node) = outer_proxy;
+	}
+	return result;
+}

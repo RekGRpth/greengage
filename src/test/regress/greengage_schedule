@@ -313,6 +313,9 @@ test: alter_db_set_tablespace
 # incorrect.
 test: oid_wraparound
 
+test: vectorized_execution
+test: vector_coverage
+
 # fts_recovery_in_progresss uses fault injectors to simulate FTS fault states,
 # hence it should be run in isolation.
 test: fts_recovery_in_progress

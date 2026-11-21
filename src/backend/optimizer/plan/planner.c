@@ -402,7 +402,10 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		}
 
 		if (result)
+		{
+			result = VectorizePlan(result);
 			return result;
+		}
 	}
 
 	/*
@@ -779,6 +782,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		elog(LOG, "Planner Time: %.3f ms", INSTR_TIME_GET_MILLISEC(endtime));
 	}
 
+	result = VectorizePlan(result);
 	return result;
 }
 
