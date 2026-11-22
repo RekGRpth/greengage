@@ -1024,6 +1024,45 @@ SELECT d FROM vector_time_test ORDER BY d DESC NULLS LAST;
  
 (10 rows)
 
+-- A custom btree opclass on a packed type keeps its own ordering: with a
+-- non-default ordering operator the column leaves the packed layout, and
+-- the SortSupport comparator decides.
+CREATE FUNCTION vector_int4_rev_cmp(int4, int4) RETURNS int4
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END $$;
+CREATE OPERATOR <<< (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4gt);
+CREATE OPERATOR <<= (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4ge);
+CREATE OPERATOR >>= (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4le);
+CREATE OPERATOR >>> (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = int4lt);
+CREATE OPERATOR CLASS vector_int4_rev_ops FOR TYPE int4 USING btree AS
+	OPERATOR 1 <<<,
+	OPERATOR 2 <<=,
+	OPERATOR 3 =,
+	OPERATOR 4 >>=,
+	OPERATOR 5 >>>,
+	FUNCTION 1 vector_int4_rev_cmp(int4, int4);
+CREATE TABLE vector_rev_sort (a int4, k int4)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (k);
+INSERT INTO vector_rev_sort SELECT g, 1 FROM generate_series(1, 50) g;
+SET gp_vectorized_execution = force;
+SELECT a FROM vector_rev_sort ORDER BY a USING <<< NULLS LAST LIMIT 5;
+ a  
+----
+ 50
+ 49
+ 48
+ 47
+ 46
+(5 rows)
+
+SET gp_vectorized_execution = force;
+DROP TABLE vector_rev_sort;
+DROP OPERATOR CLASS vector_int4_rev_ops USING btree;
+DROP OPERATOR <<< (int4, int4);
+DROP OPERATOR <<= (int4, int4);
+DROP OPERATOR >>= (int4, int4);
+DROP OPERATOR >>> (int4, int4);
+DROP FUNCTION vector_int4_rev_cmp(int4, int4);
 SELECT avg(b) FROM vector_arithmetic_test WHERE id = 4;
  avg 
 -----
@@ -1189,14 +1228,14 @@ SELECT min(n), max(n) FROM vector_numeric_test;
 SELECT n, n + 1, n - 1, n * 3, n + n, n * n FROM vector_numeric_test;
    n   | ?column? | ?column? | ?column? | ?column? | ?column? 
 -------+----------+----------+----------+----------+----------
+ -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
+   2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
+   NaN |      NaN |      NaN |      NaN |      NaN |      NaN
      0 |        1 |       -1 |        0 |        0 |        0
    1.2 |      2.2 |      0.2 |      3.6 |      2.4 |     1.44
  1.200 |    2.200 |    0.200 |    3.600 |    2.400 | 1.440000
    NaN |      NaN |      NaN |      NaN |      NaN |      NaN
        |          |          |          |          |         
- -1.20 |    -0.20 |    -2.20 |    -3.60 |    -2.40 |   1.4400
-   2.5 |      3.5 |      1.5 |      7.5 |      5.0 |     6.25
-   NaN |      NaN |      NaN |      NaN |      NaN |      NaN
 (8 rows)
 
 SELECT sum(b) FROM vector_arithmetic_test WHERE id = 4;
@@ -1250,6 +1289,73 @@ GROUP BY f4 ORDER BY f4 NULLS LAST;
            |           |          
 (6 rows)
 
+-- sum(float4) has transtype float4 and no finalfn: every accumulation
+-- step must round to float4 the way float4pl does, not accumulate in
+-- float8 and truncate at the end.
+CREATE TABLE vector_f4sum (x float4, k int4)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (k);
+INSERT INTO vector_f4sum VALUES (16777216.0, 1);
+INSERT INTO vector_f4sum VALUES (1.0, 1);
+INSERT INTO vector_f4sum VALUES (1.0, 1);
+INSERT INTO vector_f4sum VALUES (2.5, 1);
+INSERT INTO vector_f4sum VALUES (-0.5, 1);
+SET gp_vectorized_execution = force;
+SELECT sum(x) FROM vector_f4sum;
+      sum      
+---------------
+ 1.6777218e+07
+(1 row)
+
+SELECT sum(x * 2) FROM vector_f4sum;
+   sum    
+----------
+ 33554440
+(1 row)
+
+SELECT sum(x) FROM vector_f4sum WHERE x > 100;
+      sum      
+---------------
+ 1.6777216e+07
+(1 row)
+
+SET gp_vectorized_execution = off;
+SELECT sum(x) FROM vector_f4sum;
+      sum      
+---------------
+ 1.6777218e+07
+(1 row)
+
+SELECT sum(x * 2) FROM vector_f4sum;
+   sum    
+----------
+ 33554440
+(1 row)
+
+SELECT sum(x) FROM vector_f4sum WHERE x > 100;
+      sum      
+---------------
+ 1.6777216e+07
+(1 row)
+
+SET gp_vectorized_execution = force;
+-- ---- vectorized aggregates under JIT: a FILTER rejecting every row of a
+-- batch must not reach the compiled evaluation loop with a zero selection ----
+SET jit = on;
+SET jit_above_cost = 0;
+SELECT sum(x * 2) FILTER (WHERE false) FROM vector_f4sum;
+ sum 
+-----
+    
+(1 row)
+
+SELECT sum(x * 2) FILTER (WHERE x > 100) FROM vector_f4sum;
+   sum    
+----------
+ 33554432
+(1 row)
+
+RESET jit;
+RESET jit_above_cost;
 SELECT f8 / 0 FROM vector_float_test WHERE id = 4;
 ERROR:  division by zero
 SELECT f4 / 0 FROM vector_float_test WHERE id = 4;
@@ -3825,6 +3931,121 @@ line2",dk
 RESET gp_vectorized_execution;
 RESET gp_vectorized_min_rows;
 RESET gp_vectorized_execution;
+-- ---- vectorized COPY TO: untypmod'd numeric with an exotic display scale ----
+-- The fast numeric formatter renders into a fixed buffer; display scales it
+-- cannot hold must take the exact output function instead of overrunning it.
+CREATE TABLE vector_copy_numeric (n numeric, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+-- one INSERT per row: single-row statements insert in statement order, so
+-- the AOCS row numbers (and hence the COPY TO output order) are stable
+INSERT INTO vector_copy_numeric VALUES
+('0.1000000000000000000000001', 'dist');
+INSERT INTO vector_copy_numeric VALUES
+(('-2.' || repeat('9', 30))::numeric, 'dist');
+INSERT INTO vector_copy_numeric VALUES
+(42, 'dist');
+SET gp_vectorized_execution = off;
+\copy vector_copy_numeric TO STDOUT WITH (DELIMITER '|')
+0.1000000000000000000000001|dist
+-2.999999999999999999999999999999|dist
+42|dist
+SET gp_vectorized_execution = force;
+\copy vector_copy_numeric TO STDOUT WITH (DELIMITER '|')
+0.1000000000000000000000001|dist
+-2.999999999999999999999999999999|dist
+42|dist
+RESET gp_vectorized_execution;
+-- ---- vectorized COPY TO, binary format: only the regular path may write
+-- the binary framing; off and force must produce byte-identical files ----
+CREATE TABLE vector_copy_bin (i4 int4, t text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_bin VALUES (1, 'x', 'dist'), (2, 'y', 'dist');
+SET gp_vectorized_execution = off;
+COPY vector_copy_bin TO '/tmp/vector_copy_bin.data' WITH (FORMAT binary);
+SELECT encode(pg_read_binary_file('/tmp/vector_copy_bin.data'), 'hex');
+                                                                 encode                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------
+ 5047434f50590aff0d0a00000000000000000000030000000400000001000000017800000004646973740003000000040000000200000001790000000464697374ffff
+(1 row)
+
+SET gp_vectorized_execution = force;
+COPY vector_copy_bin TO '/tmp/vector_copy_bin.data' WITH (FORMAT binary);
+SELECT encode(pg_read_binary_file('/tmp/vector_copy_bin.data'), 'hex');
+                                                                 encode                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------
+ 5047434f50590aff0d0a00000000000000000000030000000400000001000000017800000004646973740003000000040000000200000001790000000464697374ffff
+(1 row)
+
+RESET gp_vectorized_execution;
+CREATE TABLE vector_copy_bin_in (LIKE vector_copy_bin) DISTRIBUTED BY (v_dist);
+COPY vector_copy_bin_in FROM '/tmp/vector_copy_bin.data' WITH (FORMAT binary);
+SELECT i4, t FROM vector_copy_bin_in ORDER BY i4;
+ i4 | t 
+----+---
+  1 | x
+  2 | y
+(2 rows)
+
+DROP TABLE vector_copy_bin_in;
+\! rm -f /tmp/vector_copy_bin.data
+-- ---- vectorized COPY TO, CSV under a client encoding different from the
+-- database encoding: the batch formatter has no transcoder, so the regular
+-- per-attribute conversion must handle these ----
+CREATE TABLE vector_copy_enc (t text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_enc VALUES ('Ã¤Ã¶Ã¼ Ã© Ã¨', 'dist'), ('plain', 'dist');
+SET gp_vectorized_execution = off;
+\encoding LATIN1
+\copy vector_copy_enc TO STDOUT WITH (FORMAT csv)
+äöü é è,dist
+plain,dist
+\encoding UTF8
+SET gp_vectorized_execution = force;
+\encoding LATIN1
+\copy vector_copy_enc TO STDOUT WITH (FORMAT csv)
+äöü é è,dist
+plain,dist
+\encoding UTF8
+RESET gp_vectorized_execution;
+DROP TABLE vector_copy_enc;
+-- ---- vectorized COPY FROM: FORCE_NOT_NULL / FORCE_NULL rewrite null-marker
+-- matches in the regular conversion loop, which the fast parse skips ----
+CREATE TABLE vector_copy_fn (a text, b text, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+CREATE TABLE vector_copy_fn2 (LIKE vector_copy_fn)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+SET gp_vectorized_execution = off;
+COPY vector_copy_fn FROM STDIN WITH (FORMAT csv, NULL 'NULL', FORCE_NOT_NULL(a), FORCE_NULL(b));
+SET gp_vectorized_execution = force;
+COPY vector_copy_fn2 FROM STDIN WITH (FORMAT csv, NULL 'NULL', FORCE_NOT_NULL(a), FORCE_NULL(b));
+-- both loads must produce byte-identical tables
+SET gp_vectorized_execution = off;
+COPY vector_copy_fn TO STDOUT WITH (DELIMITER '|');
+NULL|\N|dist
+plain|plain|dist
+COPY vector_copy_fn2 TO STDOUT WITH (DELIMITER '|');
+NULL|\N|dist
+plain|plain|dist
+SET gp_vectorized_execution = force;
+-- ---- vectorized COPY FROM: fast numeric builder overflow falls back ----
+-- A mantissa that fits the int64 accumulator can still overflow the
+-- display-scale padding of the fast numeric builder; such fields keep
+-- their full precision through the regular input function.
+CREATE TABLE vector_copy_numovf (n numeric, v_dist text)
+WITH (appendonly = true, orientation = column) DISTRIBUTED BY (v_dist);
+INSERT INTO vector_copy_numovf VALUES ('0', 'dist');
+COPY vector_copy_numovf FROM STDIN WITH (DELIMITER '|');
+SET gp_vectorized_execution = off;
+COPY (SELECT n, v_dist FROM vector_copy_numovf ORDER BY n) TO STDOUT WITH (DELIMITER '|');
+0|dist
+42.5|dist
+1234567890123456.7|dist
+SET gp_vectorized_execution = force;
+COPY (SELECT n, v_dist FROM vector_copy_numovf ORDER BY n) TO STDOUT WITH (DELIMITER '|');
+0|dist
+42.5|dist
+1234567890123456.7|dist
+RESET gp_vectorized_execution;
 DROP TABLE vector_aoco_test;
 DROP TABLE vector_aoco_small;
 DROP TABLE vector_join_l;
@@ -4195,6 +4416,32 @@ SELECT count(*) FROM vector_like WHERE t LIKE 'ord1x2final';
     19
 (1 row)
 
+-- literal patterns without % are equality tests: a proper prefix of an
+-- existing value must not match
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord1x2fina';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_like WHERE t NOT LIKE 'ord1x2fina';
+ count 
+-------
+  8182
+(1 row)
+
+SELECT count(*) FROM vector_like WHERE t LIKE 'ord';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_like WHERE v LIKE 'va3';
+ count 
+-------
+     0
+(1 row)
+
 SELECT count(*) FROM vector_like WHERE t LIKE '%Customer%Complaints%';
  count 
 -------
@@ -4319,3 +4566,9 @@ DROP TABLE vector_copy_from2;
 DROP TABLE vector_copy_sreh;
 DROP TABLE vector_copy_sreh2;
 DROP TABLE vector_copy_csv;
+DROP TABLE vector_copy_numeric;
+DROP TABLE vector_copy_bin;
+DROP TABLE vector_copy_fn;
+DROP TABLE vector_copy_fn2;
+DROP TABLE vector_copy_numovf;
+DROP TABLE vector_f4sum;
