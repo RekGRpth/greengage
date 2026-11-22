@@ -1366,6 +1366,13 @@ execMotionSenderBatch(MotionState *node)
 		int			outncols = ExecGetResultType((PlanState *) node)->natts;
 		SendReturnCode sendRC = SEND_COMPLETE;
 
+		/*
+		 * Stop promptly on query cancel, like the row path's
+		 * ExecProcNodeGPDB check; the caller still sends EoS.
+		 */
+		if (QueryFinishPending)
+			break;
+
 		/* the motion's output is the region's output: a column prefix */
 		if (outncols > batch->ncols)
 			elog(ERROR,
@@ -1385,9 +1392,11 @@ execMotionSenderBatch(MotionState *node)
 			int			row;
 			int			i;
 
-			CheckAndSendRecordCache(node->ps.state->motionlayer_context,
-									node->ps.state->interconnect_context,
-									motion->motionID, 0);
+			/*
+			 * The record typmod cache is delivered per connection; each
+			 * route must receive it before its first chunk, like the row
+			 * path does per tuple.
+			 */
 			counts = (int *) palloc0(sizeof(int) * nroutes);
 			lists = (int **) palloc0(sizeof(int *) * nroutes);
 			for (i = 0; i < nroutes; i++)
@@ -1418,6 +1427,9 @@ execMotionSenderBatch(MotionState *node)
 			{
 				if (counts[i] == 0)
 					continue;
+				CheckAndSendRecordCache(node->ps.state->motionlayer_context,
+										node->ps.state->interconnect_context,
+										motion->motionID, (int16) i);
 				resetStringInfo(&buf);
 				VectorBatchEncodeRows(&buf, batch, outncols, lists[i], counts[i]);
 				sendRC = SendBatchChunk(node->ps.state->motionlayer_context,

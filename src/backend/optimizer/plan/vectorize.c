@@ -723,6 +723,14 @@ make_region(VectorizeContext *ctx, Plan *root)
 	cs->scan.plan.parallel_aware = root->parallel_aware;
 	cs->scan.plan.parallel_safe = root->parallel_safe;
 	cs->scan.plan.flow = root->flow;
+	/*
+	 * Shared, not transferred, ownership: the wrapped subtree keeps its
+	 * own copies of these lists.  That is safe today because subplan ids
+	 * are unique and initPlans execute once, but walkers that descend
+	 * into initPlans (unlike planstate_walk_kids with PSW_IGNORE_INITPLAN)
+	 * will see each subplan twice, and future code that executes over
+	 * PlanState->initPlan would run volatile subplans twice.
+	 */
 	cs->scan.plan.initPlan = root->initPlan;
 	cs->scan.plan.extParam = root->extParam;
 	cs->scan.plan.allParam = root->allParam;
