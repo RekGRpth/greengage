@@ -1077,6 +1077,12 @@ VectorSortNext(SortState *node)
 	Tuplesortstate *tuplesortstate = (Tuplesortstate *) node->tuplesortstate;
 	TupleTableSlot *slot;
 	ScanDirection dir = node->ss.ps.state->es_direction;
+	/* the region drives the sort directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	Instrumentation *instr = node->ss.ps.instrument;
+
+	if (instr)
+		InstrStartNode(instr);
 
 	Assert(node->sort_Done);
 	if (state != NULL && state->native)
@@ -1091,6 +1097,8 @@ VectorSortNext(SortState *node)
 		{
 			if (!node->delayEagerFree)
 				ExecEagerFreeSort(node);
+			if (instr)
+				InstrStopNode(instr, 0);
 			return slot;
 		}
 		position = state->position++;
@@ -1104,15 +1112,24 @@ VectorSortNext(SortState *node)
 				 ((uint64) 1 << (row % 64))) != 0;
 		}
 		slot->tts_nvalid = state->ncols;
-		return ExecStoreVirtualTuple(slot);
+		slot = ExecStoreVirtualTuple(slot);
+		if (instr)
+			InstrStopNode(instr, 1);
+		return slot;
 	}
 	if (tuplesortstate == NULL)
+	{
+		if (instr)
+			InstrStopNode(instr, 0);
 		return NULL;
+	}
 	slot = node->ss.ps.ps_ResultTupleSlot;
 	(void) tuplesort_gettupleslot(tuplesortstate,
 								  ScanDirectionIsForward(dir), false, slot, NULL);
 	if (TupIsNull(slot) && !node->delayEagerFree)
 		ExecEagerFreeSort(node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(slot) ? 0 : 1);
 	return slot;
 }
 
@@ -1120,6 +1137,16 @@ bool
 VectorSortNextBatch(SortState *node, VectorBatch *batch,
 					const int *output_attnos)
 {
+	Instrumentation *instr = node->ss.ps.instrument;
+	uint64		emitted = 0;
+
+	/* the region drives the sort directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output batch.
+	 * The non-native path emits through VectorSortNext, which is
+	 * instrumented per row already. */
+	if (instr)
+		InstrStartNode(instr);
+
 	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
 	bool		native = state != NULL && state->native;
 	bool		forward = ScanDirectionIsForward(node->ss.ps.state->es_direction);
@@ -1149,6 +1176,7 @@ VectorSortNextBatch(SortState *node, VectorBatch *batch,
 			}
 		}
 		state->position += nrows;
+		emitted = (uint64) nrows;
 	}
 	else
 	{
@@ -1175,6 +1203,8 @@ VectorSortNextBatch(SortState *node, VectorBatch *batch,
 	VectorBatchSetRowCount(batch, nrows);
 	if (nrows == 0 && native && !node->delayEagerFree)
 		ExecEagerFreeSort(node);
+	if (instr)
+		InstrStopNode(instr, emitted);
 	return nrows > 0;
 }
 

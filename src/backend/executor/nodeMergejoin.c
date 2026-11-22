@@ -98,6 +98,7 @@
 #include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeMergejoin.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1802,5 +1803,15 @@ VectorMergeJoinPlanIsSupported(MergeJoin *node)
 TupleTableSlot *
 VectorMergeJoinNext(MergeJoinState *node)
 {
-	return ExecMergeJoin((PlanState *) node);
+	Instrumentation *instr = node->js.ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the mergejoin directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
+	result = ExecMergeJoin((PlanState *) node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(result) ? 0 : 1);
+	return result;
 }

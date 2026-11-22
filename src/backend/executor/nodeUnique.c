@@ -35,6 +35,7 @@
 
 #include "cdb/cdbvars.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeUnique.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
@@ -205,12 +206,27 @@ VectorUniqueNext(UniqueState *node, TupleTableSlot *slot)
 {
 	TupleTableSlot *resultTupleSlot = node->ps.ps_ResultTupleSlot;
 	ExprContext *econtext = node->ps.ps_ExprContext;
+	Instrumentation *instr = node->ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the unique directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
 
 	if (TupIsNull(resultTupleSlot))
-		return ExecCopySlot(resultTupleSlot, slot);
-	econtext->ecxt_innertuple = slot;
-	econtext->ecxt_outertuple = resultTupleSlot;
-	if (!ExecQualAndReset(node->eqfunction, econtext))
-		return ExecCopySlot(resultTupleSlot, slot);
-	return NULL;
+		result = ExecCopySlot(resultTupleSlot, slot);
+	else
+	{
+		econtext->ecxt_innertuple = slot;
+		econtext->ecxt_outertuple = resultTupleSlot;
+		if (!ExecQualAndReset(node->eqfunction, econtext))
+			result = ExecCopySlot(resultTupleSlot, slot);
+		else
+			result = NULL;
+	}
+
+	if (instr)
+		InstrStopNode(instr, result ? 1 : 0);
+	return result;
 }

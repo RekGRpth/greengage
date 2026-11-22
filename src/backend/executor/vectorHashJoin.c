@@ -9,6 +9,7 @@
 
 #include "access/htup_details.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/hashjoin.h"
 #include "executor/nodeHash.h"
 #include "executor/vectorHashJoin.h"
@@ -681,9 +682,22 @@ bool
 VectorHashJoinNextBatch(VectorHashJoinState *state)
 {
 	int			nrows;
+	Instrumentation *instr = state->hj->js.ps.instrument;
+	uint64		fast_rows = 0;
+
+	/* the region drives the join directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output batch.  Rows
+	 * emitted through the per-row machine below are counted there, only
+	 * the fast batch paths are counted here. */
+	if (instr)
+		InstrStartNode(instr);
 
 	if (state->done)
+	{
+		if (instr)
+			InstrStopNode(instr, 0);
 		return false;
+	}
 	do
 	{
 		nrows = 0;
@@ -749,7 +763,12 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 							continue;
 						}
 					}
-					nrows = VectorHashProbeBatchFast(state, nrows);
+					{
+						int		newrows = VectorHashProbeBatchFast(state, nrows);
+
+						fast_rows += newrows - nrows;
+						nrows = newrows;
+					}
 					continue;
 				}
 			}
@@ -771,7 +790,12 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 				if (state->fill_inner && state->fast_probe &&
 					state->hj->hj_HashTable != NULL)
 				{
-					nrows = VectorHashFinishBatch(state, nrows);
+					{
+						int		newrows = VectorHashFinishBatch(state, nrows);
+
+						fast_rows += newrows - nrows;
+						nrows = newrows;
+					}
 					if (state->finish_done)
 						state->done = true;
 					continue;
@@ -813,6 +837,8 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 	 * A done chain with rows in the batch still reports true: the caller
 	 * consumes the final partial batch before the next call reports EOF.
 	 */
+	if (instr)
+		InstrStopNode(instr, fast_rows);
 	return !state->done || nrows > 0;
 }
 
@@ -1029,7 +1055,16 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 	ExecStoreVirtualTuple(outer);
 	state->outer_in_progress = true;
 	{
-		TupleTableSlot *result = VectorHashJoinProbe(hj, outer);
+		Instrumentation *instr = hj->js.ps.instrument;
+		TupleTableSlot *result;
+
+		/* the region drives the join directly, so ExecProcNode's
+		 * instrumentation never runs; approximate it per output row */
+		if (instr)
+			InstrStartNode(instr);
+		result = VectorHashJoinProbe(hj, outer);
+		if (instr)
+			InstrStopNode(instr, result ? 1 : 0);
 
 		if (VectorHashJoinNeedsNewOuter(hj))
 			state->outer_in_progress = false;
@@ -1046,7 +1081,14 @@ VectorHashJoinInProgress(VectorHashJoinState *state)
 TupleTableSlot *
 VectorHashJoinContinue(VectorHashJoinState *state)
 {
-	TupleTableSlot *result = VectorHashJoinProbe(state->hj, NULL);
+	Instrumentation *instr = state->hj->js.ps.instrument;
+	TupleTableSlot *result;
+
+	if (instr)
+		InstrStartNode(instr);
+	result = VectorHashJoinProbe(state->hj, NULL);
+	if (instr)
+		InstrStopNode(instr, result ? 1 : 0);
 
 	if (VectorHashJoinNeedsNewOuter(state->hj))
 		state->outer_in_progress = false;
@@ -1056,12 +1098,21 @@ VectorHashJoinContinue(VectorHashJoinState *state)
 TupleTableSlot *
 VectorHashJoinFinish(VectorHashJoinState *state)
 {
+	Instrumentation *instr = state->hj->js.ps.instrument;
+	TupleTableSlot *result;
+
+	if (instr)
+		InstrStartNode(instr);
+
 	if (!state->built)
 	{
 		VectorHashJoinBuild(state);
 		state->built = true;
 	}
-	return VectorHashJoinProbeFinal(state->hj);
+	result = VectorHashJoinProbeFinal(state->hj);
+	if (instr)
+		InstrStopNode(instr, result ? 1 : 0);
+	return result;
 }
 
 /*

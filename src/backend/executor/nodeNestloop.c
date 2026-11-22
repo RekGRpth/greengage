@@ -26,6 +26,7 @@
 #include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeNestloop.h"
+#include "executor/instrument.h"
 #include "optimizer/clauses.h"
 #include "utils/lsyscache.h"
 #include "miscadmin.h"
@@ -789,7 +790,16 @@ TupleTableSlot *
 VectorNestLoopNext(NestLoopState *node, PlanState *outer_proxy,
 				   PlanState *outer_original)
 {
-	TupleTableSlot *result = ExecNestLoop_guts((PlanState *) node);
+	Instrumentation *instr = node->js.ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the nestloop directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
+	result = ExecNestLoop_guts((PlanState *) node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(result) ? 0 : 1);
 
 	if (TupIsNull(result))
 	{

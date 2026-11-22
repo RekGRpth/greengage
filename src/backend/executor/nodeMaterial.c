@@ -560,7 +560,16 @@ TupleTableSlot *
 VectorMaterialNext(MaterialState *node, PlanState *outer_proxy,
 				   PlanState *outer_original)
 {
-	TupleTableSlot *result = ExecMaterial((PlanState *) node);
+	Instrumentation *instr = node->ss.ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the material directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
+	result = ExecMaterial((PlanState *) node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(result) ? 0 : 1);
 
 	if (TupIsNull(result))
 	{
