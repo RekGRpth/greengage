@@ -1643,6 +1643,12 @@ VectorRegionExec(CustomScanState *node)
 		AggState   *agg = state->agg;
 		VectorBatch *input = VectorRegionInputBatch(state);
 		int		   *cursor = state->nested_batches ? &state->join_position : &state->position;
+		/* the region drives the aggregate directly, so ExecProcNode's
+		 * instrumentation never runs; approximate it per output row */
+		Instrumentation *instr = agg->ss.ps.instrument;
+
+		if (instr)
+			InstrStartNode(instr);
 
 		if (state->sort != NULL)
 		{
@@ -1669,7 +1675,11 @@ VectorRegionExec(CustomScanState *node)
 																		 cursor);
 
 					if (result != NULL)
+					{
+						if (instr)
+							InstrStopNode(instr, 1);
 						return result;
+					}
 				}
 				else
 				{
@@ -1689,7 +1699,11 @@ VectorRegionExec(CustomScanState *node)
 															 cursor);
 
 				if (result != NULL)
+				{
+					if (instr)
+						InstrStopNode(instr, 1);
 					return result;
+				}
 			}
 		}
 		else
@@ -1701,7 +1715,13 @@ VectorRegionExec(CustomScanState *node)
 			}
 		}
 		VectorAggFinish(state->vagg);
-		return VectorAggNext(state->vagg);
+		{
+			TupleTableSlot *result = VectorAggNext(state->vagg);
+
+			if (instr)
+				InstrStopNode(instr, result ? 1 : 0);
+			return result;
+		}
 	}
 
 	if (state->limit != NULL && VectorLimitStart(state->limit))
