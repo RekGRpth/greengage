@@ -31,6 +31,7 @@ DROP TABLE IF EXISTS vector_nl_prefetch;
 DROP TABLE IF EXISTS vector_boolnull;
 DROP TABLE IF EXISTS vector_subplan_lifetime;
 DROP TABLE IF EXISTS vector_nl_prefetch_agg;
+DROP TABLE IF EXISTS vector_fixedref;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1648,6 +1649,23 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET gp_vectorized_execution;
 DROP TABLE vector_nl_prefetch_agg;
+-- ---- Fixed-length pass-by-reference columns over batch motion ----
+-- timetz, interval and name are fixed-length but pass-by-reference; the
+-- batch motion codec must measure them by typlen, not VARSIZE_ANY, or the
+-- sender dereferences the value bytes as a varlena header and crashes.
+CREATE TABLE vector_fixedref (a int, t timetz, n name, i interval)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO vector_fixedref
+SELECT i, ('01:0' || (i % 10) || ':00+0' || (i % 3))::timetz,
+       ('n' || i)::name, (i || ' seconds')::interval
+FROM generate_series(1, 1000) AS i;
+ANALYZE vector_fixedref;
+SET gp_vectorized_execution = force;
+SELECT count(*), count(t), min(t), max(t) FROM vector_fixedref;
+SELECT n, i FROM vector_fixedref WHERE a = 7;
+RESET gp_vectorized_execution;
+DROP TABLE vector_fixedref;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
 DROP TABLE vector_part_test CASCADE;

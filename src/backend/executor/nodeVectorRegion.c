@@ -2048,7 +2048,12 @@ VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
 	if (state->proj != NULL)
 		return false;
 
-	/* the motion output columns must be the batch columns as-is */
+	/* the motion output columns must be the batch columns as-is; a batch
+	 * wider than the output is a fine prefix, but an output column with no
+	 * batch column behind it (e.g. a void column from a nested-loop inner)
+	 * must fall back to the row-wise output */
+	if (state->output_ncols > state->batch->ncols)
+		return false;
 	for (col = 0; col < state->output_ncols; col++)
 	{
 		if (state->output_attnos[col] != col)

@@ -258,13 +258,16 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 	{
 		const VectorColumn *c = &batch->columns[col];
 		bool		byval = c->typbyval && c->typlen > 0;
-		uint8		kind = byval ? 0 : 1;
+		/* fixed-length pass-by-reference types (timetz, interval, name):
+		 * not varlena, must not go through VARSIZE_ANY */
+		bool		fixed_ref = !byval && c->typlen > 0;
+		uint8		kind = byval ? 0 : (fixed_ref ? 2 : 1);
 		int			bitbytes = (nrows + 7) / 8;
 		uint8		zeros[8] = {0};
 
 		appendBinaryStringInfo(buf, (char *) &kind, 1);
 		appendStringInfoCharMacro(buf, 0);
-		vbatch_encode_u16(buf, (uint16) (byval ? c->typlen : -1));
+		vbatch_encode_u16(buf, (uint16) (byval ? c->typlen : (fixed_ref ? c->typlen : -1)));
 
 		/* null bitmap */
 		for (row = 0; row < bitbytes; row++)
@@ -323,7 +326,9 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 					Datum		v = VectorBatchGetDatum(batch, col, r);
 					Size		sz;
 
-					if (c->typlen == -2)
+					if (fixed_ref)
+						sz = c->typlen;
+					else if (c->typlen == -2)
 						sz = strlen((char *) DatumGetPointer(v)) + 1;
 					else
 					{
@@ -349,14 +354,15 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 				{
 					int			r = rows ? rows[row] : VectorBatchSelectedRow(batch, row);
 					Datum		v = VectorBatchGetDatum(batch, col, r);
+					Size		sz;
 
-					if (c->typlen != -2 &&
+					if (!fixed_ref && c->typlen != -2 &&
 						VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(v)))
 						v = datumCopy(v, false, -1);
-					appendBinaryStringInfo(buf, (char *) DatumGetPointer(v),
-										   c->typlen == -2 ?
-										   strlen((char *) DatumGetPointer(v)) + 1 :
-										   VARSIZE_ANY(DatumGetPointer(v)));
+					sz = fixed_ref ? (Size) c->typlen :
+						c->typlen == -2 ? strlen((char *) DatumGetPointer(v)) + 1 :
+						VARSIZE_ANY(DatumGetPointer(v));
+					appendBinaryStringInfo(buf, (char *) DatumGetPointer(v), sz);
 				}
 			}
 			pfree(offs);
@@ -476,6 +482,14 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 			const char *offsets = p;
 			const char *blob;
 			MemoryContext oldcxt;
+			/* kind 2: fixed-length pass-by-reference, size is typlen;
+			 * kind 1: varlena (VARSIZE_ANY) or cstring (typlen == -2) */
+			bool		fixed_ref = (kind == 2);
+
+			if (fixed_ref && typlen <= 0)
+				elog(ERROR,
+					 "corrupt vector batch chunk: bad typlen %d for fixed column %d",
+					 typlen, col);
 
 			p += (size_t) nrows * sizeof(uint32);
 			if (p + bloblen > end)
@@ -527,6 +541,8 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 							next = bloblen;
 						sz = next - off;	/* includes NUL */
 					}
+					else if (fixed_ref)
+						sz = (Size) typlen;
 					else
 						sz = VARSIZE_ANY(blob + off);
 					if (sz == 0 || sz > bloblen - off || sz > 0x40000000)
