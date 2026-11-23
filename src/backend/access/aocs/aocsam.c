@@ -1843,6 +1843,10 @@ aocs_getnext_batch_bulk(AOCSScanDesc scan, VectorBatch *batch,
 			 dsr->datumStreamVersion != DatumStreamVersion_Dense_Enhanced) ||
 			ds->largeObjectState != DatumStreamLargeObjectState_None ||
 			datumlen == -2 ||
+			/* fixed-length pass-by-reference types (timetz, interval,
+			 * name) must come out as pointers; only the per-row path
+			 * handles them, the inline reads below assume by-value */
+			(datumlen > 0 && !dsr->typeInfo.byval) ||
 			(dsr->delta_block_was_compressed &&
 			 (datumlen != 4 && datumlen != 8)))
 			return false;

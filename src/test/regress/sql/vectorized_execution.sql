@@ -28,6 +28,10 @@ DROP TABLE IF EXISTS vector_copy_sreh;
 DROP TABLE IF EXISTS vector_copy_sreh2;
 DROP TABLE IF EXISTS vector_copy_csv;
 DROP TABLE IF EXISTS vector_nl_prefetch;
+DROP TABLE IF EXISTS vector_boolnull;
+DROP TABLE IF EXISTS vector_subplan_lifetime;
+DROP TABLE IF EXISTS vector_nl_prefetch_agg;
+DROP TABLE IF EXISTS vector_fixedref;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1562,6 +1566,106 @@ WHERE (a % 5) <> 0 AND v > (SELECT avg(v) FROM vector_nl_prefetch)
 GROUP BY g ORDER BY g;
 RESET gp_vectorized_execution;
 DROP TABLE vector_nl_prefetch;
+-- ---- Three-valued logic in vector AND/OR quals ----
+-- A row whose non-final conjunct is NULL must not pass an AND because the
+-- final argument is true (NULL AND true is NULL, not true); likewise a NULL
+-- disjunct must stay NULL when the remaining arguments are all false.
+CREATE TABLE vector_boolnull (a int, b char(10))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO vector_boolnull
+SELECT i, CASE WHEN i % 10 = 0 THEN NULL ELSE 'Women' END
+FROM generate_series(1, 20000) AS i;
+INSERT INTO vector_boolnull VALUES (30000, NULL), (30001, NULL);
+ANALYZE vector_boolnull;
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vector_boolnull
+WHERE b = 'Women' AND (a = 30 OR a = 31);
+SELECT count(*) FROM vector_boolnull
+WHERE b = 'Women' AND (a = 30 OR a = 31);
+SELECT count(*) FROM vector_boolnull
+WHERE b = 'Women' AND a = 30000;
+SELECT count(*) FROM vector_boolnull
+WHERE NOT (b = 'Women' OR a = 30001);
+SELECT count(*) FROM vector_boolnull
+WHERE NOT (b = 'Nope' OR a = 30001);
+RESET gp_vectorized_execution;
+DROP TABLE vector_boolnull;
+-- ---- Correlated subplan results must outlive the per-row evaluation ----
+-- A pass-by-reference subplan result (e.g. a numeric average) lives in the
+-- subplan's per-tuple memory, which the next row's execution resets.  The
+-- vector qual evaluates a whole batch before any row is consumed, so the
+-- result must be copied to durable storage; otherwise every row compares
+-- against the last row's value.
+CREATE TABLE vector_subplan_lifetime (a int, cat char(10), p numeric(7,2))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO vector_subplan_lifetime
+SELECT i, ('C' || (i % 7))::char(10), (10 + (i % 47))::numeric(7,2)
+FROM generate_series(1, 20000) AS i;
+ANALYZE vector_subplan_lifetime;
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vector_subplan_lifetime t
+WHERE t.p > 1.2 * (SELECT avg(u.p) FROM vector_subplan_lifetime u
+                   WHERE u.cat = t.cat);
+SELECT count(*) FROM vector_subplan_lifetime t
+WHERE t.p > 1.2 * (SELECT avg(u.p) FROM vector_subplan_lifetime u
+                   WHERE u.cat = t.cat);
+SELECT t.cat, count(*), sum(t.p) FROM vector_subplan_lifetime t
+WHERE t.p > 1.2 * (SELECT avg(u.p) FROM vector_subplan_lifetime u
+                   WHERE u.cat = t.cat)
+GROUP BY t.cat ORDER BY t.cat;
+RESET gp_vectorized_execution;
+DROP TABLE vector_subplan_lifetime;
+-- ---- Nested Loop prefetch rescan over an aggregate region ----
+-- Same prefetch-rewind case as vector_nl_prefetch above, but the inner
+-- region root is a blocking aggregate: the rescan must reset the aggregate
+-- state along with the leaf scan, or the join sees an empty inner side.
+CREATE TABLE vector_nl_prefetch_agg (a int, g int, v numeric(12,2))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO vector_nl_prefetch_agg
+SELECT i, i % 11, (i % 1000)::numeric(12,2) FROM generate_series(1, 60000) AS i;
+ANALYZE vector_nl_prefetch_agg;
+SET gp_vectorized_execution = force;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET optimizer_enable_hashjoin = off;
+SET optimizer_enable_mergejoin = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM
+  (SELECT avg(v) AS m FROM vector_nl_prefetch_agg WHERE g = 1 GROUP BY g) o,
+  (SELECT g, avg(v) AS s FROM vector_nl_prefetch_agg GROUP BY g) i
+WHERE i.s > 0.9 * o.m;
+SELECT count(*) FROM
+  (SELECT avg(v) AS m FROM vector_nl_prefetch_agg WHERE g = 1 GROUP BY g) o,
+  (SELECT g, avg(v) AS s FROM vector_nl_prefetch_agg GROUP BY g) i
+WHERE i.s > 0.9 * o.m;
+RESET optimizer_enable_hashjoin;
+RESET optimizer_enable_mergejoin;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET gp_vectorized_execution;
+DROP TABLE vector_nl_prefetch_agg;
+-- ---- Fixed-length pass-by-reference columns over batch motion ----
+-- timetz, interval and name are fixed-length but pass-by-reference; the
+-- batch motion codec must measure them by typlen, not VARSIZE_ANY, or the
+-- sender dereferences the value bytes as a varlena header and crashes.
+CREATE TABLE vector_fixedref (a int, t timetz, n name, i interval)
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO vector_fixedref
+SELECT i, ('01:0' || (i % 10) || ':00+0' || (i % 3))::timetz,
+       ('n' || i)::name, (i || ' seconds')::interval
+FROM generate_series(1, 1000) AS i;
+ANALYZE vector_fixedref;
+SET gp_vectorized_execution = force;
+SELECT count(*), count(t), min(t), max(t) FROM vector_fixedref;
+SELECT n, i FROM vector_fixedref WHERE a = 7;
+RESET gp_vectorized_execution;
+DROP TABLE vector_fixedref;
 DROP TABLE vector_float_test;
 DROP TABLE vector_append_parent CASCADE;
 DROP TABLE vector_part_test CASCADE;

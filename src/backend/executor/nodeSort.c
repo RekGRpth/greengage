@@ -712,6 +712,7 @@ VectorSortCreate(SortState *node, const VectorBatch *batch)
 	state->sort_keys = palloc0(sizeof(SortSupportData) * sort->numCols);
 	state->mem_limit = (int64) PlanStateOperatorMemKB((PlanState *) node) * 1024;
 	state->native = state->mem_limit > 0;
+	state->mark_position = -1;	/* palloc0 above would leave a fake mark at 0 */
 	state->values_context = AllocSetContextCreate(estate->es_query_cxt,
 											 "Vector Sort Values",
 											 ALLOCSET_DEFAULT_MINSIZE,
