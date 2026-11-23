@@ -255,7 +255,7 @@ bool		gp_recursive_cte = true;
 bool		gp_eager_two_phase_agg = false;
 bool		gp_force_random_redistribution = false;
 
-int			gp_vectorized_execution = GP_VECTORIZED_EXECUTION_OFF;
+int			gp_vectorized_execution = GP_VECTORIZED_EXECUTION_FORCE;
 int			gp_vectorized_min_rows = 10000;
 double		gp_vectorized_cost_op_factor = 0.25;
 double		gp_vectorized_cost_margin = 0.25;
@@ -4887,7 +4887,7 @@ struct config_enum ConfigureNamesEnum_gp[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&gp_vectorized_execution,
-		GP_VECTORIZED_EXECUTION_OFF, gp_vectorized_execution_options,
+		GP_VECTORIZED_EXECUTION_FORCE, gp_vectorized_execution_options,
 		NULL, NULL, NULL
 	},
 
