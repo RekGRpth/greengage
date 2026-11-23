@@ -1345,6 +1345,19 @@ execMotionSenderBatch(MotionState *node)
 	if (!VectorRegionPullOutputBatch(outerNode, &batch))
 		return false;
 
+	/*
+	 * The motion's output must be the batch columns as-is (a prefix at
+	 * most).  A shape the batch cannot cover (an output column with no
+	 * batch column behind it, e.g. a void column from a nested-loop
+	 * inner under entrydb execution) declines batch sending; the caller
+	 * re-runs the motion row-wise.  The column counts are shape-constant,
+	 * so the mismatch, if any, shows on the first batch, before anything
+	 * is sent.
+	 */
+	if (batch != NULL &&
+		ExecGetResultType((PlanState *) node)->natts > batch->ncols)
+		return false;
+
 	if (motion->motionType == MOTIONTYPE_GATHER_SINGLE &&
 		GpIdentity.segindex != (gp_session_id % node->numInputSegs))
 		designated = false;		/* consume and drop, like the row path */
