@@ -33,6 +33,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/datum.h"
 #include "utils/float.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -205,6 +206,8 @@ typedef struct VectorExprStep
 	int16	   *defer_dscale;
 	uint64	   *defer_valid;
 	int32	   *scratch[2];
+	bool	   *bool_scratch;	/* per-row three-valued-logic flag for
+								 * VEC_AND/VEC_OR (allocated lazily) */
 	struct VectorExprStep *case_operand;
 	bool	   *array_nulls;
 	union
@@ -366,6 +369,8 @@ typedef struct VectorExprStep
 			TupleTableSlot *slot;	/* scan-shaped row of the current batch */
 			AttrNumber *outer_attnos;	/* Agg outer tlist -> batch columns */
 			int			outer_ncols;
+			int16		typlen;		/* result type for the datum copy below */
+			bool		typbyval;
 		}			subplan;
 	}			u;
 } VectorExprStep;
@@ -856,6 +861,15 @@ alloc_step(VectorExprKind kind, int nargs, int capacity)
 	{
 		step->scratch[0] = palloc(sizeof(int32) * capacity);
 		step->scratch[1] = palloc(sizeof(int32) * capacity);
+	}
+	if (kind == VEC_AND || kind == VEC_OR)
+	{
+		/*
+		 * Per-row flag recording that a non-final argument evaluated to NULL;
+		 * a row still undecided at the final argument must then come out NULL
+		 * (three-valued logic), not take the final argument's value.
+		 */
+		step->bool_scratch = palloc(sizeof(bool) * capacity);
 	}
 	return step;
 }
@@ -1997,6 +2011,9 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 					step = alloc_step(VEC_SUBPLAN, 0, batch->capacity);
 					init_value(&step->value, exprType((Node *) sp), -1,
 							   batch->capacity, true, batch->packed_i32);
+					get_typlenbyval(exprType((Node *) sp),
+									&step->u.subplan.typlen,
+									&step->u.subplan.typbyval);
 				{
 					MemoryContext oldcontext = MemoryContextSwitchTo(
 						vars->estate->es_query_cxt);
@@ -3806,10 +3823,12 @@ eval_bool(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 {
 	int32	   *current = step->scratch[0];
 	int32	   *next = step->scratch[1];
+	bool	   *seen_null = step->bool_scratch;
 	int			ncurrent = nselected;
 	int			argno;
 
 	memcpy(current, selection, sizeof(int32) * nselected);
+	memset(seen_null, 0, sizeof(bool) * batch->capacity);
 	for (argno = 0; argno < step->nargs && ncurrent > 0; argno++)
 	{
 		VectorExprStep *arg = step->args[argno];
@@ -3826,7 +3845,22 @@ eval_bool(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 
 			if (last)
 			{
-				value_set(&step->value, row, arg->value.values[row], isnull);
+				/*
+				 * Three-valued logic: a NULL final argument always yields
+				 * NULL; a TRUE final argument of an AND (or FALSE final
+				 * argument of an OR) yields NULL when an earlier argument
+				 * was NULL, the plain value otherwise.
+				 */
+				if (isnull)
+					value_set(&step->value, row, (Datum) 0, true);
+				else if (step->kind == VEC_AND && !value)
+					value_set(&step->value, row, BoolGetDatum(false), false);
+				else if (step->kind == VEC_OR && value)
+					value_set(&step->value, row, BoolGetDatum(true), false);
+				else
+					value_set(&step->value, row,
+							  seen_null[row] ? (Datum) 0 : arg->value.values[row],
+							  seen_null[row]);
 				continue;
 			}
 
@@ -3835,7 +3869,10 @@ eval_bool(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 			else if (step->kind == VEC_OR && !isnull && value)
 				value_set(&step->value, row, BoolGetDatum(true), false);
 			else
+			{
+				seen_null[row] |= isnull;
 				next[nnext++] = row;
+			}
 		}
 		{
 			int32	   *swap = current;
@@ -4493,6 +4530,15 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 					step->u.subplan.econtext->ecxt_outertuple = slot;
 					result = ExecSubPlan(step->u.subplan.sstate,
 										 step->u.subplan.econtext, &isnull);
+					/*
+					 * The result datum may point into the subplan's
+					 * per-tuple memory, which the next row's execution
+					 * resets; batch argument evaluation defers the
+					 * consumption, so durable storage is required.
+					 */
+					if (!isnull && !step->u.subplan.typbyval)
+						result = datumCopy(result, false,
+										   step->u.subplan.typlen);
 					value_set(&step->value, row, result, isnull);
 				}
 				return;

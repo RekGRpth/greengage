@@ -1226,8 +1226,8 @@ VectorBuildScanCreate(VectorRegionState *region, SeqScanState *scan,
 									 vs->batch, &vars);
 		if (vs->qual == NULL)
 		{
-			VectorBuildScanDestroy(vs);
 			MemoryContextSwitchTo(oldcontext);
+			VectorBuildScanDestroy(vs);
 			return NULL;
 		}
 	}
