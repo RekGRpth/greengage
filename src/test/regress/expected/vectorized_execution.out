@@ -32,6 +32,15 @@ DROP TABLE IF EXISTS vector_boolnull;
 DROP TABLE IF EXISTS vector_subplan_lifetime;
 DROP TABLE IF EXISTS vector_nl_prefetch_agg;
 DROP TABLE IF EXISTS vector_fixedref;
+DROP TABLE IF EXISTS vector_nl_pull_a;
+DROP TABLE IF EXISTS vector_nl_pull_b;
+DROP TABLE IF EXISTS vector_cpf_1;
+DROP TABLE IF EXISTS vector_cpf_2;
+DROP TABLE IF EXISTS vector_cpf_3m;
+DROP TABLE IF EXISTS vector_wholerow_t;
+DROP VIEW IF EXISTS vector_wholerow_v;
+DROP TYPE IF EXISTS vector_wholerow_rec;
+DROP TYPE IF EXISTS vector_wholerow_nested;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -5755,3 +5764,144 @@ DROP TABLE vector_copy_fn;
 DROP TABLE vector_copy_fn2;
 DROP TABLE vector_copy_numovf;
 DROP TABLE vector_f4sum;
+-- ---- A join-rooted region must not leak its probe scan to the motion sender ----
+-- The motion batch sender pulls a region's output batches directly, and a
+-- NestLoop-rooted region's output is the joined rows, not its probe scan's
+-- batches.  The batchable-output gates declined only hash joins, so the
+-- sender handed the probe scan's raw batches to the gather and the query
+-- lost every row, while count(*) over the same join stayed correct through
+-- the row path.  The projection must stay in place with no ORDER BY: either
+-- would put a row-wise node between the region and the motion and mask the
+-- bug.  The tables stay unanalyzed on purpose: with default estimates the
+-- planner broadcasts the inner side, keeping the probe a local scan, which
+-- is the shape the region wrap needs (analyzed sizes make it broadcast the
+-- probe side instead, and the row-mode join hides the bug).  Every output
+-- row renders identically, so no ordering is needed for a deterministic
+-- diff.
+CREATE TABLE vector_nl_pull_a (f1 boolean) DISTRIBUTED BY (f1);
+CREATE TABLE vector_nl_pull_b (f1 boolean) DISTRIBUTED BY (f1);
+INSERT INTO vector_nl_pull_a SELECT true FROM generate_series(1, 3);
+INSERT INTO vector_nl_pull_b SELECT false FROM generate_series(1, 4);
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT a.f1, b.f1 FROM vector_nl_pull_a a, vector_nl_pull_b b
+WHERE b.f1 <> a.f1;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (VectorRegion)
+         ->  Nested Loop
+               Join Filter: (vector_region.c1 <> a.f1)
+               ->  Seq Scan on vector_nl_pull_a a
+               ->  Materialize
+                     ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Seq Scan on vector_nl_pull_b b
+(10 rows)
+
+SELECT a.f1, b.f1 FROM vector_nl_pull_a a, vector_nl_pull_b b
+WHERE b.f1 <> a.f1;
+ f1 | f1 
+----+----
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+ t  | f
+(12 rows)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_nl_pull_a;
+DROP TABLE vector_nl_pull_b;
+-- ---- The COPY fast parse must reject rows the regular path rejects ----
+-- With the fast parse engaged (any gp_vectorized_execution other than
+-- off), two dispatch-split holes silently accepted bad rows: a line with
+-- more fields than the table dropped the extra ones, and a short line
+-- whose missing column the QE still owed (a middle distribution key
+-- keeps the QD prefix shorter than the line) loaded with NULLs.  Both
+-- must error exactly as they do with the feature off, and clean loads
+-- must keep working.  The rows come in over COPY FROM STDIN, inline.
+CREATE TABLE vector_cpf_1 (c1 text) DISTRIBUTED BY (c1);
+CREATE TABLE vector_cpf_2 (c1 text, c2 text) DISTRIBUTED BY (c2);
+CREATE TABLE vector_cpf_3m (c1 text, c2 text, c3 text) DISTRIBUTED BY (c2);
+SET gp_vectorized_execution = force;
+COPY vector_cpf_1 FROM STDIN WITH (DELIMITER ',');
+ERROR:  extra data after last expected column
+COPY vector_cpf_3m FROM STDIN WITH (DELIMITER ',');
+ERROR:  missing data for column "c3"
+COPY vector_cpf_2 FROM STDIN WITH (DELIMITER ',');
+SELECT count(*) FROM vector_cpf_1;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM vector_cpf_2;
+ count 
+-------
+     1
+(1 row)
+
+SELECT c1, c2 FROM vector_cpf_2;
+ c1 |  c2   
+----+-------
+ 1  | text1
+(1 row)
+
+SELECT count(*) FROM vector_cpf_3m;
+ count 
+-------
+     0
+(1 row)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_cpf_1;
+DROP TABLE vector_cpf_2;
+DROP TABLE vector_cpf_3m;
+-- ---- Whole-row vars and composite constructors ----
+-- A whole-row var reaches the row reader as attno 0; the deform set
+-- computed from pulled var numbers marked no column at all, so every
+-- whole-row expression assembled an all-zero tuple (and a ConvertRowtype
+-- over it crashed in the standard rowtype conversion).  The view wraps
+-- row(whole-row)::composite over a typed table, the exact create_view
+-- shape that failed.
+CREATE TYPE vector_wholerow_rec AS (q1 int8, q2 int8);
+CREATE TABLE vector_wholerow_t OF vector_wholerow_rec;
+INSERT INTO vector_wholerow_t VALUES (123, 456), (123, 4567890123456789);
+CREATE TYPE vector_wholerow_nested AS (x vector_wholerow_rec);
+CREATE VIEW vector_wholerow_v AS
+  SELECT row(i)::vector_wholerow_nested FROM vector_wholerow_t i;
+SET gp_vectorized_execution = force;
+SELECT i FROM vector_wholerow_t i;
+           i            
+------------------------
+ (123,456)
+ (123,4567890123456789)
+(2 rows)
+
+SELECT row(i) FROM vector_wholerow_t i;
+            row             
+----------------------------
+ ("(123,456)")
+ ("(123,4567890123456789)")
+(2 rows)
+
+SELECT * FROM vector_wholerow_v;
+            row             
+----------------------------
+ ("(123,456)")
+ ("(123,4567890123456789)")
+(2 rows)
+
+RESET gp_vectorized_execution;
+DROP VIEW vector_wholerow_v;
+DROP TABLE vector_wholerow_t;
+DROP TYPE vector_wholerow_nested;
+DROP TYPE vector_wholerow_rec;

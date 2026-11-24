@@ -120,6 +120,14 @@ typedef struct VectorRegionState
 	 * shapes).
 	 */
 	struct VectorRowLeafState *build_row_leaf;
+	/*
+	 * Adaptive leaf over a Motion receiver feeding a build chain: batch
+	 * interconnect frames hand over as batches directly, plain tuple
+	 * streams fall back to the embedded row adapter (kept in sync with
+	 * build_row_leaf above so a chain never carries both).  Kept at the
+	 * struct end: ABI-stable extension like the other build fields.
+	 */
+	struct VectorMotionLeafState *build_motion_leaf;
 	VectorBatch *batch;
 	VectorBatch *join_batch;
 	bool		nested_batches;
@@ -661,13 +669,27 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			pull_varattnos((Node *) scan->plan.targetlist, scan->scanrelid, &attrs);
 			pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &attrs);
 			/*
-			 * Siblings carry their own deform sets (append_read_attrs);
-			 * only this child's referenced attributes belong here.
+			 * A whole-row var arrives as attno 0 in the pulled set and reads
+			 * every attribute; without this no column would be deformed and
+			 * the whole-row expression would assemble an all-zero tuple.
 			 */
-			for (col = 0; col < natts; col++)
-				state->read_attrs[col] =
-					bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
-			bms_free(attrs);
+			if (bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs))
+			{
+				for (col = 0; col < natts; col++)
+					state->read_attrs[col] = true;
+				bms_free(attrs);
+			}
+			else
+			{
+				/*
+				 * Siblings carry their own deform sets (append_read_attrs);
+				 * only this child's referenced attributes belong here.
+				 */
+				for (col = 0; col < natts; col++)
+					state->read_attrs[col] =
+						bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
+				bms_free(attrs);
+			}
 		}
 		if (state->append != NULL)
 		{
@@ -952,6 +974,19 @@ VectorRowLeafDestroy(VectorRowLeafState *leaf)
 		return;
 	if (leaf->batch != NULL)
 		VectorBatchDestroy(leaf->batch);
+	pfree(leaf);
+}
+
+/* Free an adaptive motion leaf and whichever of its two paths holds data. */
+static void
+VectorMotionLeafDestroy(VectorMotionLeafState *leaf)
+{
+	if (leaf == NULL)
+		return;
+	if (leaf->current != NULL)
+		VectorBatchDestroy(leaf->current);
+	if (leaf->row.batch != NULL)
+		VectorBatchDestroy(leaf->row.batch);
 	pfree(leaf);
 }
 
@@ -1304,7 +1339,10 @@ VectorRegionOutputBatchable(VectorRegionState *state)
 		return false;
 	if (state->nested_batches)
 		return true;
-	if (state->hj != NULL || state->scan == NULL || state->append != NULL ||
+	if (state->hj != NULL || state->nestloop != NULL ||
+		state->mergejoin != NULL || state->material != NULL ||
+		state->unique != NULL ||
+		state->scan == NULL || state->append != NULL ||
 		state->limit != NULL || state->packed_i32 ||
 		state->motion_leaf != NULL || state->row_leaf != NULL)
 		return false;
@@ -1426,11 +1464,36 @@ VectorRegionInitBuildChain(VectorRegionState *state)
 			state->build_scan = NULL;
 			VectorRowLeafDestroy(state->build_row_leaf);
 			state->build_row_leaf = NULL;
+			VectorMotionLeafDestroy(state->build_motion_leaf);
+			state->build_motion_leaf = NULL;
 			return;
 		}
 		VectorHashJoinSetBuildSource(state->vhj,
 									 VectorBuildChainSourceNext, build);
 		state->build_vhj = build;
+	}
+	else if (IsA(child, MotionState))
+	{
+		/*
+		 * The build side is a Motion receiver: use the adaptive leaf, the
+		 * same one the probe chain uses.  A batch interconnect stream hands
+		 * over as batches (the wire's columns are the motion's output as-is,
+		 * which VectorHashBuildFromBatches reads directly); a plain tuple
+		 * stream falls back to the embedded row adapter.
+		 */
+		state->build_motion_leaf = MemoryContextAllocZero(
+			state->css.ss.ps.state->es_query_cxt,
+			sizeof(VectorMotionLeafState));
+		state->build_motion_leaf->motion = (MotionState *) child;
+		state->build_motion_leaf->row.input = child;
+		state->build_motion_leaf->row.batch = VectorBatchCreate(
+			state->css.ss.ps.state->es_query_cxt,
+			ExecGetResultType(child),
+			VECTOR_BATCH_DEFAULT_CAPACITY,
+			false);
+		VectorHashJoinSetBuildSource(state->vhj,
+									 VectorMotionLeafSource,
+									 state->build_motion_leaf);
 	}
 	else if (IsA(child, CustomScanState) &&
 			 ((CustomScanState *) child)->methods == &vector_region_exec_methods &&
@@ -1894,14 +1957,9 @@ VectorRegionEnd(CustomScanState *node)
 	VectorBuildScanDestroy(state->build_scan);
 	VectorRowLeafDestroy(state->row_leaf);
 	VectorRowLeafDestroy(state->build_row_leaf);
+	VectorMotionLeafDestroy(state->build_motion_leaf);
 	if (state->motion_leaf != NULL)
-	{
-		if (state->motion_leaf->current != NULL)
-			VectorBatchDestroy(state->motion_leaf->current);
-		VectorBatchDestroy(state->motion_leaf->row.batch);
-		pfree(state->motion_leaf);
-		state->motion_leaf = NULL;
-	}
+		VectorMotionLeafDestroy(state->motion_leaf);
 	if (state->proj != NULL)
 	{
 		int			col;
@@ -2015,6 +2073,21 @@ VectorRegionRescan(CustomScanState *node)
 	}
 	if (state->build_row_leaf != NULL)
 		state->build_row_leaf->eof = false;
+	if (state->build_motion_leaf != NULL)
+	{
+		/*
+		 * Same re-decision rule as the probe motion leaf: a stale EOS
+		 * decision or a handed-out batch would make every execution after
+		 * the first read an empty build.
+		 */
+		state->build_motion_leaf->decided = 0;
+		if (state->build_motion_leaf->current != NULL)
+		{
+			VectorBatchDestroy(state->build_motion_leaf->current);
+			state->build_motion_leaf->current = NULL;
+		}
+		state->build_motion_leaf->row.eof = false;
+	}
 	if (state->vagg != NULL)
 		VectorAggReset(state->vagg);
 	else if (state->vhj == NULL)
@@ -2109,7 +2182,9 @@ VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
 		return true;
 	}
 
-	if (state->hj != NULL ||
+	if (state->hj != NULL || state->nestloop != NULL ||
+		state->mergejoin != NULL || state->material != NULL ||
+		state->unique != NULL ||
 		state->scan == NULL || state->append != NULL ||
 		state->limit != NULL || state->packed_i32 ||
 		state->motion_leaf != NULL || state->row_leaf != NULL)

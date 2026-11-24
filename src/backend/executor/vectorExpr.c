@@ -1729,6 +1729,18 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 		case T_ConvertRowtypeExpr:
 			{
 				ConvertRowtypeExpr *ce = (ConvertRowtypeExpr *) expr;
+				ExprEvalRowtypeCache *rowcachep;
+
+				/*
+				 * ExecEvalConvertRowtype builds its conversion map lazily
+				 * through these caches and dereferences them unconditionally;
+				 * the zeroed step would send it through NULL pointers.  Cache
+				 * structs must be out-of-line for space reasons, exactly as
+				 * in ExecInitExprRec.
+				 */
+				rowcachep = palloc(2 * sizeof(ExprEvalRowtypeCache));
+				rowcachep[0].cacheptr = NULL;
+				rowcachep[1].cacheptr = NULL;
 
 				step = alloc_step(VEC_CONVERTROWTYPE, 1, batch->capacity);
 				init_value(&step->value, ce->resulttype, -1, batch->capacity, true, batch->packed_i32);
@@ -1737,6 +1749,8 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->u.convertrowtype.op->resnull = &step->u.convertrowtype.isnull;
 				step->u.convertrowtype.op->d.convert_rowtype.inputtype = exprType((Node *) ce->arg);
 				step->u.convertrowtype.op->d.convert_rowtype.outputtype = ce->resulttype;
+				step->u.convertrowtype.op->d.convert_rowtype.incache = &rowcachep[0];
+				step->u.convertrowtype.op->d.convert_rowtype.outcache = &rowcachep[1];
 				step->u.convertrowtype.econtext = palloc0(sizeof(ExprContext));
 				step->u.convertrowtype.econtext->ecxt_per_query_memory = CurrentMemoryContext;
 				step->args[0] = build_step(ce->arg, batch, vars, case_test);

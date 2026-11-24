@@ -1320,8 +1320,8 @@ ExecSquelchMotion(MotionState *node)
  * was consumed this way; false when the child is not a batch-producing
  * region and the caller must fall back to the per-row loop.
  *
- * Only unsorted gather and hash-redistribute motions take the batch
- * path for now; broadcast and explicit motions stay per-row.
+ * Unsorted gather, gather-single, hash-redistribute and broadcast motions
+ * take the batch path; explicit motions stay per-row.
  */
 static bool
 execMotionSenderBatch(MotionState *node)
@@ -1338,7 +1338,8 @@ execMotionSenderBatch(MotionState *node)
 
 	if ((motion->motionType != MOTIONTYPE_GATHER &&
 		 motion->motionType != MOTIONTYPE_GATHER_SINGLE &&
-		 motion->motionType != MOTIONTYPE_HASH) ||
+		 motion->motionType != MOTIONTYPE_HASH &&
+		 motion->motionType != MOTIONTYPE_BROADCAST) ||
 		motion->sendSorted)
 		return false;
 
@@ -1455,14 +1456,22 @@ execMotionSenderBatch(MotionState *node)
 		}
 		else if (designated)
 		{
+			/*
+			 * Gather goes to route 0; broadcast fans out through the
+			 * interconnect from the shared BROADCAST_SEGIDX marker, exactly
+			 * like the row path's targetRoute.
+			 */
+			int16		route = motion->motionType == MOTIONTYPE_BROADCAST ?
+				BROADCAST_SEGIDX : 0;
+
 			CheckAndSendRecordCache(node->ps.state->motionlayer_context,
 									node->ps.state->interconnect_context,
-									motion->motionID, 0);
+									motion->motionID, route);
 			VectorBatchEncodeRows(&buf, batch, outncols, NULL, nrows);
 			sendRC = SendBatchChunk(node->ps.state->motionlayer_context,
 									node->ps.state->interconnect_context,
 									motion->motionID,
-									buf.data, buf.len, 0);
+									buf.data, buf.len, route);
 		}
 
 		MemoryContextSwitchTo(oldcxt);
