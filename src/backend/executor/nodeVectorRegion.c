@@ -1325,7 +1325,10 @@ VectorRegionOutputBatchable(VectorRegionState *state)
 		return false;
 	if (state->nested_batches)
 		return true;
-	if (state->hj != NULL || state->scan == NULL || state->append != NULL ||
+	if (state->hj != NULL || state->nestloop != NULL ||
+		state->mergejoin != NULL || state->material != NULL ||
+		state->unique != NULL ||
+		state->scan == NULL || state->append != NULL ||
 		state->limit != NULL || state->packed_i32 ||
 		state->motion_leaf != NULL || state->row_leaf != NULL)
 		return false;
@@ -2165,7 +2168,9 @@ VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
 		return true;
 	}
 
-	if (state->hj != NULL ||
+	if (state->hj != NULL || state->nestloop != NULL ||
+		state->mergejoin != NULL || state->material != NULL ||
+		state->unique != NULL ||
 		state->scan == NULL || state->append != NULL ||
 		state->limit != NULL || state->packed_i32 ||
 		state->motion_leaf != NULL || state->row_leaf != NULL)

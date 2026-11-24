@@ -32,6 +32,8 @@ DROP TABLE IF EXISTS vector_boolnull;
 DROP TABLE IF EXISTS vector_subplan_lifetime;
 DROP TABLE IF EXISTS vector_nl_prefetch_agg;
 DROP TABLE IF EXISTS vector_fixedref;
+DROP TABLE IF EXISTS vector_nl_pull_a;
+DROP TABLE IF EXISTS vector_nl_pull_b;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1684,3 +1686,30 @@ DROP TABLE vector_copy_fn;
 DROP TABLE vector_copy_fn2;
 DROP TABLE vector_copy_numovf;
 DROP TABLE vector_f4sum;
+-- ---- A join-rooted region must not leak its probe scan to the motion sender ----
+-- The motion batch sender pulls a region's output batches directly, and a
+-- NestLoop-rooted region's output is the joined rows, not its probe scan's
+-- batches.  The batchable-output gates declined only hash joins, so the
+-- sender handed the probe scan's raw batches to the gather and the query
+-- lost every row, while count(*) over the same join stayed correct through
+-- the row path.  The projection must stay in place with no ORDER BY: either
+-- would put a row-wise node between the region and the motion and mask the
+-- bug.  The tables stay unanalyzed on purpose: with default estimates the
+-- planner broadcasts the inner side, keeping the probe a local scan, which
+-- is the shape the region wrap needs (analyzed sizes make it broadcast the
+-- probe side instead, and the row-mode join hides the bug).  Every output
+-- row renders identically, so no ordering is needed for a deterministic
+-- diff.
+CREATE TABLE vector_nl_pull_a (f1 boolean) DISTRIBUTED BY (f1);
+CREATE TABLE vector_nl_pull_b (f1 boolean) DISTRIBUTED BY (f1);
+INSERT INTO vector_nl_pull_a SELECT true FROM generate_series(1, 3);
+INSERT INTO vector_nl_pull_b SELECT false FROM generate_series(1, 4);
+SET gp_vectorized_execution = force;
+EXPLAIN (COSTS OFF)
+SELECT a.f1, b.f1 FROM vector_nl_pull_a a, vector_nl_pull_b b
+WHERE b.f1 <> a.f1;
+SELECT a.f1, b.f1 FROM vector_nl_pull_a a, vector_nl_pull_b b
+WHERE b.f1 <> a.f1;
+RESET gp_vectorized_execution;
+DROP TABLE vector_nl_pull_a;
+DROP TABLE vector_nl_pull_b;
