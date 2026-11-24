@@ -904,9 +904,18 @@ VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
 	slot = MakeSingleTupleTableSlot(child->ps_ResultTupleDesc, &TTSOpsVirtual);
 	ncols = slot->tts_tupleDescriptor->natts;
 
-	while (!quit && VectorHashJoinNextBatch((VectorHashJoinState *) state->build_arg))
+	for (;;)
 	{
-		VectorBatch *batch = ((VectorHashJoinState *) state->build_arg)->output;
+		VectorBatch *batch = NULL;
+
+		/*
+		 * The build feed callback (VectorHashJoinSetBuildSource) pulls the
+		 * next batch: true with a batch to insert, true with NULL at end
+		 * of stream, false when the source declined (treated as EOF; the
+		 * init side gates the source before setting it).
+		 */
+		if (!state->next_build(state->build_arg, &batch) || batch == NULL)
+			break;
 
 		for (row = 0; row < batch->nselected; row++)
 		{
@@ -914,14 +923,20 @@ VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
 			uint32		hashvalue;
 			Datum		value;
 			bool		isnull;
+			/*
+			 * A region's scan batch carries a selection: positions map to
+			 * rows through it, raw indices would read unfiltered rows.
+			 * A nested join's output batches have an identity selection.
+			 */
+			int			r = VectorBatchSelectedRow(batch, row);
 
 			CHECK_FOR_INTERRUPTS();
 
 			ExecClearTuple(slot);
 			for (col = 0; col < ncols; col++)
 			{
-				value = VectorBatchGetDatum(batch, col, row);
-				isnull = VectorBatchIsNull(batch, col, row);
+				value = VectorBatchGetDatum(batch, col, r);
+				isnull = VectorBatchIsNull(batch, col, r);
 				slot->tts_values[col] = value;
 				slot->tts_isnull[col] = isnull;
 			}
@@ -956,6 +971,8 @@ VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
 				}
 			}
 		}
+		if (quit)
+			break;
 	}
 
 	ExecClearTuple(slot);
