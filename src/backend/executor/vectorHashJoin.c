@@ -98,11 +98,18 @@ VectorHashJoinPlanIsSupported(HashJoin *join)
 	 * The build side is consumed row-wise through the standard Hash node,
 	 * so its input may be any plan; only the probe side feeds on batches
 	 * and must be a simple scan.
+	 *
+	 * extParam is the honest "this subtree references an external param"
+	 * signal: GPDB's finalize_plan adds every initPlan's setParams to
+	 * allParam of every node in the main tree, so in any query with an
+	 * initPlan allParam is non-NULL everywhere (e.g. a HAVING referencing
+	 * the initPlan result).  A region executes once per slice and initPlan
+	 * params are fixed before dispatch, so the polluted allParam is
+	 * harmless here; the agg region already runs with it.
 	 */
 	if (join->hashclauses == NIL ||
 		join->hashqualclauses != NIL || join->hashkeys == NIL ||
-		join->join.plan.initPlan != NIL || join->join.plan.extParam != NULL ||
-		join->join.plan.allParam != NULL)
+		join->join.plan.initPlan != NIL || join->join.plan.extParam != NULL)
 		return false;
 
 	switch (join->join.jointype)
