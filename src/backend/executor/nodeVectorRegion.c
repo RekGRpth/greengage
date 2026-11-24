@@ -1294,6 +1294,61 @@ VectorBuildLeafSource(void *arg, VectorBatch **batch)
  * chain's probe side is batchable, run it batch-wise and feed the hash build
  * from its output batches instead of MultiExecHash's row-wise pull.
  */
+static bool
+VectorRegionOutputBatchable(VectorRegionState *state)
+{
+	int			col;
+
+	/* an aggregate or sort consumes the join batches: row-wise output */
+	if (state->agg != NULL || state->sort != NULL)
+		return false;
+	if (state->nested_batches)
+		return true;
+	if (state->hj != NULL || state->scan == NULL || state->append != NULL ||
+		state->limit != NULL || state->packed_i32 ||
+		state->motion_leaf != NULL || state->row_leaf != NULL)
+		return false;
+	/* computed projections do not materialize into batch columns */
+	if (state->proj != NULL)
+		return false;
+	/* the motion output columns must be the batch columns as-is; a batch
+	 * wider than the output is a fine prefix, but an output column with no
+	 * batch column behind it (e.g. a void column from a nested-loop inner)
+	 * must fall back to the row-wise output */
+	if (state->output_ncols > state->batch->ncols)
+		return false;
+	/* the output columns must be the batch columns as-is */
+	for (col = 0; col < state->output_ncols; col++)
+	{
+		if (state->output_attnos[col] != col)
+			return false;
+	}
+	return true;
+}
+
+/* Pull-convention feed over a nested build join's output batches. */
+static bool
+VectorBuildChainSourceNext(void *arg, VectorBatch **batch)
+{
+	VectorHashJoinState *state = (VectorHashJoinState *) arg;
+
+	if (!VectorHashJoinNextBatch(state))
+	{
+		*batch = NULL;
+		return true;
+	}
+	*batch = VectorHashJoinOutput(state);
+	return true;
+}
+
+/* Pull-convention feed straight from a region's native output batches. */
+static bool
+VectorRegionBuildSourceNext(void *arg, VectorBatch **batch)
+{
+	(void) VectorRegionPullOutputBatch((PlanState *) arg, batch);
+	return *batch != NULL;
+}
+
 static VectorHashJoinState *
 VectorRegionCreateBuildChain(VectorRegionState *region, HashJoinState *hj)
 {
@@ -1361,21 +1416,37 @@ VectorRegionInitBuildChain(VectorRegionState *state)
 	if (!IsA(hash, HashState))
 		return;
 	child = outerPlanState(hash);
-	if (!IsA(child, HashJoinState))
-		return;
-	build = VectorRegionCreateBuildChain(state, (HashJoinState *) child);
-	if (build == NULL)
+	if (IsA(child, HashJoinState))
 	{
-		/* the leaf may have been created before a deeper failure */
-		VectorBuildScanDestroy(state->build_scan);
-		state->build_scan = NULL;
-		VectorRowLeafDestroy(state->build_row_leaf);
-		state->build_row_leaf = NULL;
-		return;
+		build = VectorRegionCreateBuildChain(state, (HashJoinState *) child);
+		if (build == NULL)
+		{
+			/* the leaf may have been created before a deeper failure */
+			VectorBuildScanDestroy(state->build_scan);
+			state->build_scan = NULL;
+			VectorRowLeafDestroy(state->build_row_leaf);
+			state->build_row_leaf = NULL;
+			return;
+		}
+		VectorHashJoinSetBuildSource(state->vhj,
+									 VectorBuildChainSourceNext, build);
+		state->build_vhj = build;
 	}
-	VectorHashJoinSetBuildSource(state->vhj,
-								 VectorHashJoinSourceNextBatch, build);
-	state->build_vhj = build;
+	else if (IsA(child, CustomScanState) &&
+			 ((CustomScanState *) child)->methods == &vector_region_exec_methods &&
+			 VectorRegionOutputBatchable((VectorRegionState *) child))
+	{
+		/*
+		 * The build side is a region that produces output batches
+		 * natively: feed the hash build straight from them instead of
+		 * MultiExecHash pulling the region's row output one slot at a
+		 * time.  The batchable gate must match VectorRegionPullOutput-
+		 * Batch's own decline conditions, or a mid-stream decline would
+		 * end the feed as an empty build.
+		 */
+		VectorHashJoinSetBuildSource(state->vhj,
+									 VectorRegionBuildSourceNext, child);
+	}
 }
 
 static VectorBatch *

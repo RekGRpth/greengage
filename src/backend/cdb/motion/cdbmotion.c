@@ -775,12 +775,14 @@ decomposeQueuedBatch(MotionNodeEntry *pMNEntry)
 		for (col = 0; col < natts; col++)
 		{
 			isnull[col] = VectorBatchIsNull(batch, col, row);
-			if (!isnull[col])
-				values[col] = VectorBatchCopyDatum(batch, col,
-												   VectorBatchGetDatum(batch, col, row),
-												   false);
-			else
-				values[col] = 0;
+			/*
+			 * No copy needed: heap_form_minimal_tuple copies by-reference
+			 * data into the tuple body right away, and the batch outlives
+			 * this loop.  Copying here as well tripled the allocation
+			 * traffic for row-wise consumers of a batch stream.
+			 */
+			values[col] = isnull[col] ? 0 :
+				VectorBatchGetDatum(batch, col, row);
 		}
 		tup = heap_form_minimal_tuple(tupdesc, values, isnull);
 		htfifo_addtuple(pMNEntry->ready_tuples, tup);

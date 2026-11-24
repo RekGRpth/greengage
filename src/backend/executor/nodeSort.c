@@ -1071,19 +1071,20 @@ VectorSortFinish(SortState *node)
 	}
 }
 
-TupleTableSlot *
-VectorSortNext(SortState *node)
+/*
+ * Emit the next row without touching the node's instrumentation.  The
+ * instrumented entry point is VectorSortNext; VectorSortNextBatch runs
+ * the whole batch under a single start/stop pair and must not re-enter
+ * the instrumented wrapper (a second InstrStartNode on a running node
+ * is an error under EXPLAIN ANALYZE's timing).
+ */
+static TupleTableSlot *
+VectorSortNextRow(SortState *node)
 {
 	VectorSortState *state = (VectorSortState *) node->vector_sort_state;
 	Tuplesortstate *tuplesortstate = (Tuplesortstate *) node->tuplesortstate;
 	TupleTableSlot *slot;
 	ScanDirection dir = node->ss.ps.state->es_direction;
-	/* the region drives the sort directly, so ExecProcNode's
-	 * instrumentation never runs; approximate it per output row */
-	Instrumentation *instr = node->ss.ps.instrument;
-
-	if (instr)
-		InstrStartNode(instr);
 
 	Assert(node->sort_Done);
 	if (state != NULL && state->native)
@@ -1098,8 +1099,6 @@ VectorSortNext(SortState *node)
 		{
 			if (!node->delayEagerFree)
 				ExecEagerFreeSort(node);
-			if (instr)
-				InstrStopNode(instr, 0);
 			return slot;
 		}
 		position = state->position++;
@@ -1114,21 +1113,29 @@ VectorSortNext(SortState *node)
 		}
 		slot->tts_nvalid = state->ncols;
 		slot = ExecStoreVirtualTuple(slot);
-		if (instr)
-			InstrStopNode(instr, 1);
 		return slot;
 	}
 	if (tuplesortstate == NULL)
-	{
-		if (instr)
-			InstrStopNode(instr, 0);
 		return NULL;
-	}
 	slot = node->ss.ps.ps_ResultTupleSlot;
 	(void) tuplesort_gettupleslot(tuplesortstate,
 								  ScanDirectionIsForward(dir), false, slot, NULL);
 	if (TupIsNull(slot) && !node->delayEagerFree)
 		ExecEagerFreeSort(node);
+	return slot;
+}
+
+TupleTableSlot *
+VectorSortNext(SortState *node)
+{
+	/* the region drives the sort directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	Instrumentation *instr = node->ss.ps.instrument;
+	TupleTableSlot *slot;
+
+	if (instr)
+		InstrStartNode(instr);
+	slot = VectorSortNextRow(node);
 	if (instr)
 		InstrStopNode(instr, TupIsNull(slot) ? 0 : 1);
 	return slot;
@@ -1143,8 +1150,9 @@ VectorSortNextBatch(SortState *node, VectorBatch *batch,
 
 	/* the region drives the sort directly, so ExecProcNode's
 	 * instrumentation never runs; approximate it per output batch.
-	 * The non-native path emits through VectorSortNext, which is
-	 * instrumented per row already. */
+	 * The non-native path emits through VectorSortNextRow: the whole
+	 * batch runs under this single start/stop pair, and re-entering the
+	 * instrumented wrapper would start the running node a second time. */
 	if (instr)
 		InstrStartNode(instr);
 
@@ -1183,7 +1191,7 @@ VectorSortNextBatch(SortState *node, VectorBatch *batch,
 	{
 		while (nrows < batch->capacity)
 		{
-			TupleTableSlot *slot = VectorSortNext(node);
+			TupleTableSlot *slot = VectorSortNextRow(node);
 
 			if (TupIsNull(slot))
 				break;

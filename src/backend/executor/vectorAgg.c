@@ -124,6 +124,15 @@ struct VectorAggState
 	uint32		spool_gen;		/* batch generation already spooled */
 	Tuplesortstate **phase_sorts;	/* per phase >= 2: next-phase sort input */
 	Tuplestorestate **phase_stores;	/* plain phases need no ordering */
+	/*
+	 * Argument values evaluated for (args_batch, args_gen).  The sorted
+	 * driver returns after every output row and is re-entered for the next
+	 * one; without this key it would re-evaluate the whole input batch on
+	 * every call (quadratic for row-wise consumers such as a motion
+	 * sender above the region).
+	 */
+	VectorBatch *args_batch;
+	uint32		args_gen;
 };
 
 bool
@@ -1914,7 +1923,15 @@ VectorAggProcessBatchSorted(VectorAggState *state, VectorBatch *batch,
 		return NULL;
 
 	spool_next_phase(state, batch);
-	eval_arguments(state, batch);
+	/* Evaluate once per batch content, not once per call: this driver
+	 * returns after every output row and is re-entered per row by
+	 * row-wise consumers. */
+	if (state->args_batch != batch || state->args_gen != batch->gen)
+	{
+		eval_arguments(state, batch);
+		state->args_batch = batch;
+		state->args_gen = batch->gen;
+	}
 	while (*position < batch->nselected)
 	{
 		int			row = VectorBatchSelectedRow(batch, *position);
@@ -2240,4 +2257,6 @@ VectorAggReset(VectorAggState *state)
 	state->group_open = false;
 	state->projected_set = -1;
 	state->output_done = false;
+	state->args_batch = NULL;
+	state->args_gen = 0;
 }

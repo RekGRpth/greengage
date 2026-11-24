@@ -731,6 +731,8 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 						state->done = true;
 						break;
 					}
+					if (state->done)
+						break;	/* empty INNER/SEMI build, set by the build */
 					if (hashtable->nbatch != 1 ||
 						hashtable->parallel_state != NULL ||
 						hashtable->eagerlyReleased)
@@ -902,9 +904,18 @@ VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
 	slot = MakeSingleTupleTableSlot(child->ps_ResultTupleDesc, &TTSOpsVirtual);
 	ncols = slot->tts_tupleDescriptor->natts;
 
-	while (!quit && VectorHashJoinNextBatch((VectorHashJoinState *) state->build_arg))
+	for (;;)
 	{
-		VectorBatch *batch = ((VectorHashJoinState *) state->build_arg)->output;
+		VectorBatch *batch = NULL;
+
+		/*
+		 * The build feed callback (VectorHashJoinSetBuildSource) pulls the
+		 * next batch: true with a batch to insert, true with NULL at end
+		 * of stream, false when the source declined (treated as EOF; the
+		 * init side gates the source before setting it).
+		 */
+		if (!state->next_build(state->build_arg, &batch) || batch == NULL)
+			break;
 
 		for (row = 0; row < batch->nselected; row++)
 		{
@@ -912,14 +923,20 @@ VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
 			uint32		hashvalue;
 			Datum		value;
 			bool		isnull;
+			/*
+			 * A region's scan batch carries a selection: positions map to
+			 * rows through it, raw indices would read unfiltered rows.
+			 * A nested join's output batches have an identity selection.
+			 */
+			int			r = VectorBatchSelectedRow(batch, row);
 
 			CHECK_FOR_INTERRUPTS();
 
 			ExecClearTuple(slot);
 			for (col = 0; col < ncols; col++)
 			{
-				value = VectorBatchGetDatum(batch, col, row);
-				isnull = VectorBatchIsNull(batch, col, row);
+				value = VectorBatchGetDatum(batch, col, r);
+				isnull = VectorBatchIsNull(batch, col, r);
 				slot->tts_values[col] = value;
 				slot->tts_isnull[col] = isnull;
 			}
@@ -954,6 +971,8 @@ VectorHashBuildFromBatches(VectorHashJoinState *state, HashState *hashNode,
 				}
 			}
 		}
+		if (quit)
+			break;
 	}
 
 	ExecClearTuple(slot);
@@ -1006,6 +1025,17 @@ VectorHashJoinBuild(VectorHashJoinState *state)
 	node->hj_InnerEmpty = node->hj_HashTable->totalTuples == 0;
 	node->hj_OuterNotEmpty = false;
 	node->hj_JoinState = HJ_NEED_NEW_OUTER;
+	/*
+	 * An empty build side cannot produce output for INNER/SEMI joins:
+	 * stop before pulling any probe batches, the row executor's
+	 * empty-hash-table shortcut (it never scans the outer then).  LEFT
+	 * still emits null-extended outer rows, ANTI passes them all, and
+	 * RIGHT/FULL hand unmatched stored tuples to the finish phase, so
+	 * those must scan.
+	 */
+	if (node->hj_InnerEmpty &&
+		(node->js.jointype == JOIN_INNER || node->js.jointype == JOIN_SEMI))
+		state->done = true;
 }
 
 TupleTableSlot *
