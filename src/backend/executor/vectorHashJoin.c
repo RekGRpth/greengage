@@ -26,6 +26,16 @@
 /* Returns true if doing null-fill on inner relation */
 #define HJ_FILL_INNER(hjstate)	((hjstate)->hj_NullOuterTupleSlot != NULL)
 
+/*
+ * Uninstrumented row-state bodies: the batch driver runs them inside its
+ * own open InstrStartNode window; the public entries below instrument for
+ * the region's per-row driver.
+ */
+static TupleTableSlot *VectorHashJoinNextRowBody(VectorHashJoinState *state,
+												 VectorBatch *batch, int position);
+static TupleTableSlot *VectorHashJoinContinueBody(VectorHashJoinState *state);
+static TupleTableSlot *VectorHashJoinFinishBody(VectorHashJoinState *state);
+
 struct VectorHashJoinState
 {
 	MemoryContext context;
@@ -783,11 +793,11 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 			}
 
 			if (state->outer_in_progress)
-				result = VectorHashJoinContinue(state);
+				result = VectorHashJoinContinueBody(state);
 			else if (state->outer_batch != NULL &&
 					 state->outer_position < state->outer_batch->nselected)
-				result = VectorHashJoinNextRow(state, state->outer_batch,
-											  state->outer_position++);
+				result = VectorHashJoinNextRowBody(state, state->outer_batch,
+												   state->outer_position++);
 			else if (state->outer_eof)
 			{
 				/*
@@ -809,7 +819,7 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 						state->done = true;
 					continue;
 				}
-				result = VectorHashJoinFinish(state);
+				result = VectorHashJoinFinishBody(state);
 			}
 			else
 			{
@@ -819,8 +829,8 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 				{
 					if (state->outer_batch->nselected == 0)
 						continue;
-					result = VectorHashJoinNextRow(state, state->outer_batch,
-												  state->outer_position++);
+					result = VectorHashJoinNextRowBody(state, state->outer_batch,
+													   state->outer_position++);
 				}
 				else
 				{
@@ -1045,8 +1055,16 @@ VectorHashJoinBuild(VectorHashJoinState *state)
 		state->done = true;
 }
 
-TupleTableSlot *
-VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int position)
+/*
+ * Uninstrumented body of VectorHashJoinNextRow.  The batch driver calls
+ * this directly: VectorHashJoinNextBatch already holds the join node's
+ * instrument open for the whole batch, and a nested InstrStartNode on
+ * the same instrument fails the "called twice in a row" assertion under
+ * EXPLAIN ANALYZE (the same shape as the vectorized sort's double start).
+ */
+static TupleTableSlot *
+VectorHashJoinNextRowBody(VectorHashJoinState *state, VectorBatch *batch,
+						  int position)
 {
 	HashJoinState *hj = state->hj;
 	TupleTableSlot *outer = hj->hj_OuterTupleSlot;
@@ -1091,28 +1109,49 @@ VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int positi
 	outer->tts_nvalid = state->outer_ncols;
 	ExecStoreVirtualTuple(outer);
 	state->outer_in_progress = true;
-	{
-		Instrumentation *instr = hj->js.ps.instrument;
-		TupleTableSlot *result;
+	return VectorHashJoinProbe(hj, outer);
+}
 
-		/* the region drives the join directly, so ExecProcNode's
-		 * instrumentation never runs; approximate it per output row */
-		if (instr)
-			InstrStartNode(instr);
-		result = VectorHashJoinProbe(hj, outer);
-		if (instr)
-			InstrStopNode(instr, result ? 1 : 0);
+/*
+ * Public entry for the region's own per-row driver: it replaces
+ * ExecProcNode's instrumentation, so it starts and stops the join node's
+ * instrument around one output row.
+ */
+TupleTableSlot *
+VectorHashJoinNextRow(VectorHashJoinState *state, VectorBatch *batch, int position)
+{
+	Instrumentation *instr = state->hj->js.ps.instrument;
+	TupleTableSlot *result;
 
-		if (VectorHashJoinNeedsNewOuter(hj))
-			state->outer_in_progress = false;
-		return result;
-	}
+	if (instr)
+		InstrStartNode(instr);
+	result = VectorHashJoinNextRowBody(state, batch, position);
+	if (instr)
+		InstrStopNode(instr, result ? 1 : 0);
+	return result;
 }
 
 bool
 VectorHashJoinInProgress(VectorHashJoinState *state)
 {
 	return state->outer_in_progress;
+}
+
+/*
+ * Uninstrumented resume of a suspended outer row, for the batch driver's
+ * own loop - the instrument is already open there (see
+ * VectorHashJoinNextRowBody).  VectorHashJoinContinue below is the
+ * instrumented entry for the region's per-row driver.
+ */
+static TupleTableSlot *
+VectorHashJoinContinueBody(VectorHashJoinState *state)
+{
+	TupleTableSlot *result;
+
+	result = VectorHashJoinProbe(state->hj, NULL);
+	if (VectorHashJoinNeedsNewOuter(state->hj))
+		state->outer_in_progress = false;
+	return result;
 }
 
 TupleTableSlot *
@@ -1123,12 +1162,28 @@ VectorHashJoinContinue(VectorHashJoinState *state)
 
 	if (instr)
 		InstrStartNode(instr);
-	result = VectorHashJoinProbe(state->hj, NULL);
+	result = VectorHashJoinContinueBody(state);
 	if (instr)
 		InstrStopNode(instr, result ? 1 : 0);
+	return result;
+}
 
-	if (VectorHashJoinNeedsNewOuter(state->hj))
-		state->outer_in_progress = false;
+/*
+ * Uninstrumented fill_inner finish for the batch driver's loop; same
+ * nesting rule as ContinueBody.  VectorHashJoinFinish below is the
+ * instrumented entry for the region's per-row driver.
+ */
+static TupleTableSlot *
+VectorHashJoinFinishBody(VectorHashJoinState *state)
+{
+	TupleTableSlot *result;
+
+	if (!state->built)
+	{
+		VectorHashJoinBuild(state);
+		state->built = true;
+	}
+	result = VectorHashJoinProbeFinal(state->hj);
 	return result;
 }
 
@@ -1140,13 +1195,7 @@ VectorHashJoinFinish(VectorHashJoinState *state)
 
 	if (instr)
 		InstrStartNode(instr);
-
-	if (!state->built)
-	{
-		VectorHashJoinBuild(state);
-		state->built = true;
-	}
-	result = VectorHashJoinProbeFinal(state->hj);
+	result = VectorHashJoinFinishBody(state);
 	if (instr)
 		InstrStopNode(instr, result ? 1 : 0);
 	return result;
