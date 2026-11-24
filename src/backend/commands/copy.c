@@ -6359,6 +6359,18 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 		p++;						/* skip the delimiter */
 	}
 
+	/*
+	 * The scan may not have run at all: zero fields to process on this
+	 * side (a QE whose columns the QD fully processed) leaves
+	 * last_had_delim at its initial false even when the residual is
+	 * non-empty, and the count check below then accepts the row while
+	 * dropping the residual - data the regular path rejects as extra
+	 * data after the last expected column.  Recompute from the scan
+	 * position; it agrees with the loop's bookkeeping on every path the
+	 * loop did run.
+	 */
+	last_had_delim = (p < line_end);
+
 	if (stop_processing_at_field >= 0)
 	{
 		if (nfields < limit)
@@ -6519,7 +6531,14 @@ CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
 	 */
 	if (stop_processing_at_field >= 0)
 	{
-		cstate->stopped_processing_at_delim = true;
+		/*
+		 * Mirror the regular split's bookkeeping: the QE owes more fields
+		 * only when a delimiter follows the last processed field.  Marking
+		 * a line-ended scan as stopped-at-delimiter made the QE parse an
+		 * empty residual as one empty field instead of reporting the
+		 * columns it still owes as missing data.
+		 */
+		cstate->stopped_processing_at_delim = (p < line_end);
 		cstate->line_buf.cursor = p - cstate->line_buf.data;
 	}
 	else

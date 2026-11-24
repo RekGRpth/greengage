@@ -34,6 +34,9 @@ DROP TABLE IF EXISTS vector_nl_prefetch_agg;
 DROP TABLE IF EXISTS vector_fixedref;
 DROP TABLE IF EXISTS vector_nl_pull_a;
 DROP TABLE IF EXISTS vector_nl_pull_b;
+DROP TABLE IF EXISTS vector_cpf_1;
+DROP TABLE IF EXISTS vector_cpf_2;
+DROP TABLE IF EXISTS vector_cpf_3m;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -1713,3 +1716,32 @@ WHERE b.f1 <> a.f1;
 RESET gp_vectorized_execution;
 DROP TABLE vector_nl_pull_a;
 DROP TABLE vector_nl_pull_b;
+-- ---- The COPY fast parse must reject rows the regular path rejects ----
+-- With the fast parse engaged (any gp_vectorized_execution other than
+-- off), two dispatch-split holes silently accepted bad rows: a line with
+-- more fields than the table dropped the extra ones, and a short line
+-- whose missing column the QE still owed (a middle distribution key
+-- keeps the QD prefix shorter than the line) loaded with NULLs.  Both
+-- must error exactly as they do with the feature off, and clean loads
+-- must keep working.  The rows come in over COPY FROM STDIN, inline.
+CREATE TABLE vector_cpf_1 (c1 text) DISTRIBUTED BY (c1);
+CREATE TABLE vector_cpf_2 (c1 text, c2 text) DISTRIBUTED BY (c2);
+CREATE TABLE vector_cpf_3m (c1 text, c2 text, c3 text) DISTRIBUTED BY (c2);
+SET gp_vectorized_execution = force;
+COPY vector_cpf_1 FROM STDIN WITH (DELIMITER ',');
+1,text1
+\.
+COPY vector_cpf_3m FROM STDIN WITH (DELIMITER ',');
+1,text1
+\.
+COPY vector_cpf_2 FROM STDIN WITH (DELIMITER ',');
+1,text1
+\.
+SELECT count(*) FROM vector_cpf_1;
+SELECT count(*) FROM vector_cpf_2;
+SELECT c1, c2 FROM vector_cpf_2;
+SELECT count(*) FROM vector_cpf_3m;
+RESET gp_vectorized_execution;
+DROP TABLE vector_cpf_1;
+DROP TABLE vector_cpf_2;
+DROP TABLE vector_cpf_3m;
