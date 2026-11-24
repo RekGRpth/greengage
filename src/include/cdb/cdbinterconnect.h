@@ -476,6 +476,16 @@ typedef struct MotionNodeEntry
 	 */
 	ReadyBatch	   *ready_batch_head;
 	ReadyBatch	   *ready_batch_tail;
+	/*
+	 * Lazy batch-to-row vending for a row-wise consumer: instead of
+	 * forming every queued batch's rows into the FIFO up front, hold
+	 * the decoded batch and form one row per RecvTupleFrom call.  A
+	 * batch stream of n rows then costs one heap_form_minimal_tuple
+	 * per row and an O(1) teardown, instead of n forms plus a FIFO
+	 * holding n entries that teardown frees one by one.
+	 */
+	struct VectorBatch *pending_batch;
+	int32           pending_row;
 }       MotionNodeEntry;
 
 
