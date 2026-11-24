@@ -37,6 +37,10 @@ DROP TABLE IF EXISTS vector_nl_pull_b;
 DROP TABLE IF EXISTS vector_cpf_1;
 DROP TABLE IF EXISTS vector_cpf_2;
 DROP TABLE IF EXISTS vector_cpf_3m;
+DROP TABLE IF EXISTS vector_wholerow_t;
+DROP VIEW IF EXISTS vector_wholerow_v;
+DROP TYPE IF EXISTS vector_wholerow_rec;
+DROP TYPE IF EXISTS vector_wholerow_nested;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -4890,3 +4894,43 @@ RESET gp_vectorized_execution;
 DROP TABLE vector_cpf_1;
 DROP TABLE vector_cpf_2;
 DROP TABLE vector_cpf_3m;
+-- ---- Whole-row vars and composite constructors ----
+-- A whole-row var reaches the row reader as attno 0; the deform set
+-- computed from pulled var numbers marked no column at all, so every
+-- whole-row expression assembled an all-zero tuple (and a ConvertRowtype
+-- over it crashed in the standard rowtype conversion).  The view wraps
+-- row(whole-row)::composite over a typed table, the exact create_view
+-- shape that failed.
+CREATE TYPE vector_wholerow_rec AS (q1 int8, q2 int8);
+CREATE TABLE vector_wholerow_t OF vector_wholerow_rec;
+INSERT INTO vector_wholerow_t VALUES (123, 456), (123, 4567890123456789);
+CREATE TYPE vector_wholerow_nested AS (x vector_wholerow_rec);
+CREATE VIEW vector_wholerow_v AS
+  SELECT row(i)::vector_wholerow_nested FROM vector_wholerow_t i;
+SET gp_vectorized_execution = force;
+SELECT i FROM vector_wholerow_t i;
+           i            
+------------------------
+ (123,456)
+ (123,4567890123456789)
+(2 rows)
+
+SELECT row(i) FROM vector_wholerow_t i;
+            row             
+----------------------------
+ ("(123,456)")
+ ("(123,4567890123456789)")
+(2 rows)
+
+SELECT * FROM vector_wholerow_v;
+            row             
+----------------------------
+ ("(123,456)")
+ ("(123,4567890123456789)")
+(2 rows)
+
+RESET gp_vectorized_execution;
+DROP VIEW vector_wholerow_v;
+DROP TABLE vector_wholerow_t;
+DROP TYPE vector_wholerow_nested;
+DROP TYPE vector_wholerow_rec;

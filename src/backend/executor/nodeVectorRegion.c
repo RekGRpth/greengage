@@ -669,13 +669,27 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			pull_varattnos((Node *) scan->plan.targetlist, scan->scanrelid, &attrs);
 			pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &attrs);
 			/*
-			 * Siblings carry their own deform sets (append_read_attrs);
-			 * only this child's referenced attributes belong here.
+			 * A whole-row var arrives as attno 0 in the pulled set and reads
+			 * every attribute; without this no column would be deformed and
+			 * the whole-row expression would assemble an all-zero tuple.
 			 */
-			for (col = 0; col < natts; col++)
-				state->read_attrs[col] =
-					bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
-			bms_free(attrs);
+			if (bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs))
+			{
+				for (col = 0; col < natts; col++)
+					state->read_attrs[col] = true;
+				bms_free(attrs);
+			}
+			else
+			{
+				/*
+				 * Siblings carry their own deform sets (append_read_attrs);
+				 * only this child's referenced attributes belong here.
+				 */
+				for (col = 0; col < natts; col++)
+					state->read_attrs[col] =
+						bms_is_member(col + 1 - FirstLowInvalidHeapAttributeNumber, attrs);
+				bms_free(attrs);
+			}
 		}
 		if (state->append != NULL)
 		{
