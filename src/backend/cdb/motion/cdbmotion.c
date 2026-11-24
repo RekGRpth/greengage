@@ -747,49 +747,63 @@ SendEndOfStream(MotionLayerState *mlStates,
  * the motion layer context, the deformed tuples follow the usual FIFO
  * ownership (the consumer frees them).
  */
+/*
+ * Take ownership of the queued batch at the head of the batch queue:
+ * the ReadyBatch node is unlinked and freed, the decoded batch moves
+ * to the entry's pending slot for row-by-row vending.
+ */
 static void
-decomposeQueuedBatch(MotionNodeEntry *pMNEntry)
+TakePendingBatch(MotionNodeEntry *pMNEntry)
 {
 	ReadyBatch *node = pMNEntry->ready_batch_head;
-	VectorBatch *batch;
-	TupleDesc	tupdesc = pMNEntry->tuple_desc;
-	int			natts = tupdesc->natts;
-	int			pos;
 
 	if (node == NULL)
 		return;
 	pMNEntry->ready_batch_head = node->next;
 	if (pMNEntry->ready_batch_head == NULL)
 		pMNEntry->ready_batch_tail = NULL;
-	batch = node->batch;
+	pMNEntry->pending_batch = node->batch;
+	pMNEntry->pending_row = 0;
 	pfree(node);
+}
 
-	for (pos = 0; pos < batch->nselected; pos++)
+/*
+ * Form the pending batch's current row as the next tuple for a row-wise
+ * consumer, advancing the vending cursor; destroy the batch when its
+ * rows run out.  Values are read selection-aware and by-reference data
+ * needs no copy: heap_form_minimal_tuple copies it into the tuple body,
+ * and the batch outlives the call.
+ */
+static MinimalTuple
+VendPendingBatchTuple(MotionNodeEntry *pMNEntry)
+{
+	VectorBatch *batch = pMNEntry->pending_batch;
+	TupleDesc	tupdesc = pMNEntry->tuple_desc;
+	int			natts = tupdesc->natts;
+	Datum	   *values = (Datum *) palloc(sizeof(Datum) * Max(natts, 1));
+	bool	   *isnull = (bool *) palloc(sizeof(bool) * Max(natts, 1));
+	MinimalTuple tup;
+	int			col;
+	int			row = VectorBatchSelectedRow(batch, pMNEntry->pending_row);
+
+	for (col = 0; col < natts; col++)
 	{
-		int			row = VectorBatchSelectedRow(batch, pos);
-		Datum	   *values = (Datum *) palloc(sizeof(Datum) * Max(natts, 1));
-		bool	   *isnull = (bool *) palloc(sizeof(bool) * Max(natts, 1));
-		MinimalTuple tup;
-		int			col;
-
-		for (col = 0; col < natts; col++)
-		{
-			isnull[col] = VectorBatchIsNull(batch, col, row);
-			/*
-			 * No copy needed: heap_form_minimal_tuple copies by-reference
-			 * data into the tuple body right away, and the batch outlives
-			 * this loop.  Copying here as well tripled the allocation
-			 * traffic for row-wise consumers of a batch stream.
-			 */
-			values[col] = isnull[col] ? 0 :
-				VectorBatchGetDatum(batch, col, row);
-		}
-		tup = heap_form_minimal_tuple(tupdesc, values, isnull);
-		htfifo_addtuple(pMNEntry->ready_tuples, tup);
-		pfree(values);
-		pfree(isnull);
+		isnull[col] = VectorBatchIsNull(batch, col, row);
+		values[col] = isnull[col] ? 0 :
+			VectorBatchGetDatum(batch, col, row);
 	}
-	VectorBatchDestroy(batch);
+	tup = heap_form_minimal_tuple(tupdesc, values, isnull);
+	pfree(values);
+	pfree(isnull);
+
+	pMNEntry->pending_row++;
+	if (pMNEntry->pending_row >= batch->nselected)
+	{
+		VectorBatchDestroy(batch);
+		pMNEntry->pending_batch = NULL;
+		pMNEntry->pending_row = 0;
+	}
+	return tup;
 }
 
 /*
@@ -836,6 +850,18 @@ RecvTupleFrom(MotionLayerState *mlStates,
 
 	for (;;)
 	{
+		/*
+		 * A pending batch vends first: batch chunks and tuple chunks
+		 * never mix on one stream, so the two sources cannot both be
+		 * non-empty.
+		 */
+		if (pMNEntry->pending_batch != NULL)
+		{
+			tuple = VendPendingBatchTuple(pMNEntry);
+			if (tuple)
+				break;
+			continue;
+		}
 		/* Get the next tuple from the FIFO, if one is available. */
 		tuple = htfifo_gettuple(ReadyList);
 		if (tuple)
@@ -844,7 +870,7 @@ RecvTupleFrom(MotionLayerState *mlStates,
 		/* row-wise consumers drain vectorized streams via tuples */
 		if (pMNEntry->ready_batch_head != NULL)
 		{
-			decomposeQueuedBatch(pMNEntry);
+			TakePendingBatch(pMNEntry);
 			continue;
 		}
 
@@ -1090,6 +1116,11 @@ EndMotionLayerNode(MotionLayerState *mlStates, int16 motNodeID, bool flushCommLa
 	FreeTupleDesc(pMNEntry->tuple_desc);
 	if (!pMNEntry->preserve_order)
 		htfifo_destroy(pMNEntry->ready_tuples);
+	if (pMNEntry->pending_batch != NULL)
+	{
+		VectorBatchDestroy(pMNEntry->pending_batch);
+		pMNEntry->pending_batch = NULL;
+	}
 
 	pMNEntry->valid = false;
 }
