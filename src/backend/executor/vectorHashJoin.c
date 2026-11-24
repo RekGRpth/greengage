@@ -731,6 +731,8 @@ VectorHashJoinNextBatch(VectorHashJoinState *state)
 						state->done = true;
 						break;
 					}
+					if (state->done)
+						break;	/* empty INNER/SEMI build, set by the build */
 					if (hashtable->nbatch != 1 ||
 						hashtable->parallel_state != NULL ||
 						hashtable->eagerlyReleased)
@@ -1006,6 +1008,17 @@ VectorHashJoinBuild(VectorHashJoinState *state)
 	node->hj_InnerEmpty = node->hj_HashTable->totalTuples == 0;
 	node->hj_OuterNotEmpty = false;
 	node->hj_JoinState = HJ_NEED_NEW_OUTER;
+	/*
+	 * An empty build side cannot produce output for INNER/SEMI joins:
+	 * stop before pulling any probe batches, the row executor's
+	 * empty-hash-table shortcut (it never scans the outer then).  LEFT
+	 * still emits null-extended outer rows, ANTI passes them all, and
+	 * RIGHT/FULL hand unmatched stored tuples to the finish phase, so
+	 * those must scan.
+	 */
+	if (node->hj_InnerEmpty &&
+		(node->js.jointype == JOIN_INNER || node->js.jointype == JOIN_SEMI))
+		state->done = true;
 }
 
 TupleTableSlot *
