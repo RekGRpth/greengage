@@ -4459,23 +4459,30 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 						continue;
 					}
 					{
+						ArrayType  *srcarr = DatumGetArrayTypeP(arg->value.values[row]);
 						Datum	   *elems;
 						bool	   *elem_nulls;
 						int			nelems;
 						Datum	   *result_elems;
 						bool	   *result_nulls;
-						int			dims[1];
-						int			lbs[1] = {1};
 						int			e;
 
-						deconstruct_array(DatumGetArrayTypeP(arg->value.values[row]),
+						deconstruct_array(srcarr,
 										  get_element_type(arg->value.typid),
 										  step->u.arraycoerce.elmlen,
 										  step->u.arraycoerce.elembyval,
 										  step->u.arraycoerce.elemalign,
 										  &elems, &elem_nulls, &nelems);
-						result_elems = palloc(sizeof(Datum) * Max(nelems, 1));
-						result_nulls = palloc(sizeof(bool) * Max(nelems, 1));
+						if (nelems <= 0)
+						{
+							value_set(&step->value, row,
+									  PointerGetDatum(construct_empty_array(
+										  step->u.arraycoerce.resultelemtype)),
+									  false);
+							continue;
+						}
+						result_elems = palloc(sizeof(Datum) * nelems);
+						result_nulls = palloc(sizeof(bool) * nelems);
 						for (e = 0; e < nelems; e++)
 						{
 							value_set(&step->u.arraycoerce.case_step->value, row,
@@ -4483,9 +4490,17 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 							eval_step(elemstep, batch, &row, 1);
 							result_elems[e] = elemstep->value.values[row];
 							result_nulls[e] = value_is_null(&elemstep->value, row);
+							/* As in array_map(), store detoasted elements */
+							if (!result_nulls[e] &&
+								step->u.arraycoerce.resultlen == -1)
+								result_elems[e] =
+									PointerGetDatum(PG_DETOAST_DATUM(result_elems[e]));
 						}
-						dims[0] = nelems;
-						array = construct_md_array(result_elems, result_nulls, 1, dims, lbs,
+						/* Keep the source array's shape, like array_map() */
+						array = construct_md_array(result_elems, result_nulls,
+												   ARR_NDIM(srcarr),
+												   ARR_DIMS(srcarr),
+												   ARR_LBOUND(srcarr),
 												   step->u.arraycoerce.resultelemtype,
 												   step->u.arraycoerce.resultlen,
 												   step->u.arraycoerce.resultbyval,

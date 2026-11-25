@@ -1800,3 +1800,24 @@ SELECT sum(v), count(*) FROM vector_gsets_rows;
 RESET gp_vectorized_execution;
 DROP TABLE vector_gsets_empty;
 DROP TABLE vector_gsets_rows;
+-- ---- Array coercion keeps the source array's shape ----
+-- The vector interpreter rebuilt a coerced array with one dimension and
+-- lower bound 1, dropping the source's ndim, dims and lower bound.
+-- int2vector -> int2[] carries lower bound 0, so values coerced inside a
+-- vector region compared unequal to the same coercion done on the row
+-- path (this is what made gpcheckcat report phantom pg_index
+-- inconsistencies); 2-D arrays came back flattened.
+CREATE TEMPORARY TABLE vector_arrcoerce_c AS
+  SELECT gp_segment_id AS segid, indexrelid, indkey FROM pg_index
+  DISTRIBUTED BY (segid);
+SET gp_vectorized_execution = force;
+SELECT indexrelid, v::text AS v, array_lower(v, 1) AS lb, count(*)
+FROM (
+  SELECT segid, indexrelid, indkey::int2[] AS v
+    FROM vector_arrcoerce_c WHERE indexrelid = 112
+  UNION ALL
+  SELECT gp_segment_id, indexrelid, indkey::int2[] AS v
+    FROM gp_dist_random('pg_index') WHERE indexrelid = 112) u
+GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+RESET gp_vectorized_execution;
+DROP TABLE vector_arrcoerce_c;
