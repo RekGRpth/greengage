@@ -326,6 +326,12 @@ plan_node_name(Plan *plan)
 		case T_NestLoop: return "NestLoop";
 		case T_Material: return "Material";
 		case T_SeqScan: return "SeqScan";
+		case T_AssertOp: return "AssertOp";
+		case T_Result: return "Result";
+		case T_CustomScan: return "CustomScan";
+		case T_Append: return "Append";
+		case T_Motion: return "Motion";
+		case T_DynamicSeqScan: return "DynamicSeqScan";
 		default: return "plan node";
 	}
 }
@@ -862,17 +868,36 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		IsA(outerPlan(node), Agg))
 		return plan_tree_mutator(node, vectorize_mutator, ctx, false);
 
-	if (IsA(node, HashJoin) && slice_runs_on_segments(ctx) &&
-		VectorHashJoinPlanIsSupported((HashJoin *) node) &&
-		((IsA(outerPlan(node), SeqScan) &&
-		  is_simple_scan(ctx, (SeqScan *) outerPlan(node))) ||
-		 (IsA(outerPlan(node), Motion) &&
-		  motion_probe_tlist_is_simple(outerPlan(node)))) &&
-		/* the build side reads row-wise through the Hash node: any input */
-		IsA(innerPlan(node), Hash))
+	if (IsA(node, HashJoin))
 	{
-		Plan	   *hash = innerPlan(node);
+		const char *why = slice_runs_on_segments(ctx)
+			? VectorHashJoinPlanDeclineReason((HashJoin *) node)
+			: "the slice does not run on segments";
+		Plan	   *hash;
 
+		if (why == NULL)
+		{
+			if (IsA(outerPlan(node), SeqScan))
+			{
+				if (!is_simple_scan(ctx, (SeqScan *) outerPlan(node)))
+					why = "the probe scan is not simple";
+			}
+			else if (IsA(outerPlan(node), Motion))
+			{
+				if (!motion_probe_tlist_is_simple(outerPlan(node)))
+					why = "the motion probe targetlist is not a plain projection";
+			}
+			else
+				why = psprintf("the probe side is a %s, not a simple scan "
+								   "or a motion",
+							   plan_node_name(outerPlan(node)));
+		}
+		if (why != NULL)
+		{
+			decision(ctx, (Plan *) node, why);
+			return plan_tree_mutator(node, vectorize_mutator, ctx, false);
+		}
+		hash = innerPlan(node);
 		/*
 		 * A Motion probe leaf receives its rows from another slice: capture
 		 * swallows the producer subtree, so vectorize it first.  The region
@@ -892,6 +917,11 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		is_simple_scan(ctx, (SeqScan *) outerPlan(node)) &&
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
+	if (IsA(node, Material) && slice_runs_on_segments(ctx) &&
+		!(VectorMaterialPlanIsSupported((Material *) node) &&
+		  IsA(outerPlan(node), SeqScan) &&
+		  is_simple_scan(ctx, (SeqScan *) outerPlan(node))))
+		decision(ctx, (Plan *) node, "the material shape is not a supported region candidate");
 
 	if (IsA(node, NestLoop) && slice_runs_on_segments(ctx) &&
 		VectorNestLoopPlanIsSupported((NestLoop *) node) &&
@@ -903,6 +933,11 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 			return (Node *) make_region(ctx, (Plan *) node);
 		return node;
 	}
+	if (IsA(node, NestLoop) && slice_runs_on_segments(ctx) &&
+		!(VectorNestLoopPlanIsSupported((NestLoop *) node) &&
+		  IsA(outerPlan(node), SeqScan) &&
+		  is_simple_scan(ctx, (SeqScan *) outerPlan(node))))
+		decision(ctx, (Plan *) node, "the nestloop shape is not a supported region candidate");
 
 	if (IsA(node, MergeJoin) && slice_runs_on_segments(ctx) &&
 		VectorMergeJoinPlanIsSupported((MergeJoin *) node) &&
@@ -945,17 +980,27 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		auto_allowed(ctx, (Plan *) node))
 		return (Node *) make_region(ctx, (Plan *) node);
 
-	if (IsA(node, Agg) && slice_runs_on_segments(ctx) &&
-		VectorAggPlanIsSupported((Agg *) node) &&
-		(!IsA(outerPlan(node), Append) ||
-		 is_simple_append(ctx, (Append *) outerPlan(node))) &&
-		(!IsA(outerPlan(node), SeqScan) ||
-		 is_simple_scan(ctx, (SeqScan *) outerPlan(node))) &&
-		auto_allowed(ctx, (Plan *) node))
+	if (IsA(node, Agg) && slice_runs_on_segments(ctx))
 	{
-		vectorize_motion_subtrees(ctx, outerPlan(node));
-		vectorize_chain_leaves(ctx, &outerPlan(node));
-		return (Node *) make_region(ctx, (Plan *) node);
+		const char *why = NULL;
+
+		if (!VectorAggPlanIsSupported((Agg *) node))
+			why = "the aggregate shape is not supported";
+		else if (IsA(outerPlan(node), Append) &&
+				 !is_simple_append(ctx, (Append *) outerPlan(node)))
+			why = "the append below the aggregate is not simple";
+		else if (IsA(outerPlan(node), SeqScan) &&
+				 !is_simple_scan(ctx, (SeqScan *) outerPlan(node)))
+			why = "the scan below the aggregate is not simple";
+		if (why == NULL && auto_allowed(ctx, (Plan *) node))
+		{
+			vectorize_motion_subtrees(ctx, outerPlan(node));
+			vectorize_chain_leaves(ctx, &outerPlan(node));
+			return (Node *) make_region(ctx, (Plan *) node);
+		}
+		if (why != NULL)
+			decision(ctx, (Plan *) node, why);
+		return plan_tree_mutator(node, vectorize_mutator, ctx, false);
 	}
 
 	if (IsA(node, SeqScan) && slice_runs_on_segments(ctx) &&
