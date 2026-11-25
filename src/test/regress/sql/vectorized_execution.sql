@@ -1819,5 +1819,24 @@ FROM (
   SELECT gp_segment_id, indexrelid, indkey::int2[] AS v
     FROM gp_dist_random('pg_index') WHERE indexrelid = 112) u
 GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+-- Empty int2vectors - the distribution keys of partitioned children -
+-- must keep their shape too: a region path that rebuilt the empty as a
+-- zero-dimensional array split identical gp_distribution_policy rows
+-- into different groups (phantom gpcheckcat inconsistencies).
+CREATE TABLE vector_arrcoerce_part (id int) DISTRIBUTED RANDOMLY
+  PARTITION BY RANGE (id) (START (0) END (20) EVERY (10));
+CREATE TEMPORARY TABLE vector_arrcoerce_d AS
+  SELECT p.gp_segment_id AS segid, p.localoid, p.distkey
+  FROM gp_distribution_policy p
+  JOIN pg_class c ON c.oid = p.localoid
+  WHERE c.relname LIKE 'vector_arrcoerce_part%' DISTRIBUTED BY (segid);
+SELECT v::text AS txt, array_lower(v, 1) AS lb, array_ndims(v) AS nd
+FROM (
+  SELECT segid, distkey::int2[] AS v FROM vector_arrcoerce_d
+  UNION ALL
+  SELECT gp_segment_id, distkey::int2[] AS v FROM gp_dist_random('gp_distribution_policy')) u
+GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
 RESET gp_vectorized_execution;
 DROP TABLE vector_arrcoerce_c;
+DROP TABLE vector_arrcoerce_d;
+DROP TABLE vector_arrcoerce_part;
