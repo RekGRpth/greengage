@@ -41,6 +41,8 @@ DROP TABLE IF EXISTS vector_wholerow_t;
 DROP VIEW IF EXISTS vector_wholerow_v;
 DROP TYPE IF EXISTS vector_wholerow_rec;
 DROP TYPE IF EXISTS vector_wholerow_nested;
+DROP TABLE IF EXISTS vector_gsets_empty;
+DROP TABLE IF EXISTS vector_gsets_rows;
 CREATE TABLE vector_aoco_test
 (id int4, big int8, val text, num numeric(12,2))
 WITH (appendonly = true, orientation = column)
@@ -5905,3 +5907,67 @@ DROP VIEW vector_wholerow_v;
 DROP TABLE vector_wholerow_t;
 DROP TYPE vector_wholerow_nested;
 DROP TYPE vector_wholerow_rec;
+-- ---- Grouping sets in the vector aggregate ----
+-- Three shapes were wrong: a mixed aggregate with two or more plain
+-- (non-hash) sets crashed - the plain-set walk assumed one phase per
+-- set and ran off the phases array; a plain aggregate with grouping
+-- sets emitted only the first set's row; and with several plain sets
+-- every input row advanced only the first set's state, so the sets
+-- collapsed into one row with multiplied aggregates (this is the
+-- groupingsets test's gstest_empty shape that crashed a segment).
+CREATE TABLE vector_gsets_empty (a int, b int, v numeric) DISTRIBUTED BY (a);
+CREATE TABLE vector_gsets_rows (a int, b int, v numeric) DISTRIBUTED BY (a);
+INSERT INTO vector_gsets_rows VALUES (1, 2, 3.5), (1, 3, 4.5);
+SET gp_vectorized_execution = force;
+SELECT a, b, sum(v), count(*) FROM vector_gsets_empty
+GROUP BY GROUPING SETS ((a, b), (), (), ())
+ORDER BY 1 NULLS FIRST, 2 NULLS FIRST;
+ a | b | sum | count 
+---+---+-----+-------
+   |   |     |     0
+   |   |     |     0
+   |   |     |     0
+(3 rows)
+
+SELECT a, b, sum(v), count(*) FROM vector_gsets_rows
+GROUP BY GROUPING SETS ((a, b), (), (), ())
+ORDER BY 1 NULLS FIRST, 2 NULLS FIRST;
+ a | b | sum | count 
+---+---+-----+-------
+   |   | 8.0 |     2
+   |   | 8.0 |     2
+   |   | 8.0 |     2
+ 1 | 2 | 3.5 |     1
+ 1 | 3 | 4.5 |     1
+(5 rows)
+
+SELECT a, b, sum(v), count(*) FROM vector_gsets_rows
+GROUP BY GROUPING SETS ((a), (), (a, b), ())
+ORDER BY 1 NULLS FIRST, 2 NULLS FIRST;
+ a | b | sum | count 
+---+---+-----+-------
+   |   | 8.0 |     2
+   |   | 8.0 |     2
+ 1 |   | 8.0 |     2
+ 1 | 2 | 3.5 |     1
+ 1 | 3 | 4.5 |     1
+(5 rows)
+
+SELECT sum(v), count(*) FROM vector_gsets_rows
+GROUP BY GROUPING SETS ((), (), ());
+ sum | count 
+-----+-------
+ 8.0 |     2
+ 8.0 |     2
+ 8.0 |     2
+(3 rows)
+
+SELECT sum(v), count(*) FROM vector_gsets_rows;
+ sum | count 
+-----+-------
+ 8.0 |     2
+(1 row)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_gsets_empty;
+DROP TABLE vector_gsets_rows;
