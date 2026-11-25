@@ -642,23 +642,6 @@ vectorize_has_ordered_aggs(Node *node)
  * Build a scan-only region.  The original SeqScan remains a custom child so
  * executor initialization keeps its relation lock and EXPLAIN shows the leaf.
  */
-/*
- * A region hands its output to the parent as batches when its wrapped root
- * is a scan (scan batches) or a hash join (join batches); deeper shapes
- * keep the row-wise output.  Mirrors the executor's VectorRegionProbe-
- * Batches acceptance for the shapes the planner can build here.
- */
-static bool
-region_probe_is_batchable(CustomScan *cs)
-{
-	Plan	   *root;
-
-	if (cs->custom_plans == NIL)
-		return false;
-	root = linitial(cs->custom_plans);
-	return IsA(root, SeqScan) || IsA(root, HashJoin);
-}
-
 static Plan *
 make_region(VectorizeContext *ctx, Plan *root)
 {
@@ -904,32 +887,11 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 				if (!motion_probe_tlist_is_simple(outerPlan(node)))
 					why = "the motion probe targetlist is not a plain projection";
 			}
-			else if (IsA(outerPlan(node), CustomScan) &&
-					 region_probe_is_batchable((CustomScan *) outerPlan(node)))
-			 ;	/* a region feeds probe batches directly */
-			else if (IsA(outerPlan(node), HashJoin))
-			{
-				/*
-				 * Join chains wrap bottom-up: vectorize the probe join
-				 * first; when it becomes a batchable region, this join
-				 * wraps on top of it and the chain grows one level.
-				 */
-				outerPlan(node) = (Plan *)
-					vectorize_mutator((Node *) outerPlan(node), ctx);
-				if (!(IsA(outerPlan(node), CustomScan) &&
-					  region_probe_is_batchable((CustomScan *)
-												outerPlan(node))))
-					why = "the probe join chain is not batchable";
-			}
 			else
 				why = psprintf("the probe side is a %s, not a simple scan "
 								   "or a motion",
 							   plan_node_name(outerPlan(node)));
 		}
-		if (why == NULL && ((HashJoin *) node)->hashqualclauses != NIL &&
-			!(IsA(outerPlan(node), CustomScan) &&
-			  region_probe_is_batchable((CustomScan *) outerPlan(node))))
-			why = "the residual join filter needs a batchable region probe";
 		if (why != NULL)
 		{
 			decision(ctx, (Plan *) node, why);
