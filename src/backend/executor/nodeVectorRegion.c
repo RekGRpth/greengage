@@ -163,6 +163,9 @@ static bool VectorRegionSortIsPassthrough(SortState *sort);
 static void VectorRegionInitBuildChain(VectorRegionState *state);
 static bool VectorRegionNextScanBatch(VectorRegionState *state);
 static VectorBatch *VectorRegionInputBatch(VectorRegionState *state);
+static bool VectorRegionOutputBatchable(VectorRegionState *state);
+static bool VectorRegionProbeBatches(VectorRegionState *state);
+static bool VectorRegionProbeSourceFeed(void *arg, VectorBatch **batch);
 static Node *VectorRegionCreateState(CustomScan *cscan);
 static void VectorRegionBegin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *VectorRegionExec(CustomScanState *node);
@@ -1087,6 +1090,77 @@ VectorMotionLeafSource(void *arg, VectorBatch **batch)
 	return true;
 }
 
+/*
+ * The probe feed state for a batchable child region: the child's pulled
+ * batch plus our own detached copy of it.
+ */
+typedef struct VectorRegionProbeFeed
+{
+	PlanState   *child;			/* the nested region pulled for probe batches */
+	VectorBatch *copy;			/* our own batch; by-ref values detached here */
+	MemoryContext context;		/* where the copy batch is allocated */
+} VectorRegionProbeFeed;
+
+/*
+ * Pull-convention probe feed over a child region's output batches.  Each
+ * pull detaches the child's batch into our own storage: the child resets
+ * its batch on its next pull, and a chained region's rows reference the
+ * grandchild's storage two stolen-by-reference hops deep, so handing the
+ * child's batch out directly leaves the probe reading recycled memory
+ * (SIGSEGV on an -O2 build; at -O0 the recycled bytes happen to stay
+ * intact, which masked this in early testing).
+ */
+static bool
+VectorRegionProbeSourceFeed(void *arg, VectorBatch **batch)
+{
+	VectorRegionProbeFeed *feed = (VectorRegionProbeFeed *) arg;
+	VectorBatch  *src;
+	int			pos;
+
+	/*
+	 * The pull returns true with a NULL batch at the child's EOF: that is
+	 * this feed's EOF too.
+	 */
+	/*
+	 * The pull returns true with a NULL batch at the child's EOF: that is
+	 * this feed's EOF too.
+	 */
+	if (!VectorRegionPullOutputBatch(feed->child, &src) || src == NULL)
+		return false;
+
+	if (feed->copy == NULL)
+	{
+		feed->copy = VectorBatchCreate(feed->context, src->tupdesc,
+									   VECTOR_BATCH_DEFAULT_CAPACITY, false);
+		for (pos = 0; pos < feed->copy->capacity; pos++)
+			feed->copy->selection[pos] = pos;
+	}
+
+	VectorBatchReset(feed->copy);
+
+	for (pos = 0; pos < src->nselected; pos++)
+	{
+		int			srow = VectorBatchSelectedRow(src, pos);
+		int			col;
+
+		feed->copy->selection[pos] = pos;
+		for (col = 0; col < src->ncols; col++)
+		{
+			bool		isnull = VectorBatchIsNull(src, col, srow);
+			Datum		value = VectorBatchCopyDatum(feed->copy, col,
+													 src->columns[col].values[srow],
+													 isnull);
+
+			VectorColumnSetDatum(&feed->copy->columns[col], pos, value, isnull);
+		}
+	}
+
+	feed->copy->nrows = src->nselected;
+	feed->copy->nselected = src->nselected;
+	*batch = feed->copy;
+	return true;
+}
+
 static VectorHashJoinState *
 VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 {
@@ -1120,6 +1194,26 @@ VectorRegionCreateJoinChain(VectorRegionState *region, HashJoinState *hj)
 														   false);
 		source = VectorMotionLeafSource;
 		source_arg = region->motion_leaf;
+	}
+	else if (IsA(outer, CustomScanState) &&
+			 VectorRegionProbeBatches((VectorRegionState *) outer))
+	{
+		/*
+		 * A child region that hands out batches (a scan root or a nested
+		 * join chain) feeds the probe directly.  The feed keeps its own
+		 * detached copy: the child recycles its batch on its next pull,
+		 * and a chained region's output references the grandchild's
+		 * storage through stolen-by-reference hops, so handing the
+		 * child's batch out directly would leave the parent's probe
+		 * reading recycled memory.
+		 */
+		VectorRegionProbeFeed *feed = MemoryContextAllocZero(
+			region->css.ss.ps.state->es_query_cxt,
+			sizeof(VectorRegionProbeFeed));
+		feed->child = outer;
+		feed->context = region->css.ss.ps.state->es_query_cxt;
+		source = VectorRegionProbeSourceFeed;
+		source_arg = feed;
 	}
 	else if (IsA(outer, CustomScanState))
 	{
@@ -1329,6 +1423,41 @@ VectorBuildLeafSource(void *arg, VectorBatch **batch)
  * chain's probe side is batchable, run it batch-wise and feed the hash build
  * from its output batches instead of MultiExecHash's row-wise pull.
  */
+/*
+ * Whether a child region hands its output to the parent as batches: true
+ * for a nested join chain (its join batches are the region output) and
+ * for a scan root whose output columns map as-is; false for everything
+ * the executor's pull declines to the row-wise adapter.  This mirrors
+ * VectorRegionPullOutputBatch's own acceptance, minus the node-type
+ * checks, so the two can never disagree mid-stream.
+ */
+static bool
+VectorRegionProbeBatches(VectorRegionState *state)
+{
+	int			col;
+
+	if (state->nested_batches)
+		return true;
+	if (state->agg != NULL || state->sort != NULL ||
+		state->hj != NULL || state->nestloop != NULL ||
+		state->mergejoin != NULL || state->material != NULL ||
+		state->unique != NULL ||
+		state->scan == NULL || state->append != NULL ||
+		state->limit != NULL || state->packed_i32 ||
+		state->motion_leaf != NULL || state->row_leaf != NULL)
+		return false;
+	if (state->proj != NULL)
+		return false;
+	if (state->output_ncols > state->batch->ncols)
+		return false;
+	for (col = 0; col < state->output_ncols; col++)
+	{
+		if (state->output_attnos[col] != col)
+			return false;
+	}
+	return true;
+}
+
 static bool
 VectorRegionOutputBatchable(VectorRegionState *state)
 {

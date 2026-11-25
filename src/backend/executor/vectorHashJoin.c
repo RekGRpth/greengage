@@ -123,7 +123,8 @@ VectorHashJoinPlanDeclineReason(HashJoin *join)
 	 * harmless here; the agg region already runs with it.
 	 */
 	if (join->hashclauses == NIL ||
-		join->hashqualclauses != NIL || join->hashkeys == NIL ||
+		(join->hashqualclauses != NIL &&
+		 !IsA(outerPlan(join), CustomScan)) || join->hashkeys == NIL ||
 		join->join.plan.initPlan != NIL || join->join.plan.extParam != NULL)
 		return "the hash clauses, the residual join filter or the plan "
 			   "params are not region-friendly";
