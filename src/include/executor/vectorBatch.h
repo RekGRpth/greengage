@@ -157,6 +157,13 @@ VectorBatchIsNull(const VectorBatch *batch, int col, int row)
 static inline int
 VectorBatchSelectedRow(const VectorBatch *batch, int position)
 {
+	/*
+	 * A batch published with sel_identity (VectorBatchSetRowCount) has no
+	 * selection array behind it: its rows are positional.
+	 */
+	if (batch->sel_identity)
+		return position;
+
 	Assert(position >= 0 && position < batch->nselected);
 	return batch->selection[position];
 }

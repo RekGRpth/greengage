@@ -1097,7 +1097,8 @@ VectorMotionLeafSource(void *arg, VectorBatch **batch)
 typedef struct VectorRegionProbeFeed
 {
 	PlanState   *child;			/* the nested region pulled for probe batches */
-	VectorBatch *copy;			/* our own batch; by-ref values detached here */
+	VectorBatch *copy;			/* our own batch; values stolen from the child */
+	int		   *identity;		/* dstcol map for VectorBatchCopyColumns */
 	MemoryContext context;		/* where the copy batch is allocated */
 } VectorRegionProbeFeed;
 
@@ -1115,12 +1116,7 @@ VectorRegionProbeSourceFeed(void *arg, VectorBatch **batch)
 {
 	VectorRegionProbeFeed *feed = (VectorRegionProbeFeed *) arg;
 	VectorBatch  *src;
-	int			pos;
 
-	/*
-	 * The pull returns true with a NULL batch at the child's EOF: that is
-	 * this feed's EOF too.
-	 */
 	/*
 	 * The pull returns true with a NULL batch at the child's EOF: that is
 	 * this feed's EOF too.
@@ -1130,32 +1126,26 @@ VectorRegionProbeSourceFeed(void *arg, VectorBatch **batch)
 
 	if (feed->copy == NULL)
 	{
+		int			c;
+
 		feed->copy = VectorBatchCreate(feed->context, src->tupdesc,
-									   VECTOR_BATCH_DEFAULT_CAPACITY, false);
-		for (pos = 0; pos < feed->copy->capacity; pos++)
-			feed->copy->selection[pos] = pos;
+									   src->capacity, false);
+		feed->identity = palloc(sizeof(int) * src->ncols);
+		for (c = 0; c < src->ncols; c++)
+			feed->identity[c] = c;
 	}
 
 	VectorBatchReset(feed->copy);
 
-	for (pos = 0; pos < src->nselected; pos++)
-	{
-		int			srow = VectorBatchSelectedRow(src, pos);
-		int			col;
+	/*
+	 * Steal the values wholesale (VectorBatchCopyColumns memcpys the flat
+	 * by-value arrays and the by-reference datum pointers): the child's
+	 * storage stays put until the child's next reset, and this feed's
+	 * consumer drains the copy before feeding pulls again.
+	 */
+	VectorBatchCopyColumns(feed->copy, src, feed->identity);
 
-		feed->copy->selection[pos] = pos;
-		for (col = 0; col < src->ncols; col++)
-		{
-			bool		isnull = VectorBatchIsNull(src, col, srow);
-			Datum		value = VectorBatchCopyDatum(feed->copy, col,
-													 src->columns[col].values[srow],
-													 isnull);
-
-			VectorColumnSetDatum(&feed->copy->columns[col], pos, value, isnull);
-		}
-	}
-
-	feed->copy->nrows = src->nselected;
+	feed->copy->nrows = src->nrows;
 	feed->copy->nselected = src->nselected;
 	*batch = feed->copy;
 	return true;
