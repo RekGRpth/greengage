@@ -99,11 +99,16 @@ struct VectorHashJoinState
 	HashJoinTuple finish_tuple; /* last unmatched tuple returned */
 };
 
-bool
-VectorHashJoinPlanIsSupported(HashJoin *join)
+/*
+ * Return the reason the planner cannot wrap this hash join as a region
+ * root, or NULL when it can.  VectorHashJoinPlanIsSupported is its boolean
+ * view for the callers that only need the verdict.
+ */
+const char *
+VectorHashJoinPlanDeclineReason(HashJoin *join)
 {
 	if (!IsA(innerPlan(join), Hash))
-		return false;
+		return "the build side is not a Hash";
 	/*
 	 * The build side is consumed row-wise through the standard Hash node,
 	 * so its input may be any plan; only the probe side feeds on batches
@@ -118,9 +123,11 @@ VectorHashJoinPlanIsSupported(HashJoin *join)
 	 * harmless here; the agg region already runs with it.
 	 */
 	if (join->hashclauses == NIL ||
-		join->hashqualclauses != NIL || join->hashkeys == NIL ||
+		(join->hashqualclauses != NIL &&
+		 !IsA(outerPlan(join), CustomScan)) || join->hashkeys == NIL ||
 		join->join.plan.initPlan != NIL || join->join.plan.extParam != NULL)
-		return false;
+		return "the hash clauses, the residual join filter or the plan "
+			   "params are not region-friendly";
 
 	switch (join->join.jointype)
 	{
@@ -131,10 +138,16 @@ VectorHashJoinPlanIsSupported(HashJoin *join)
 		case JOIN_SEMI:
 		case JOIN_ANTI:
 		case JOIN_LASJ_NOTIN:
-			return true;
+			return NULL;
 		default:
-			return false;
+			return "the join type is not supported";
 	}
+}
+
+bool
+VectorHashJoinPlanIsSupported(HashJoin *join)
+{
+	return VectorHashJoinPlanDeclineReason(join) == NULL;
 }
 
 static bool VectorHashProbeFastGate(VectorHashJoinState *state);

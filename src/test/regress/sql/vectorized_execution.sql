@@ -1819,5 +1819,52 @@ FROM (
   SELECT gp_segment_id, indexrelid, indkey::int2[] AS v
     FROM gp_dist_random('pg_index') WHERE indexrelid = 112) u
 GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+-- Empty int2vectors - the distribution keys of partitioned children -
+-- must keep their shape too: a region path that rebuilt the empty as a
+-- zero-dimensional array split identical gp_distribution_policy rows
+-- into different groups (phantom gpcheckcat inconsistencies).
+CREATE TABLE vector_arrcoerce_part (id int) DISTRIBUTED RANDOMLY
+  PARTITION BY RANGE (id) (START (0) END (20) EVERY (10));
+CREATE TEMPORARY TABLE vector_arrcoerce_d AS
+  SELECT p.gp_segment_id AS segid, p.localoid, p.distkey
+  FROM gp_distribution_policy p
+  JOIN pg_class c ON c.oid = p.localoid
+  WHERE c.relname LIKE 'vector_arrcoerce_part%' DISTRIBUTED BY (segid);
+SELECT v::text AS txt, array_lower(v, 1) AS lb, array_ndims(v) AS nd
+FROM (
+  SELECT segid, distkey::int2[] AS v FROM vector_arrcoerce_d
+  UNION ALL
+  SELECT gp_segment_id, distkey::int2[] AS v FROM gp_dist_random('gp_distribution_policy')) u
+GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
 RESET gp_vectorized_execution;
 DROP TABLE vector_arrcoerce_c;
+DROP TABLE vector_arrcoerce_d;
+DROP TABLE vector_arrcoerce_part;
+-- ---- Nested join chain: the probe feed survives the child chain's EOF ----
+-- A hash join wrapped over another hash join region pulls its probe
+-- batches through VectorRegionProbeSourceFeed.  At the child chain's EOF
+-- the pull returns true with a NULL batch; the feed must treat that as
+-- its own EOF.  Pre-fix it dereferenced the NULL and crashed a segment
+-- on the first query whose plan probed a region through the feed.
+CREATE TABLE vector_chain_f (k1 int, k2 int, v numeric) DISTRIBUTED BY (k1);
+CREATE TABLE vector_chain_d1 (k int, a text) DISTRIBUTED BY (k);
+CREATE TABLE vector_chain_d2 (k int, b text) DISTRIBUTED BY (k);
+INSERT INTO vector_chain_f
+  SELECT i, i % 10 + 1, i * 0.5 FROM generate_series(1, 3000) i;
+INSERT INTO vector_chain_f VALUES (40000, 77, 1.0);
+INSERT INTO vector_chain_d1 SELECT i, 'd1-' || i FROM generate_series(1, 50) i;
+INSERT INTO vector_chain_d2 SELECT i, 'd2-' || i FROM generate_series(1, 30) i;
+SET gp_vectorized_execution = force;
+SELECT count(*) FROM vector_chain_f f
+  JOIN vector_chain_d1 d1 ON f.k1 = d1.k
+  JOIN vector_chain_d2 d2 ON f.k2 = d2.k;
+-- an inner chain that yields zero rows hits the feed's EOF on the very
+-- first pull, where the NULL deref crashed before any batch was copied
+SELECT count(*) FROM vector_chain_f f
+  JOIN vector_chain_d1 d1 ON f.k1 = d1.k
+  JOIN vector_chain_d2 d2 ON f.k2 = d2.k
+  WHERE d1.a = 'no such key';
+RESET gp_vectorized_execution;
+DROP TABLE vector_chain_f;
+DROP TABLE vector_chain_d1;
+DROP TABLE vector_chain_d2;

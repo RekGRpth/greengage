@@ -4475,10 +4475,20 @@ eval_step(VectorExprStep *step, VectorBatch *batch, int32 *selection, int nselec
 										  &elems, &elem_nulls, &nelems);
 						if (nelems <= 0)
 						{
-							value_set(&step->value, row,
-									  PointerGetDatum(construct_empty_array(
-										  step->u.arraycoerce.resultelemtype)),
-									  false);
+							/*
+							 * An empty source coerces to an empty result of
+							 * the same shape: copy the source and overwrite
+							 * the element type, like the binary-coercion
+							 * branch above.  Every execution path then
+							 * agrees on the empty array's header - grouping
+							 * and hashing include the dimensions in the
+							 * signature, and a region path that rebuilds the
+							 * empty as 0-dimensional would split identical
+							 * rows from row-path copies.
+							 */
+							array = DatumGetArrayTypePCopy(arg->value.values[row]);
+							ARR_ELEMTYPE(array) = step->u.arraycoerce.resultelemtype;
+							value_set(&step->value, row, PointerGetDatum(array), false);
 							continue;
 						}
 						result_elems = palloc(sizeof(Datum) * nelems);

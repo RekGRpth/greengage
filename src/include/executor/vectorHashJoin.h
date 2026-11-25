@@ -15,6 +15,7 @@ typedef struct VectorHashJoinState VectorHashJoinState;
 typedef bool (*VectorHashJoinSourceNext)(void *arg, VectorBatch **batch);
 
 extern bool VectorHashJoinPlanIsSupported(HashJoin *join);
+extern const char *VectorHashJoinPlanDeclineReason(HashJoin *join);
 extern VectorHashJoinState *VectorHashJoinCreate(MemoryContext parent,
 												 HashJoinState *hj);
 extern VectorHashJoinState *VectorHashJoinCreateBatch(MemoryContext parent,
