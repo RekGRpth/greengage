@@ -113,6 +113,7 @@ struct VectorAggState
 	bool		output_done;
 	/* AGG_MIXED: plain (non-hash) grouping sets are emitted before hashed */
 	int			mixed_plain_index;
+	int			plain_set_index;	/* multi-set AGG_PLAIN output cursor */
 	bool		mixed_hashed_started;
 	/* multi-phase sorted aggregation: per-phase spools and phase driver */
 	bool		multi_phase;
@@ -1878,6 +1879,22 @@ VectorAggProcessBatch(VectorAggState *state, VectorBatch *batch)
 			}
 			continue;
 		}
+		else if (agg->aggstrategy == AGG_PLAIN && agg->phase->numsets > 1)
+		{
+			int			setno;
+
+			/*
+			 * A plain aggregate can still carry grouping sets (no hashed,
+			 * no sorted set): every input row contributes to every set of
+			 * the phase, exactly as the sorted multi-set advance does.
+			 */
+			for (setno = 0; setno < agg->phase->numsets; setno++)
+			{
+				VectorAggSelectSet(agg, setno);
+				advance_row(state, agg->pergroups[setno], row);
+			}
+			continue;
+		}
 		else
 			pergroup = agg->pergroups[0];
 
@@ -2150,16 +2167,40 @@ VectorAggNext(VectorAggState *state)
 	{
 		AggState   *agg = state->agg;
 
-		/* plain grouping sets go first, in phase order, as in nodeAgg */
+		/*
+		 * Plain grouping sets go first, in phase order, as in nodeAgg.
+		 * Every non-hash grouping set lives in exactly one plain phase
+		 * (all same-prefix sets share their phase, e.g. all the empty
+		 * sets of a GROUPING SETS list), so the walk covers each phase's
+		 * own numsets rather than assuming one phase per set - an
+		 * assumed-per-set phase index runs off the end of phases[] and
+		 * crashes once a phase holds two or more sets.
+		 */
 		while (!state->mixed_hashed_started &&
 			   state->mixed_plain_index < agg->maxsets)
 		{
-			int			k = state->mixed_plain_index++;
+			int			phaseidx;
+			int			phaseset;
 
-			/* each plain phase contributes exactly one grouping set */
-			result = VectorAggRetrievePlainSet(agg, k + 1, 0, k);
-			if (result != NULL)
-				return result;
+			for (phaseidx = 1; phaseidx < agg->numphases; phaseidx++)
+			{
+				int			numsets = Max(agg->phases[phaseidx].numsets, 1);
+
+				/*
+				 * Prepare projection and finalize both index the phase's
+				 * per-set arrays by the GLOBAL grouping-set number, the
+				 * same number pergroups[] and select_current_set use.
+				 */
+				for (phaseset = 0; phaseset < numsets; phaseset++)
+				{
+					int			k = state->mixed_plain_index++;
+
+					result = VectorAggRetrievePlainSet(agg, phaseidx,
+													   k, k);
+					if (result != NULL)
+						return result;
+				}
+			}
 		}
 		if (!state->mixed_hashed_started)
 		{
@@ -2184,6 +2225,28 @@ VectorAggNext(VectorAggState *state)
 		if (state->fast != NULL && !state->fast->converted)
 			return fast_retrieve_next(state);
 		return VectorAggRetrieveHashed(state->agg);
+	}
+
+	/*
+	 * An AGG_PLAIN node can still carry grouping sets (GROUPING SETS with
+	 * no hashed and no sorted set): each set projects one empty-group row
+	 * from its own pergroup array.  VectorAggRetrievePlain only knows the
+	 * first set, so walk the phase's sets here; initialize_aggregates
+	 * (numReset 0) has already initialized all of them.
+	 */
+	if (state->agg->aggstrategy == AGG_PLAIN &&
+		state->agg->phase->numsets > 1)
+	{
+		int			setno = state->plain_set_index;
+		int			phaseidx = state->agg->phase - state->agg->phases;
+
+		if (setno >= state->agg->phase->numsets)
+		{
+			state->output_done = true;
+			return NULL;
+		}
+		state->plain_set_index++;
+		return VectorAggRetrievePlainSet(state->agg, phaseidx, setno, setno);
 	}
 
 	state->output_done = true;
@@ -2227,6 +2290,8 @@ VectorAggReset(VectorAggState *state)
 		state->mixed_plain_index = 0;
 		state->mixed_hashed_started = false;
 	}
+	/* the multi-set plain walk restarts from the first grouping set */
+	state->plain_set_index = 0;
 	/* A reused hash table must be iterated, not populated a second time. */
 	state->input_done = state->agg->aggstrategy == AGG_HASHED &&
 		state->agg->table_filled;
