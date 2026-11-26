@@ -248,8 +248,80 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 {
 	int			col;
 	int			row;
+	uint32	  **coloffs;		/* per by-ref column: blob offsets, built once */
+	uint32	   *colblobs;		/* per by-ref column: blob length */
+	Size		total = 8;		/* magic + nrows + ncols */
+	bool		dense = rows == NULL && batch->sel_identity;
 
 	Assert(ncols <= batch->ncols);
+
+	coloffs = (uint32 **) palloc0(sizeof(uint32 *) * ncols);
+	colblobs = (uint32 *) palloc0(sizeof(uint32) * ncols);
+
+	/*
+	 * Size the payload exactly and build the by-ref offset arrays up
+	 * front: the appends below then never grow the buffer (a realloc
+	 * memmoves the whole payload), and every varlena header is read once
+	 * per row instead of twice.
+	 */
+	for (col = 0; col < ncols; col++)
+	{
+		const VectorColumn *c = &batch->columns[col];
+		bool		byval = c->typbyval && c->typlen > 0;
+		/* fixed-length pass-by-reference types (timetz, interval, name):
+		 * not varlena, must not go through VARSIZE_ANY */
+		bool		fixed_ref = !byval && c->typlen > 0;
+		int			bitbytes = (nrows + 7) / 8;
+
+		total += 4 + bitbytes + (8 - bitbytes % 8) % 8;
+		if (byval)
+		{
+			total += (Size) c->typlen * nrows;
+			continue;
+		}
+
+		{
+			uint32	   *offs = (uint32 *) palloc(sizeof(uint32) * Max(nrows, 1));
+			uint32		bloblen = 0;
+
+			coloffs[col] = offs;
+			for (row = 0; row < nrows; row++)
+			{
+				int			r = rows ? rows[row] : VectorBatchSelectedRow(batch, row);
+				Datum		v;
+				Size		sz;
+
+				if (VectorBatchIsNull(batch, col, r))
+				{
+					offs[row] = 0xFFFFFFFF;
+					continue;
+				}
+				v = VectorBatchGetDatum(batch, col, r);
+				if (fixed_ref)
+					sz = c->typlen;
+				else if (c->typlen == -2)
+					sz = strlen((char *) DatumGetPointer(v)) + 1;
+				else
+				{
+					/*
+					 * Flatten expanded objects for the measurement only;
+					 * the fill pass flattens again, matching the previous
+					 * behavior.  The flat copy is palloc'd in the caller's
+					 * short-lived context.
+					 */
+					if (VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(v)))
+						v = datumCopy(v, false, -1);
+					sz = VARSIZE_ANY(DatumGetPointer(v));
+				}
+				offs[row] = bloblen;
+				bloblen += (uint32) sz;
+			}
+			colblobs[col] = bloblen;
+			total += 4 + (Size) sizeof(uint32) * nrows + bloblen;
+		}
+	}
+
+	enlargeStringInfo(buf, (int) total);
 	vbatch_encode_u32(buf, VBATCH_MAGIC);
 	vbatch_encode_u16(buf, (uint16) nrows);
 	vbatch_encode_u16(buf, (uint16) ncols);
@@ -258,8 +330,6 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 	{
 		const VectorColumn *c = &batch->columns[col];
 		bool		byval = c->typbyval && c->typlen > 0;
-		/* fixed-length pass-by-reference types (timetz, interval, name):
-		 * not varlena, must not go through VARSIZE_ANY */
 		bool		fixed_ref = !byval && c->typlen > 0;
 		uint8		kind = byval ? 0 : (fixed_ref ? 2 : 1);
 		int			bitbytes = (nrows + 7) / 8;
@@ -291,6 +361,29 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 
 		if (byval)
 		{
+			/*
+			 * A dense batch stores each column contiguously in the wire's
+			 * own width for common datum sizes: one memcpy moves the whole
+			 * column instead of a per-row append.
+			 */
+			if (dense && c->typlen == sizeof(Datum))
+			{
+				appendBinaryStringInfo(buf, (char *) c->values,
+									   c->typlen * nrows);
+				continue;
+			}
+			if (dense && c->i32_values != NULL && c->typlen == sizeof(int32))
+			{
+				appendBinaryStringInfo(buf, (char *) c->i32_values,
+									   sizeof(int32) * nrows);
+				continue;
+			}
+			if (dense && c->i16_values != NULL && c->typlen == sizeof(int16))
+			{
+				appendBinaryStringInfo(buf, (char *) c->i16_values,
+									   sizeof(int16) * nrows);
+				continue;
+			}
 			for (row = 0; row < nrows; row++)
 			{
 				int			r = rows ? rows[row] : VectorBatchSelectedRow(batch, row);
@@ -308,46 +401,15 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 		else
 		{
 			/*
-			 * Two passes: all offsets first, then the blob, matching the
-			 * decoder's layout [bloblen][offsets n][blob bytes].
+			 * All offsets first, then the blob, matching the decoder's
+			 * layout [bloblen][offsets n][blob bytes].
 			 */
-			uint32		bloblen = 0;
-			uint32	   *offs;
+			uint32	   *offs = coloffs[col];
 
-			offs = (uint32 *) palloc(sizeof(uint32) * Max(nrows, 1));
-			for (row = 0; row < nrows; row++)
-			{
-				int			r = rows ? rows[row] : VectorBatchSelectedRow(batch, row);
-
-				if (VectorBatchIsNull(batch, col, r))
-					offs[row] = 0xFFFFFFFF;
-				else
-				{
-					Datum		v = VectorBatchGetDatum(batch, col, r);
-					Size		sz;
-
-					if (fixed_ref)
-						sz = c->typlen;
-					else if (c->typlen == -2)
-						sz = strlen((char *) DatumGetPointer(v)) + 1;
-					else
-					{
-						/*
-						 * Flatten expanded objects; the flattened copy is
-						 * palloc'd in the caller's short-lived context.
-						 */
-						if (VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(v)))
-							v = datumCopy(v, false, -1);
-						sz = VARSIZE_ANY(DatumGetPointer(v));
-					}
-					offs[row] = bloblen;
-					bloblen += (uint32) sz;
-				}
-			}
-
-			vbatch_encode_u32(buf, bloblen);
-			for (row = 0; row < nrows; row++)
-				vbatch_encode_u32(buf, offs[row]);
+			vbatch_encode_u32(buf, colblobs[col]);
+			if (nrows > 0)
+				appendBinaryStringInfo(buf, (char *) offs,
+									   sizeof(uint32) * nrows);
 			for (row = 0; row < nrows; row++)
 			{
 				if (offs[row] != 0xFFFFFFFF)
@@ -365,9 +427,10 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 					appendBinaryStringInfo(buf, (char *) DatumGetPointer(v), sz);
 				}
 			}
-			pfree(offs);
 		}
 	}
+	pfree(coloffs);
+	pfree(colblobs);
 }
 
 static uint32

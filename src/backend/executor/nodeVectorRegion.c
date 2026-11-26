@@ -77,6 +77,7 @@ typedef struct VectorMotionLeafState
 	MotionState *motion;
 	VectorRowLeafState row;		/* row.input == (PlanState *) motion */
 	int			decided;		/* 0 = first pull, 1 = batch, 2 = rows, 3 = eos */
+	int		   *identity;		/* aggregate-input adoption map, lazily built */
 	VectorBatch *current;		/* handed out; destroyed on replace/EOF */
 } VectorMotionLeafState;
 
@@ -91,6 +92,12 @@ typedef struct VectorRegionState
 	 */
 	struct VectorRowLeafState *row_leaf;
 	struct VectorMotionLeafState *motion_leaf;
+	/*
+	 * Adaptive input over a Motion receiver for an aggregate region:
+	 * batch interconnect frames hand over as batches directly, plain
+	 * tuple streams fall back to the row adapter through state->input.
+	 */
+	struct VectorMotionLeafState *motion_input;
 	AppendState *append;
 	int			append_index;
 	VectorExprState **append_quals;
@@ -162,6 +169,8 @@ static void VectorRowLeafDestroy(VectorRowLeafState *leaf);
 static bool VectorRegionSortIsPassthrough(SortState *sort);
 static void VectorRegionInitBuildChain(VectorRegionState *state);
 static bool VectorRegionNextScanBatch(VectorRegionState *state);
+static bool VectorRegionMotionInputNext(VectorRegionState *state);
+static bool VectorMotionLeafNext(void *arg);
 static VectorBatch *VectorRegionInputBatch(VectorRegionState *state);
 static bool VectorRegionOutputBatchable(VectorRegionState *state);
 static bool VectorRegionProbeBatches(VectorRegionState *state);
@@ -290,6 +299,25 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 			state->append = (AppendState *) outer;
 		else if (IsA(outer, HashJoinState))
 			state->hj = (HashJoinState *) outer;
+		else if (IsA(outer, MotionState))
+		{
+			/*
+			 * Adaptive input: a batch interconnect stream hands over as
+			 * batches directly; a plain tuple stream falls back to the
+			 * leaf's embedded row adapter.
+			 */
+			state->input = (PlanState *) outer;
+			state->motion_input = MemoryContextAllocZero(
+				node->ss.ps.state->es_query_cxt,
+				sizeof(VectorMotionLeafState));
+			state->motion_input->motion = (MotionState *) outer;
+			state->motion_input->row.input = (PlanState *) outer;
+			state->motion_input->row.batch = VectorBatchCreate(
+				node->ss.ps.state->es_query_cxt,
+				ExecGetResultType(outer),
+				VECTOR_BATCH_DEFAULT_CAPACITY,
+				false);
+		}
 		else
 			state->input = state->sort != NULL ? (PlanState *) state->sort : outer;
 	}
@@ -831,6 +859,7 @@ VectorRegionReadAdapter(VectorRegionState *state)
 	while (nrows < batch->capacity)
 	{
 		TupleTableSlot *slot = ExecProcNode(state->input);
+		MemoryContext oldcontext;
 		int			col;
 
 		if (TupIsNull(slot))
@@ -841,14 +870,20 @@ VectorRegionReadAdapter(VectorRegionState *state)
 		slot_getallattrs(slot);
 		if (slot->tts_nvalid != batch->ncols)
 			elog(ERROR, "vector region input shape changed during execution");
+		/*
+		 * One context switch per row instead of one per by-ref value: the
+		 * copies land in the batch's varlena context either way.
+		 */
+		oldcontext = MemoryContextSwitchTo(batch->varlena_context);
 		for (col = 0; col < batch->ncols; col++)
 		{
 			Datum		value = slot->tts_values[col];
 			bool		isnull = slot->tts_isnull[col];
 
-			value = VectorBatchCopyDatum(batch, col, value, isnull);
+			value = VectorBatchCopyDatumInContext(batch, col, value, isnull);
 			VectorBatchSetValue(batch, col, nrows, value, isnull);
 		}
+		MemoryContextSwitchTo(oldcontext);
 		nrows++;
 	}
 	VectorBatchSetRowCount(batch, nrows);
@@ -856,6 +891,41 @@ VectorRegionReadAdapter(VectorRegionState *state)
 	state->eof = exhausted;
 	if (nrows == 0)
 		return false;
+	return true;
+}
+
+/*
+ * Adaptive input over a Motion receiver for an aggregate region: batch
+ * interconnect frames hand over as batches directly (VectorMotionLeafNext
+ * also falls back to its embedded row adapter for plain tuple streams).
+ * The source batch is stolen into the region's own batch, whose pointer
+ * identity the consumption loops rely on; by-ref values keep referencing
+ * the source batch's storage, which stays alive until the next pull.
+ */
+static bool
+VectorRegionMotionInputNext(VectorRegionState *state)
+{
+	VectorMotionLeafState *leaf = state->motion_input;
+	VectorBatch *batch;
+	int			c;
+
+	if (!VectorMotionLeafNext(leaf))
+		return false;
+
+	batch = leaf->decided == 1 ? leaf->current : leaf->row.batch;
+
+	if (batch->nrows > state->batch->capacity)
+		elog(ERROR, "vector region input batch exceeds its capacity");
+
+	if (leaf->identity == NULL)
+	{
+		leaf->identity = palloc(sizeof(int) * state->batch->ncols);
+		for (c = 0; c < state->batch->ncols; c++)
+			leaf->identity[c] = c;
+	}
+	VectorBatchReset(state->batch);
+	VectorBatchCopyColumns(state->batch, batch, leaf->identity);
+	state->position = 0;
 	return true;
 }
 
@@ -876,12 +946,16 @@ VectorScanRowsToBatch(VectorBatch *batch, TupleTableSlot *slot,
 	VectorBatchReset(batch);
 	while (nrows < batch->capacity)
 	{
+		MemoryContext oldcontext;
+
 		if (!table_scan_getnextslot(scandesc, dir, slot))
 		{
 			*eof = true;
 			break;
 		}
 
+		/* one context switch per row instead of one per by-ref value */
+		oldcontext = MemoryContextSwitchTo(batch->varlena_context);
 		for (col = 0; col < batch->ncols; col++)
 		{
 			Datum		value;
@@ -890,9 +964,10 @@ VectorScanRowsToBatch(VectorBatch *batch, TupleTableSlot *slot,
 			if (!read_attrs[col])
 				continue;
 			value = slot_getattr(slot, col + 1, &isnull);
-			value = VectorBatchCopyDatum(batch, col, value, isnull);
+			value = VectorBatchCopyDatumInContext(batch, col, value, isnull);
 			VectorBatchSetValue(batch, col, nrows, value, isnull);
 		}
+		MemoryContextSwitchTo(oldcontext);
 		nrows++;
 	}
 
@@ -1671,7 +1746,11 @@ VectorRegionNextScanBatch(VectorRegionState *state)
 		return true;
 
 	if (state->input != NULL)
+	{
+		if (state->motion_input != NULL)
+			return VectorRegionMotionInputNext(state);
 		return VectorRegionReadAdapter(state);
+	}
 
 	for (;;)
 	{
@@ -2079,6 +2158,7 @@ VectorRegionEnd(CustomScanState *node)
 	VectorMotionLeafDestroy(state->build_motion_leaf);
 	if (state->motion_leaf != NULL)
 		VectorMotionLeafDestroy(state->motion_leaf);
+	VectorMotionLeafDestroy(state->motion_input);
 	if (state->proj != NULL)
 	{
 		int			col;
@@ -2130,6 +2210,21 @@ VectorRegionRescan(CustomScanState *node)
 		outerPlanState(state->material) = state->mat_outer;
 	if (state->batch != NULL)
 		VectorBatchReset(state->batch);
+	/*
+	 * A re-pull re-decides the stream shape: batch mode resumes with a
+	 * fresh recv, and a tuple stream falls back to the leaf's row adapter
+	 * again (its EOF flag resets with the decision).
+	 */
+	if (state->motion_input != NULL)
+	{
+		state->motion_input->decided = 0;
+		if (state->motion_input->current != NULL)
+		{
+			VectorBatchDestroy(state->motion_input->current);
+			state->motion_input->current = NULL;
+		}
+		state->motion_input->row.eof = false;
+	}
 	if (state->scan != NULL && state->input == NULL &&
 		state->scan->ss.ss_currentScanDesc != NULL)
 	{

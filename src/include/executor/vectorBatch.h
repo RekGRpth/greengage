@@ -16,6 +16,7 @@
 #include "access/tupdesc.h"
 #include "lib/stringinfo.h"
 #include "catalog/pg_type_d.h"
+#include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/float.h"
 
@@ -91,6 +92,27 @@ extern Datum VectorBatchCopyDatum(VectorBatch *batch, int col, Datum value,
 								  bool isnull);
 extern void VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
 								   const int *dstcol);
+
+/*
+ * Copy a value into a batch assuming the caller has already switched to
+ * batch->varlena_context: the fill loops hoist the context switch out of
+ * their per-value calls.  Same semantics as VectorBatchCopyDatum otherwise.
+ */
+static inline Datum
+VectorBatchCopyDatumInContext(VectorBatch *batch, int col, Datum value,
+							  bool isnull)
+{
+	VectorColumn *column;
+
+	if (isnull)
+		return (Datum) 0;
+
+	column = &batch->columns[col];
+	if (column->typbyval)
+		return value;
+
+	return datumCopy(value, column->typbyval, column->typlen);
+}
 
 static inline Datum
 VectorColumnGetDatum(const VectorColumn *column, int row)
