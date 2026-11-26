@@ -14,6 +14,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
+#include "nodes/nodeFuncs.h"
 #include "executor/vectorAgg.h"
 #include "executor/vectorExpr.h"
 #include "miscadmin.h"
@@ -117,6 +118,7 @@ struct VectorAggState
 	bool		mixed_hashed_started;
 	/* multi-phase sorted aggregation: per-phase spools and phase driver */
 	bool		multi_phase;
+	bool		is_combine;	/* the split is FINAL_DESERIAL: combine transitions */
 	VectorBatch *batch;
 	TupleTableSlot *sort_slot;	/* minimal-tuple slot for spool reads */
 	int			position;
@@ -200,9 +202,21 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	int			col = 0;
 
 	if (!IsA(outer, SeqScan) && !IsA(outer, Motion) &&
+		!IsA(outer, CustomScan) && !IsA(outer, HashJoin) &&
 		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED &&
 		agg->aggstrategy != AGG_MIXED)
 		return false;
+	if (IsA(outer, HashJoin) &&
+		((HashJoin *) outer)->join.jointype == JOIN_FULL)
+	{
+		/*
+		 * A plain aggregate over a Hash FULL join: the FULL join's
+		 * null-extended batches produced wrong sums in this shape, so
+		 * keep it row-wise until its batch path is understood.
+		 */
+		return false;
+	}
+
 
 	vars->outer_ncols = list_length(outer->targetlist);
 	vars->outer_attnos = MemoryContextAlloc(context,
@@ -233,7 +247,10 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	}
 	if (!IsA(outer, SeqScan))
 	{
-		/* A region above a Motion or another row leaf reads its output shape. */
+		/*
+		 * A region above a Motion, another row leaf, or a child region
+		 * reads its output shape.
+		 */
 		vars->scanrelid = 0;
 		foreach(lc, outer->targetlist)
 		{
@@ -266,6 +283,68 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 	return true;
 }
 
+/*
+ * The per-aggregate plan checks for one Aggref inside a finalize
+ * targetlist expression: same rules as a direct tlist Aggref.
+ */
+static bool
+aggref_plan_supported(Aggref *aggref, Agg *agg, VectorExprVarMap *vars)
+{
+	ListCell   *arglc;
+
+	if ((aggref->aggkind != AGGKIND_NORMAL &&
+		 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
+		aggref->agglevelsup != 0 ||
+		aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
+		(aggref->aggdirectargs != NIL &&
+		 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
+		aggref->aggtype == INTERNALOID ||
+		((aggref->aggorder != NIL || aggref->aggdistinct != NIL) &&
+		 agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_SORTED) ||
+		(aggref->aggdistinct != NIL && list_length(aggref->args) != 1))
+		return false;
+	if (aggref->aggfilter != NULL &&
+		!VectorExprIsSupported(aggref->aggfilter, vars))
+		return false;
+	foreach(arglc, aggref->args)
+	{
+		TargetEntry *arg = (TargetEntry *) lfirst(arglc);
+
+		if (!VectorExprIsSupported(arg->expr, vars))
+			return false;
+	}
+	return true;
+}
+
+struct FinalizeTlistContext
+{
+	Agg			  *agg;
+	VectorExprVarMap *vars;
+};
+
+/*
+ * A finalize targetlist expression must be built from constants, outer
+ * Vars and supported Aggrefs: the row machinery projects exactly such
+ * expressions after finalize_aggregates.  This admits e.g. the
+ * planner's avg(int8) expansion, a division expression over the sum
+ * and count aggregates.
+ */
+static bool
+finalize_tlist_walker(Node *node, void *context)
+{
+	struct FinalizeTlistContext *ctx = (struct FinalizeTlistContext *) context;
+
+	if (node == NULL)
+		return true;
+	if (IsA(node, Aggref))
+		return aggref_plan_supported((Aggref *) node, ctx->agg, ctx->vars);
+	if (IsA(node, Var))
+		return VectorExprIsSupported((Expr *) node, ctx->vars);
+	if (IsA(node, Const) || IsA(node, Param) || IsA(node, CaseTestExpr))
+		return true;
+	return expression_tree_walker(node, finalize_tlist_walker, (void *) ctx);
+}
+
 bool
 VectorAggPlanIsSupported(Agg *agg)
 {
@@ -277,7 +356,9 @@ VectorAggPlanIsSupported(Agg *agg)
 	if ((agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED &&
 		 agg->aggstrategy != AGG_SORTED && agg->aggstrategy != AGG_MIXED) ||
 		(agg->aggsplit != AGGSPLIT_SIMPLE &&
-		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
+		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
+		 !(agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
+		   agg->aggstrategy == AGG_HASHED)) ||
 		!bms_is_empty(agg->aggParams) || agg->agg_expr_id != 0)
 		return false;
 	/*
@@ -357,34 +438,20 @@ VectorAggPlanIsSupported(Agg *agg)
 				goto done;
 			continue;
 		}
-		if (!IsA(te->expr, Aggref))
-			goto done;
-
+		/*
+		 * Any targetlist expression over Aggrefs and group-key Vars
+		 * projects through the row machinery's finalize path
+		 * (finalize_aggregates + project_aggregates): accept it when
+		 * every Aggref inside passes the per-aggregate checks and every
+		 * Var reads an outer column the batch can supply.
+		 */
 		{
-			Aggref	   *aggref = (Aggref *) te->expr;
-			ListCell   *arglc;
+			struct FinalizeTlistContext fctx;
 
-			if ((aggref->aggkind != AGGKIND_NORMAL &&
-				 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
-				aggref->agglevelsup != 0 ||
-				aggref->aggsplit != agg->aggsplit || aggref->aggvariadic ||
-				(aggref->aggdirectargs != NIL &&
-				 !AGGKIND_IS_ORDERED_SET(aggref->aggkind)) ||
-				aggref->aggtype == INTERNALOID ||
-				((aggref->aggorder != NIL || aggref->aggdistinct != NIL) &&
-				 agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_SORTED) ||
-				(aggref->aggdistinct != NIL && list_length(aggref->args) != 1))
+			fctx.agg = agg;
+			fctx.vars = &vars;
+			if (!finalize_tlist_walker((Node *) te->expr, &fctx))
 				goto done;
-			if (aggref->aggfilter != NULL &&
-				!VectorExprIsSupported(aggref->aggfilter, &vars))
-				goto done;
-			foreach(arglc, aggref->args)
-			{
-				TargetEntry *arg = (TargetEntry *) lfirst(arglc);
-
-				if (!VectorExprIsSupported(arg->expr, &vars))
-				goto done;
-			}
 		}
 	}
 	supported = true;
@@ -650,6 +717,7 @@ VectorAggCreate(MemoryContext parent, AggState *agg, VectorBatch *batch)
 				VectorExprDeferNumericResult(state->args[transno][0]);
 	}
 	state->multi_phase = agg->aggstrategy == AGG_SORTED && agg->numphases > 2;
+	state->is_combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
 	state->batch = batch;
 	state->current_phase_idx = 1;
 	if (state->multi_phase)
@@ -1747,6 +1815,47 @@ advance_packed_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 	}
 }
 
+/*
+ * A combine transition consumes the serialized partial state carried by
+ * the input column: deserialize it, then run the combine through the
+ * regular transition bridge.  Mirrors the row executor's
+ * EEOP_AGG_STRICT_DESERIALIZE / EEOP_AGG_DESERIALIZE steps, including
+ * the strict-deserialize bailout on a NULL input.
+ */
+static void
+advance_combine_row(AggState *agg, AggStatePerTrans pertrans,
+					AggStatePerGroup pergroupstate, int transno,
+					Datum input, bool isnull)
+{
+	Datum		value = input;
+	bool		valuenull = isnull;
+	Datum		combine_values[1];
+	bool		combine_nulls[1];
+
+	if (OidIsValid(pertrans->deserialfn_oid))
+	{
+		FunctionCallInfo ds_fcinfo = pertrans->deserialfn_fcinfo;
+		MemoryContext oldcontext;
+
+		if (pertrans->deserialfn.fn_strict && isnull)
+			return;
+		ds_fcinfo->args[0].value = input;
+		ds_fcinfo->args[0].isnull = isnull;
+		ds_fcinfo->args[1].value = (Datum) 0;
+		ds_fcinfo->args[1].isnull = false;
+		oldcontext = MemoryContextSwitchTo(
+			agg->curaggcontext->ecxt_per_tuple_memory);
+		ds_fcinfo->isnull = false;
+		value = FunctionCallInvoke(ds_fcinfo);
+		valuenull = ds_fcinfo->isnull;
+		MemoryContextSwitchTo(oldcontext);
+	}
+	combine_values[0] = value;
+	combine_nulls[0] = valuenull;
+	VectorAggAdvanceTransition(agg, pergroupstate, transno,
+							   combine_values, combine_nulls);
+}
+
 static void
 advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 {
@@ -1778,6 +1887,19 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 				state->arg_values[transno][argno][row];
 			state->nulls[transno][argno] =
 				(state->arg_nulls[transno][argno][row / 64] >> (row % 64)) & 1;
+		}
+		if (state->is_combine)
+		{
+			/*
+			 * A combine transition: the input column carries the
+			 * (optionally serialized) partial state from below.
+			 * Deserialize and run the combine through the regular
+			 * transition bridge; the by-value fast paths do not apply.
+			 */
+			advance_combine_row(agg, pertrans, pergroup, transno,
+								state->values[transno][0],
+								state->nulls[transno][0]);
+			continue;
 		}
 		if (pertrans->numSortCols == 0 &&
 			advance_byval_fast(state, pergroup, transno, row))

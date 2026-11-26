@@ -2043,8 +2043,8 @@ JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
 ------------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
                            Hash Cond: ((l.id % 10) = vector_region_1.g)
                            ->  Seq Scan on vector_aoco_test l
@@ -2639,8 +2639,8 @@ SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
 ------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
                            Hash Cond: ((vector_region.id % 1000) = (vector_region_1.id % 1000))
                            ->  Redistribute Motion 3:3  (slice2; segments: 3)
@@ -4646,23 +4646,24 @@ WHERE t.p > 1.2 * (SELECT avg(u.p) FROM vector_subplan_lifetime u
 ---------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
-                           Hash Cond: (t.cat = vector_region.cat)
-                           Join Filter: (t.p > (1.2 * (avg(vector_region.p))))
+                           Hash Cond: (t.cat = vector_region_1.cat)
+                           Join Filter: (t.p > (1.2 * vector_region_1.avg))
                            ->  Seq Scan on vector_subplan_lifetime t
                            ->  Hash
                                  ->  Broadcast Motion 3:3  (slice2; segments: 3)
-                                       ->  Finalize HashAggregate
-                                             Group Key: vector_region.cat
-                                             ->  Redistribute Motion 3:3  (slice3; segments: 3)
-                                                   Hash Key: vector_region.cat
-                                                   ->  Custom Scan (VectorRegion)
-                                                         ->  Streaming Partial HashAggregate
-                                                               Group Key: u.cat
-                                                               ->  Seq Scan on vector_subplan_lifetime u
-(19 rows)
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Finalize HashAggregate
+                                                   Group Key: vector_region.cat
+                                                   ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                         Hash Key: vector_region.cat
+                                                         ->  Custom Scan (VectorRegion)
+                                                               ->  Streaming Partial HashAggregate
+                                                                     Group Key: u.cat
+                                                                     ->  Seq Scan on vector_subplan_lifetime u
+(20 rows)
 
 SELECT count(*) FROM vector_subplan_lifetime t
 WHERE t.p > 1.2 * (SELECT avg(u.p) FROM vector_subplan_lifetime u
@@ -4714,27 +4715,29 @@ WHERE i.s > 0.9 * o.m;
  Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Nested Loop
-               Join Filter: ((avg(vector_region_1.v)) > (0.9 * (avg(vector_region.v))))
+               Join Filter: (vector_region_3.s > (0.9 * vector_region_1.m))
                ->  Broadcast Motion 3:3  (slice3; segments: 3)
-                     ->  Finalize HashAggregate
-                           Group Key: vector_region.g
-                           ->  Redistribute Motion 3:3  (slice4; segments: 3)
-                                 Hash Key: vector_region.g
-                                 ->  Custom Scan (VectorRegion)
-                                       ->  Streaming Partial HashAggregate
-                                             Group Key: vector_nl_prefetch_agg_1.g
-                                             ->  Seq Scan on vector_nl_prefetch_agg vector_nl_prefetch_agg_1
-                                                   Filter: (g = 1)
+                     ->  Custom Scan (VectorRegion)
+                           ->  Finalize HashAggregate
+                                 Group Key: vector_region.g
+                                 ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                       Hash Key: vector_region.g
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: vector_nl_prefetch_agg_1.g
+                                                   ->  Seq Scan on vector_nl_prefetch_agg vector_nl_prefetch_agg_1
+                                                         Filter: (g = 1)
                ->  Materialize
-                     ->  Finalize HashAggregate
-                           Group Key: vector_region_1.g
-                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                                 Hash Key: vector_region_1.g
-                                 ->  Custom Scan (VectorRegion)
-                                       ->  Streaming Partial HashAggregate
-                                             Group Key: vector_nl_prefetch_agg.g
-                                             ->  Seq Scan on vector_nl_prefetch_agg
-(24 rows)
+                     ->  Custom Scan (VectorRegion)
+                           ->  Finalize HashAggregate
+                                 Group Key: vector_region_2.g
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: vector_region_2.g
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: vector_nl_prefetch_agg.g
+                                                   ->  Seq Scan on vector_nl_prefetch_agg
+(26 rows)
 
 SELECT count(*) FROM
   (SELECT avg(v) AS m FROM vector_nl_prefetch_agg WHERE g = 1 GROUP BY g) o,
