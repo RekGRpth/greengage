@@ -487,12 +487,11 @@ typedef struct MotionNodeEntry
 	struct VectorBatch *pending_batch;
 	int32           pending_row;
 	/*
-	 * Reused chunk-assembly buffer for reconstructBatch: a fresh
-	 * StringInfo per decoded batch munmaps and re-faults a large
-	 * allocation on every batch; one buffer that keeps its capacity
-	 * across batches stays resident.
+	 * The chunk-assembly buffer moved into the decoded batch (its
+	 * wire_data): the decode points its by-reference values into the
+	 * payload, so each batch owns the buffer it was assembled in until
+	 * it is destroyed.
 	 */
-	struct StringInfoData *batch_assemble;
 }       MotionNodeEntry;
 
 

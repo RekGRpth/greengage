@@ -50,6 +50,14 @@ typedef struct VectorizeContext
 	int			slice;
 	int			next_plan_node_id;
 	int			wrapped;
+	/*
+	 * Set while descending an aggregate whose motion input was declined
+	 * for missing fast group keys: the producer chain under that motion
+	 * stays row-wise, or the batch wire would feed a row consumer through
+	 * per-row decompose and tuple forming - costlier than the row
+	 * executor end to end.
+	 */
+	bool		suppress_motion;
 } VectorizeContext;
 
 static Node *vectorize_mutator(Node *node, VectorizeContext *ctx);
@@ -857,6 +865,8 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 		int			saved_slice = ctx->slice;
 		Node	   *result;
 
+		if (ctx->suppress_motion)
+			return node;
 		ctx->slice = motion->motionID;
 		result = plan_tree_mutator(node, vectorize_mutator, ctx, false);
 		ctx->slice = saved_slice;
@@ -986,6 +996,11 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 
 		if (!VectorAggPlanIsSupported((Agg *) node))
 			why = "the aggregate shape is not supported";
+		else if (IsA(outerPlan(node), Motion) &&
+				 ((Agg *) node)->aggstrategy == AGG_HASHED &&
+				 !VectorAggFastGroupsPlanEligible((Agg *) node))
+			why = "the hashed aggregate over a motion has no fast group "
+				  "table for its keys";
 		else if (IsA(outerPlan(node), Append) &&
 				 !is_simple_append(ctx, (Append *) outerPlan(node)))
 			why = "the append below the aggregate is not simple";
@@ -1013,7 +1028,25 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 			return (Node *) make_region(ctx, (Plan *) node);
 		}
 		if (why != NULL)
+		{
+			bool		saved_suppress = ctx->suppress_motion;
+
 			decision(ctx, (Plan *) node, why);
+			/*
+			 * The no-fast-keys motion gate must also leave the producer
+			 * chain under its motion row-wise (see suppress_motion).
+			 */
+			ctx->suppress_motion =
+				(IsA(outerPlan(node), Motion) &&
+				 ((Agg *) node)->aggstrategy == AGG_HASHED);
+			{
+				Node	   *result = plan_tree_mutator(node, vectorize_mutator,
+													   ctx, false);
+
+				ctx->suppress_motion = saved_suppress;
+				return result;
+			}
+		}
 		return plan_tree_mutator(node, vectorize_mutator, ctx, false);
 	}
 

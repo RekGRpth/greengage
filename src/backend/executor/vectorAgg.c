@@ -20,6 +20,7 @@
 #include "miscadmin.h"
 #include "parser/parsetree.h"
 #include "utils/array.h"
+#include "utils/lsyscache.h"
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/tuplesort.h"
@@ -855,6 +856,44 @@ fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
  */
 #define VFAST_MAXKEYS	4
 #define VFAST_WORDS		(VFAST_MAXKEYS + 1)
+
+/*
+ * Plan-time view of the fast group table's eligibility: a hashed
+ * aggregate whose grouping keys are all by-value fixed-width columns
+ * (1/2/4/8 bytes, at most VFAST_MAXKEYS of them) can run the open
+ * addressing table and beat the row executor even over a motion.
+ * Anything wider (varlena keys) hashes per row through the standard
+ * slot machinery: batched it is the row executor plus overhead, so the
+ * caller gates the shape out.
+ */
+bool
+VectorAggFastGroupsPlanEligible(Agg *agg)
+{
+	TargetEntry *te;
+	int			col;
+
+	if (agg->aggstrategy != AGG_HASHED || agg->streaming ||
+		agg->numCols < 1 || agg->numCols > VFAST_MAXKEYS)
+		return false;
+	for (col = 0; col < agg->numCols; col++)
+	{
+		int16		typlen;
+		bool		byval;
+
+		if (agg->grpColIdx[col] <= 0 ||
+			agg->grpColIdx[col] > list_length(outerPlan(agg)->targetlist))
+			return false;
+		te = (TargetEntry *) list_nth(outerPlan(agg)->targetlist,
+									  agg->grpColIdx[col] - 1);
+		if (te == NULL || te->resjunk)
+			return false;
+		get_typlenbyval(exprType((Node *) te->expr), &typlen, &byval);
+		if (!byval || (typlen != 1 && typlen != 2 && typlen != 4 && typlen != 8))
+			return false;
+	}
+	return true;
+}
+
 
 typedef struct VectorAggFastGroups
 {
