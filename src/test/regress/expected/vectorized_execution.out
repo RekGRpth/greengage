@@ -6067,3 +6067,139 @@ RESET gp_vectorized_execution;
 DROP TABLE vector_chain_f;
 DROP TABLE vector_chain_d1;
 DROP TABLE vector_chain_d2;
+-- ---- Hash FULL join batch fill: both sides' unmatched rows ----
+-- The batch hash join set its fill flags for JOIN_LEFT and JOIN_RIGHT
+-- only and rejected JOIN_FULL in the fast-probe gate, so a FULL join
+-- wrapped in a region lost the probe side's rows and emitted every
+-- build tuple as unmatched: a hashed aggregate over its batches
+-- undercounted.  Keys 41..60 match (20 pairs), 1..40 are left-only and
+-- 61..100 right-only; the two CTE aggregates make the plan join the
+-- partial aggregates' outputs locally, so the final hashed aggregate
+-- consumes the FULL join's batch output - the shape the fill fix
+-- targets.  The plain scalar aggregate over a Hash FULL join keeps
+-- the row-wise executor by a separate plan gate.
+-- randomly distributed: the planner then feeds the join through
+-- motions, whose probes the region chain batch-consumes
+CREATE TABLE vector_fj_l (k int, item int) DISTRIBUTED RANDOMLY;
+CREATE TABLE vector_fj_r (k int, item int) DISTRIBUTED RANDOMLY;
+INSERT INTO vector_fj_l SELECT i, i FROM generate_series(1, 60) i;
+INSERT INTO vector_fj_r SELECT i + 40, i + 40 FROM generate_series(1, 60) i;
+SET optimizer_enable_mergejoin = off;
+SET gp_vectorized_execution = force;
+SELECT coalesce(l.customer_sk, r.customer_sk) AS k,
+       sum(case when l.customer_sk is null then 1 else 0 end) AS r_only,
+       sum(case when r.customer_sk is null then 1 else 0 end) AS l_only
+FROM (SELECT k customer_sk, item item_sk FROM vector_fj_l
+      GROUP BY k, item) l
+FULL OUTER JOIN (SELECT k customer_sk, item item_sk FROM vector_fj_r
+      GROUP BY k, item) r
+ON l.customer_sk = r.customer_sk AND l.item_sk = r.item_sk
+GROUP BY 1 ORDER BY 1;
+  k  | r_only | l_only 
+-----+--------+--------
+   1 |      0 |      1
+   2 |      0 |      1
+   3 |      0 |      1
+   4 |      0 |      1
+   5 |      0 |      1
+   6 |      0 |      1
+   7 |      0 |      1
+   8 |      0 |      1
+   9 |      0 |      1
+  10 |      0 |      1
+  11 |      0 |      1
+  12 |      0 |      1
+  13 |      0 |      1
+  14 |      0 |      1
+  15 |      0 |      1
+  16 |      0 |      1
+  17 |      0 |      1
+  18 |      0 |      1
+  19 |      0 |      1
+  20 |      0 |      1
+  21 |      0 |      1
+  22 |      0 |      1
+  23 |      0 |      1
+  24 |      0 |      1
+  25 |      0 |      1
+  26 |      0 |      1
+  27 |      0 |      1
+  28 |      0 |      1
+  29 |      0 |      1
+  30 |      0 |      1
+  31 |      0 |      1
+  32 |      0 |      1
+  33 |      0 |      1
+  34 |      0 |      1
+  35 |      0 |      1
+  36 |      0 |      1
+  37 |      0 |      1
+  38 |      0 |      1
+  39 |      0 |      1
+  40 |      0 |      1
+  41 |      0 |      0
+  42 |      0 |      0
+  43 |      0 |      0
+  44 |      0 |      0
+  45 |      0 |      0
+  46 |      0 |      0
+  47 |      0 |      0
+  48 |      0 |      0
+  49 |      0 |      0
+  50 |      0 |      0
+  51 |      0 |      0
+  52 |      0 |      0
+  53 |      0 |      0
+  54 |      0 |      0
+  55 |      0 |      0
+  56 |      0 |      0
+  57 |      0 |      0
+  58 |      0 |      0
+  59 |      0 |      0
+  60 |      0 |      0
+  61 |      1 |      0
+  62 |      1 |      0
+  63 |      1 |      0
+  64 |      1 |      0
+  65 |      1 |      0
+  66 |      1 |      0
+  67 |      1 |      0
+  68 |      1 |      0
+  69 |      1 |      0
+  70 |      1 |      0
+  71 |      1 |      0
+  72 |      1 |      0
+  73 |      1 |      0
+  74 |      1 |      0
+  75 |      1 |      0
+  76 |      1 |      0
+  77 |      1 |      0
+  78 |      1 |      0
+  79 |      1 |      0
+  80 |      1 |      0
+  81 |      1 |      0
+  82 |      1 |      0
+  83 |      1 |      0
+  84 |      1 |      0
+  85 |      1 |      0
+  86 |      1 |      0
+  87 |      1 |      0
+  88 |      1 |      0
+  89 |      1 |      0
+  90 |      1 |      0
+  91 |      1 |      0
+  92 |      1 |      0
+  93 |      1 |      0
+  94 |      1 |      0
+  95 |      1 |      0
+  96 |      1 |      0
+  97 |      1 |      0
+  98 |      1 |      0
+  99 |      1 |      0
+ 100 |      1 |      0
+(100 rows)
+
+RESET optimizer_enable_mergejoin;
+RESET gp_vectorized_execution;
+DROP TABLE vector_fj_l;
+DROP TABLE vector_fj_r;

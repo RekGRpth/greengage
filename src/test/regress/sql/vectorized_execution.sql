@@ -1873,3 +1873,35 @@ RESET gp_vectorized_execution;
 DROP TABLE vector_chain_f;
 DROP TABLE vector_chain_d1;
 DROP TABLE vector_chain_d2;
+-- ---- Hash FULL join batch fill: both sides' unmatched rows ----
+-- The batch hash join set its fill flags for JOIN_LEFT and JOIN_RIGHT
+-- only and rejected JOIN_FULL in the fast-probe gate, so a FULL join
+-- wrapped in a region lost the probe side's rows and emitted every
+-- build tuple as unmatched: a hashed aggregate over its batches
+-- undercounted.  Keys 41..60 match (20 pairs), 1..40 are left-only and
+-- 61..100 right-only; the two CTE aggregates make the plan join the
+-- partial aggregates' outputs locally, so the final hashed aggregate
+-- consumes the FULL join's batch output - the shape the fill fix
+-- targets.  The plain scalar aggregate over a Hash FULL join keeps
+-- the row-wise executor by a separate plan gate.
+-- randomly distributed: the planner then feeds the join through
+-- motions, whose probes the region chain batch-consumes
+CREATE TABLE vector_fj_l (k int, item int) DISTRIBUTED RANDOMLY;
+CREATE TABLE vector_fj_r (k int, item int) DISTRIBUTED RANDOMLY;
+INSERT INTO vector_fj_l SELECT i, i FROM generate_series(1, 60) i;
+INSERT INTO vector_fj_r SELECT i + 40, i + 40 FROM generate_series(1, 60) i;
+SET optimizer_enable_mergejoin = off;
+SET gp_vectorized_execution = force;
+SELECT coalesce(l.customer_sk, r.customer_sk) AS k,
+       sum(case when l.customer_sk is null then 1 else 0 end) AS r_only,
+       sum(case when r.customer_sk is null then 1 else 0 end) AS l_only
+FROM (SELECT k customer_sk, item item_sk FROM vector_fj_l
+      GROUP BY k, item) l
+FULL OUTER JOIN (SELECT k customer_sk, item item_sk FROM vector_fj_r
+      GROUP BY k, item) r
+ON l.customer_sk = r.customer_sk AND l.item_sk = r.item_sk
+GROUP BY 1 ORDER BY 1;
+RESET optimizer_enable_mergejoin;
+RESET gp_vectorized_execution;
+DROP TABLE vector_fj_l;
+DROP TABLE vector_fj_r;
