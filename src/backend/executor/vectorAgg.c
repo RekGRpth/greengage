@@ -858,22 +858,20 @@ fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
 #define VFAST_WORDS		(VFAST_MAXKEYS + 1)
 
 /*
- * Plan-time view of the fast group table's eligibility: a hashed
- * aggregate whose grouping keys are all by-value fixed-width columns
- * (1/2/4/8 bytes, at most VFAST_MAXKEYS of them) can run the open
- * addressing table and beat the row executor even over a motion.
- * Anything wider (varlena keys) hashes per row through the standard
- * slot machinery: batched it is the row executor plus overhead, so the
- * caller gates the shape out.
+ * Plan-time census of a hashed aggregate's grouping keys: true when two
+ * or more keys are outside the fast group table's reach (anything not
+ * by-value 1/2/4/8 bytes).  Such an aggregate hashes per row through
+ * the standard slot machinery: batched over a motion it loses to the
+ * row executor, so the caller gates the shape out.
  */
 bool
-VectorAggFastGroupsPlanEligible(Agg *agg)
+VectorAggWideGroupKeys(Agg *agg)
 {
 	TargetEntry *te;
 	int			col;
+	int			slow = 0;
 
-	if (agg->aggstrategy != AGG_HASHED || agg->streaming ||
-		agg->numCols < 1 || agg->numCols > VFAST_MAXKEYS)
+	if (agg->aggstrategy != AGG_HASHED)
 		return false;
 	for (col = 0; col < agg->numCols; col++)
 	{
@@ -889,9 +887,15 @@ VectorAggFastGroupsPlanEligible(Agg *agg)
 			return false;
 		get_typlenbyval(exprType((Node *) te->expr), &typlen, &byval);
 		if (!byval || (typlen != 1 && typlen != 2 && typlen != 4 && typlen != 8))
-			return false;
+			slow++;
 	}
-	return true;
+	/*
+	 * One slow key costs about what it saves; two or more lose to the
+	 * row executor consistently (query11's seven text keys, query67's
+	 * rollup levels), while single-text-key shapes measured par and
+	 * stayed net-positive vectorized (query06).
+	 */
+	return slow >= 2;
 }
 
 

@@ -998,7 +998,7 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 			why = "the aggregate shape is not supported";
 		else if (IsA(outerPlan(node), Motion) &&
 				 ((Agg *) node)->aggstrategy == AGG_HASHED &&
-				 !VectorAggFastGroupsPlanEligible((Agg *) node))
+				 VectorAggWideGroupKeys((Agg *) node))
 			why = "the hashed aggregate over a motion has no fast group "
 				  "table for its keys";
 		else if (IsA(outerPlan(node), Append) &&
