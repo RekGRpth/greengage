@@ -5998,7 +5998,9 @@ GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
 -- Empty int2vectors - the distribution keys of partitioned children -
 -- must keep their shape too: a region path that rebuilt the empty as a
 -- zero-dimensional array split identical gp_distribution_policy rows
--- into different groups (phantom gpcheckcat inconsistencies).
+-- into different groups (phantom gpcheckcat inconsistencies).  The
+-- catalog queries filter to this test's own tables: the shapes of other
+-- tables' distribution keys differ from cluster to cluster.
 CREATE TABLE vector_arrcoerce_part (id int) DISTRIBUTED RANDOMLY
   PARTITION BY RANGE (id) (START (0) END (20) EVERY (10));
 CREATE TEMPORARY TABLE vector_arrcoerce_d AS
@@ -6010,13 +6012,15 @@ SELECT v::text AS txt, array_lower(v, 1) AS lb, array_ndims(v) AS nd
 FROM (
   SELECT segid, distkey::int2[] AS v FROM vector_arrcoerce_d
   UNION ALL
-  SELECT gp_segment_id, distkey::int2[] AS v FROM gp_dist_random('gp_distribution_policy')) u
+  SELECT p.gp_segment_id, p.distkey::int2[] AS v
+    FROM gp_dist_random('gp_distribution_policy') p
+    JOIN pg_class c ON c.oid = p.localoid
+    WHERE c.relname LIKE 'vector_arrcoerce_part%') u
 GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
-    txt    | lb | nd 
------------+----+----
- {}        |  0 |  1
- [0:0]={1} |  0 |  1
-(2 rows)
+ txt | lb | nd 
+-----+----+----
+ {}  |  0 |  1
+(1 row)
 
 RESET gp_vectorized_execution;
 DROP TABLE vector_arrcoerce_c;
