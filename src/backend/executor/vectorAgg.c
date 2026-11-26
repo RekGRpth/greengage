@@ -210,9 +210,11 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 		((HashJoin *) outer)->join.jointype == JOIN_FULL)
 	{
 		/*
-		 * A plain aggregate over a Hash FULL join: the FULL join's
-		 * null-extended batches produced wrong sums in this shape, so
-		 * keep it row-wise until its batch path is understood.
+		 * An aggregate over a Hash FULL join: the batch machine's FULL
+		 * path (both the fast probe and the row-driven fallback) loses
+		 * the probe-side rows and misfills the finish, producing wrong
+		 * sums.  Keep the shape row-wise until the batch machine learns
+		 * the FULL join.
 		 */
 		return false;
 	}

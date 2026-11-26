@@ -282,6 +282,7 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 	if (join->join.jointype != JOIN_INNER &&
 		join->join.jointype != JOIN_LEFT &&
 		join->join.jointype != JOIN_RIGHT &&
+		join->join.jointype != JOIN_FULL &&
 		join->join.jointype != JOIN_SEMI &&
 		join->join.jointype != JOIN_ANTI &&
 		join->join.jointype != JOIN_LASJ_NOTIN)
@@ -329,9 +330,11 @@ VectorHashProbeFastGate(VectorHashJoinState *state)
 	if (nkeys == 0)
 		return false;
 	state->fill_outer = (join->join.jointype == JOIN_LEFT ||
+						 join->join.jointype == JOIN_FULL ||
 						 join->join.jointype == JOIN_ANTI ||
 						 join->join.jointype == JOIN_LASJ_NOTIN);
-	state->fill_inner = (join->join.jointype == JOIN_RIGHT);
+	state->fill_inner = (join->join.jointype == JOIN_RIGHT ||
+						 join->join.jointype == JOIN_FULL);
 	state->semi_join = (join->join.jointype == JOIN_SEMI);
 	state->anti_join = (join->join.jointype == JOIN_ANTI ||
 						join->join.jointype == JOIN_LASJ_NOTIN);
