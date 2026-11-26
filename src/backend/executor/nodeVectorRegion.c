@@ -154,6 +154,7 @@ typedef struct VectorRegionState
 	int		   **append_dstcols;	/* child column -> batch column, or -1 */
 	VectorBatch **append_batches;	/* per child: private fill batch */
 	bool	   **append_read_attrs;	/* per child: row-reader deform set */
+	bool		explain_only;	/* EXPLAIN_ONLY init: no batch was created */
 } VectorRegionState;
 
 typedef struct VectorNestLoopProxy
@@ -254,6 +255,13 @@ VectorRegionBegin(CustomScanState *node, EState *estate, int eflags)
 	bool		needs_row_reader = false;
 	ListCell   *lc;
 	int			col = 0;
+
+	/*
+	 * An EXPLAIN_ONLY init (the coordinator's EXPLAIN walk) creates no
+	 * batch, so the batch-output gates below must not promise anything:
+	 * with the flag set they decline before touching state->batch.
+	 */
+	state->explain_only = (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0;
 
 	foreach(lc, cscan->custom_plans)
 	{
@@ -1502,6 +1510,12 @@ VectorRegionProbeBatches(VectorRegionState *state)
 	int			col;
 
 	/*
+	 * An EXPLAIN_ONLY init creates no batch; decline before any of the
+	 * checks below could dereference state->batch.
+	 */
+	if (state->explain_only)
+		return false;
+	/*
 	 * An aggregate or sort consumes the join batches and outputs rows: the
 	 * region hands no batches out.  This check must stay ahead of the
 	 * nested_batches shortcut to mirror VectorRegionPullOutputBatch, whose
@@ -1538,6 +1552,12 @@ VectorRegionOutputBatchable(VectorRegionState *state)
 {
 	int			col;
 
+	/*
+	 * An EXPLAIN_ONLY init creates no batch; decline before any of the
+	 * checks below could dereference state->batch.
+	 */
+	if (state->explain_only)
+		return false;
 	/* an aggregate or sort consumes the join batches: row-wise output */
 	if (state->agg != NULL || state->sort != NULL)
 		return false;

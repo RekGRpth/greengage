@@ -994,8 +994,22 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 			why = "the scan below the aggregate is not simple";
 		if (why == NULL && auto_allowed(ctx, (Plan *) node))
 		{
+			Plan	   *hash;
+
 			vectorize_motion_subtrees(ctx, outerPlan(node));
 			vectorize_chain_leaves(ctx, &outerPlan(node));
+			/*
+			 * Mirror the hash-join region root: the leaf below the Hash node
+			 * gets wrapped too, so an aggregate feeding the build (a CTE
+			 * aggregate on the other side of a join) runs batched inside the
+			 * region.  When the build region cannot hand out batches the
+			 * hash build falls back to pulling its row output, which is the
+			 * normal row-wise build feed.
+			 */
+			hash = innerPlan(outerPlan(node));
+			if (hash != NULL && IsA(hash, Hash))
+				outerPlan(hash) = (Plan *)
+					vectorize_mutator((Node *) outerPlan(hash), ctx);
 			return (Node *) make_region(ctx, (Plan *) node);
 		}
 		if (why != NULL)
