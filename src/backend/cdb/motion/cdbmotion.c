@@ -629,20 +629,33 @@ reconstructBatch(MotionLayerState *mlStates, MotionNodeEntry *pMNEntry,
 				 ChunkSorterEntry *pCSEntry)
 {
 	TupleChunkListItem tcItem;
-	StringInfoData buf;
+	StringInfo	buf;
 	VectorBatch  *batch;
 
-	initStringInfo(&buf);
+	/*
+	 * One assembly buffer per motion node, kept across batches: reset
+	 * keeps the allocation, so a steady batch stream never re-faults a
+	 * large buffer.  The buffer dies with motion_layer_mctx at query end.
+	 */
+	if (pMNEntry->batch_assemble == NULL)
+	{
+		pMNEntry->batch_assemble = (StringInfo)
+			palloc(sizeof(StringInfoData));
+		initStringInfo(pMNEntry->batch_assemble);
+	}
+	else
+		resetStringInfo(pMNEntry->batch_assemble);
+	buf = pMNEntry->batch_assemble;
+
 	for (tcItem = pCSEntry->chunk_list.p_first; tcItem != NULL;
 		 tcItem = tcItem->p_next)
-		appendBinaryStringInfo(&buf,
+		appendBinaryStringInfo(buf,
 							   GetChunkDataPtr(tcItem) + TUPLE_CHUNK_HEADER_SIZE,
 							   tcItem->chunk_length - TUPLE_CHUNK_HEADER_SIZE);
 
 	batch = VectorBatchDecodeRows(mlStates->motion_layer_mctx,
 								  pMNEntry->tuple_desc,
-								  buf.data, buf.len);
-	pfree(buf.data);
+								  buf->data, buf->len);
 
 	{
 		ReadyBatch *node = (ReadyBatch *) palloc(sizeof(ReadyBatch));
