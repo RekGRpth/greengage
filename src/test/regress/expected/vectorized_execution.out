@@ -2041,21 +2041,22 @@ JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
 ------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
                            Hash Cond: ((l.id % 10) = r.g)
                            ->  Seq Scan on vector_aoco_test l
                            ->  Hash
                                  ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                        ->  Subquery Scan on r
-                                             ->  HashAggregate
-                                                   Group Key: vector_region.c1
-                                                   ->  Redistribute Motion 3:3  (slice3; segments: 3)
-                                                         Hash Key: vector_region.c1
-                                                         ->  Custom Scan (VectorRegion)
-                                                               ->  Seq Scan on vector_aoco_small
-(17 rows)
+                                             ->  Custom Scan (VectorRegion)
+                                                   ->  HashAggregate
+                                                         Group Key: vector_region.c1
+                                                         ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                               Hash Key: vector_region.c1
+                                                               ->  Custom Scan (VectorRegion)
+                                                                     ->  Seq Scan on vector_aoco_small
+(18 rows)
 
 SELECT count(*) FROM vector_aoco_test l
 JOIN (SELECT id % 10 AS g, count(*) AS c FROM vector_aoco_small GROUP BY 1) r
@@ -2633,8 +2634,8 @@ SELECT count(*) FROM vector_aoco_test l JOIN vector_aoco_wide w
 ------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
                            Hash Cond: ((vector_region.c1 % 1000) = (vector_region_1.c1 % 1000))
                            ->  Redistribute Motion 3:3  (slice2; segments: 3)
@@ -2676,28 +2677,29 @@ GROUP BY cnt ORDER BY custdist DESC, cnt DESC;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: (count(*)), vector_region_2.c1
+   Merge Key: vector_region_3.c2, vector_region_3.c1
    ->  Sort
-         Sort Key: (count(*)) DESC, vector_region_2.c1 DESC
-         ->  Finalize HashAggregate
-               Group Key: vector_region_2.c1
-               ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                     Hash Key: vector_region_2.c1
-                     ->  Custom Scan (VectorRegion)
-                           ->  Partial HashAggregate
-                                 Group Key: (count(vector_region_1.in2))
-                                 ->  Custom Scan (VectorRegion)
-                                       ->  HashAggregate
-                                             Group Key: l.id
-                                             ->  Hash Right Join
-                                                   Hash Cond: ((vector_region.c1 % 2000) = l.id)
-                                                   ->  Redistribute Motion 3:3  (slice3; segments: 3)
-                                                         Hash Key: (vector_region.c1 % 2000)
-                                                         ->  Custom Scan (VectorRegion)
-                                                               ->  Seq Scan on vector_aoco_wide w
-                                                   ->  Hash
-                                                         ->  Seq Scan on vector_aoco_test l
-(23 rows)
+         Sort Key: vector_region_3.c2 DESC, vector_region_3.c1 DESC
+         ->  Custom Scan (VectorRegion)
+               ->  Finalize HashAggregate
+                     Group Key: vector_region_2.c1
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: vector_region_2.c1
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Partial HashAggregate
+                                       Group Key: (count(vector_region_1.in2))
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  HashAggregate
+                                                   Group Key: l.id
+                                                   ->  Hash Right Join
+                                                         Hash Cond: ((vector_region.c1 % 2000) = l.id)
+                                                         ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                               Hash Key: (vector_region.c1 % 2000)
+                                                               ->  Custom Scan (VectorRegion)
+                                                                     ->  Seq Scan on vector_aoco_wide w
+                                                         ->  Hash
+                                                               ->  Seq Scan on vector_aoco_test l
+(24 rows)
 
 SELECT cnt, count(*) AS custdist FROM
   (SELECT l.id AS lk, count(w.id) AS cnt
@@ -5685,20 +5687,21 @@ WHERE i.s > 0.9 * o.m;
                ->  Redistribute Motion 3:3  (slice2; segments: 3)
                      Hash Key: 1
                      ->  Subquery Scan on i
-                           ->  Finalize HashAggregate
-                                 Group Key: vector_region.c1
-                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
-                                       Hash Key: vector_region.c1
-                                       ->  Custom Scan (VectorRegion)
-                                             ->  Partial HashAggregate
-                                                   Group Key: vector_nl_prefetch_agg.g
-                                                   ->  Seq Scan on vector_nl_prefetch_agg
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Finalize HashAggregate
+                                       Group Key: vector_region.c1
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: vector_region.c1
+                                             ->  Custom Scan (VectorRegion)
+                                                   ->  Partial HashAggregate
+                                                         Group Key: vector_nl_prefetch_agg.g
+                                                         ->  Seq Scan on vector_nl_prefetch_agg
                ->  Materialize
                      ->  Subquery Scan on o
                            ->  Finalize GroupAggregate
-                                 Group Key: vector_region_1.c1
+                                 Group Key: vector_region_2.c1
                                  ->  Redistribute Motion 3:3  (slice4; segments: 3)
-                                       Hash Key: vector_region_1.c1
+                                       Hash Key: vector_region_2.c1
                                        ->  Custom Scan (VectorRegion)
                                              ->  Partial GroupAggregate
                                                    Group Key: vector_nl_prefetch_agg_1.g
