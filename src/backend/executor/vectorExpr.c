@@ -2250,6 +2250,16 @@ VectorExprCompile(MemoryContext parent, Expr *expr, VectorBatch *batch,
 	VectorExprState *state;
 	MemoryContext oldcontext;
 
+	/*
+	 * Defensive guards for executor-init races: during a cluster shutdown
+	 * racing a query start, the region's batch or the expression node can
+	 * be torn down between our caller's checks and this call.  Returning
+	 * NULL makes the region init fall back to the row-wise path instead of
+	 * crashing the process.
+	 */
+	if (expr == NULL || batch == NULL || vars == NULL)
+		return NULL;
+
 	if (!VectorExprIsSupported(expr, vars))
 		return NULL;
 
