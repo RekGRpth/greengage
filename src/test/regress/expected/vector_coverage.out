@@ -421,18 +421,19 @@ EXPLAIN (COSTS OFF) SELECT a, count(*) FROM cov_aoco GROUP BY a;
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT d, count(*) FROM cov_aoco GROUP BY d;
-                         QUERY PLAN                         
-------------------------------------------------------------
+                            QUERY PLAN                            
+------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Finalize HashAggregate
-         Group Key: vector_region.c1
-         ->  Redistribute Motion 3:3  (slice2; segments: 3)
-               Hash Key: vector_region.c1
-               ->  Custom Scan (VectorRegion)
-                     ->  Partial HashAggregate
-                           Group Key: cov_aoco.d
-                           ->  Seq Scan on cov_aoco
-(10 rows)
+   ->  Custom Scan (VectorRegion)
+         ->  Finalize HashAggregate
+               Group Key: vector_region.c1
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: vector_region.c1
+                     ->  Custom Scan (VectorRegion)
+                           ->  Partial HashAggregate
+                                 Group Key: cov_aoco.d
+                                 ->  Seq Scan on cov_aoco
+(11 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(DISTINCT d) FROM cov_aoco;
                    QUERY PLAN                   
@@ -454,23 +455,24 @@ EXPLAIN (COSTS OFF) SELECT count(*) FILTER (WHERE i) FROM cov_aoco;
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT d, count(*) FROM cov_aoco GROUP BY d ORDER BY d LIMIT 5;
-                                  QUERY PLAN                                  
-------------------------------------------------------------------------------
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
  Limit
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         Merge Key: vector_region.c1
+         Merge Key: vector_region_1.c1
          ->  Limit
                ->  Sort
-                     Sort Key: vector_region.c1
-                     ->  Finalize HashAggregate
-                           Group Key: vector_region.c1
-                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                                 Hash Key: vector_region.c1
-                                 ->  Custom Scan (VectorRegion)
-                                       ->  Partial HashAggregate
-                                             Group Key: cov_aoco.d
-                                             ->  Seq Scan on cov_aoco
-(15 rows)
+                     Sort Key: vector_region_1.c1
+                     ->  Custom Scan (VectorRegion)
+                           ->  Finalize HashAggregate
+                                 Group Key: vector_region.c1
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: vector_region.c1
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Partial HashAggregate
+                                                   Group Key: cov_aoco.d
+                                                   ->  Seq Scan on cov_aoco
+(16 rows)
 
 EXPLAIN (COSTS OFF) SELECT DISTINCT a FROM cov_aoco;
                 QUERY PLAN                
@@ -483,43 +485,43 @@ EXPLAIN (COSTS OFF) SELECT DISTINCT a FROM cov_aoco;
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT d, GROUPING(d) FROM cov_aoco GROUP BY ROLLUP (d);
-                         QUERY PLAN                         
-------------------------------------------------------------
+                            QUERY PLAN                            
+------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Finalize HashAggregate
-         Group Key: vector_region.c1, vector_region.c3
-         ->  Redistribute Motion 3:3  (slice2; segments: 3)
-               Hash Key: vector_region.c1, vector_region.c3
-               ->  Custom Scan (VectorRegion)
-                     ->  Partial MixedAggregate
-                           Hash Key: cov_aoco.d
-                           Group Key: ()
-                           ->  Seq Scan on cov_aoco
-(11 rows)
+   ->  Custom Scan (VectorRegion)
+         ->  Finalize HashAggregate
+               Group Key: vector_region.c1, vector_region.c3
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: vector_region.c1, vector_region.c3
+                     ->  Custom Scan (VectorRegion)
+                           ->  Partial MixedAggregate
+                                 Hash Key: cov_aoco.d
+                                 Group Key: ()
+                                 ->  Seq Scan on cov_aoco
+(12 rows)
 
 -- joins
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.a = q.a;
-                            QUERY PLAN                            
-------------------------------------------------------------------
+                         QUERY PLAN                         
+------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
-                           Hash Cond: (p.a = vector_region.c1)
+                           Hash Cond: (p.a = q.a)
                            ->  Seq Scan on cov_aoco p
                            ->  Hash
-                                 ->  Custom Scan (VectorRegion)
-                                       ->  Seq Scan on cov_aoco q
-(11 rows)
+                                 ->  Seq Scan on cov_aoco q
+(10 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.d = q.d;
                                      QUERY PLAN                                     
 ------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
                            Hash Cond: (vector_region.c1 = vector_region_1.c1)
                            ->  Redistribute Motion 3:3  (slice2; segments: 3)
@@ -558,8 +560,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_heap q ON p.d = q.d
 ------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Join
                            Hash Cond: (vector_region.c1 = vector_region_1.c1)
                            ->  Redistribute Motion 3:3  (slice2; segments: 3)
@@ -574,19 +576,18 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_heap q ON p.d = q.d
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE EXISTS (SELECT 1 FROM cov_heap WHERE cov_heap.a = cov_aoco.a);
-                              QUERY PLAN                              
-----------------------------------------------------------------------
+                           QUERY PLAN                           
+----------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
-         ->  Partial Aggregate
-               ->  Custom Scan (VectorRegion)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
                      ->  Hash Semi Join
-                           Hash Cond: (cov_aoco.a = vector_region.c1)
+                           Hash Cond: (cov_aoco.a = cov_heap.a)
                            ->  Seq Scan on cov_aoco
                            ->  Hash
-                                 ->  Custom Scan (VectorRegion)
-                                       ->  Seq Scan on cov_heap
-(11 rows)
+                                 ->  Seq Scan on cov_heap
+(10 rows)
 
 -- heap leaf through the row adapter, append over union all
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_heap WHERE d = 'h3';
