@@ -1882,8 +1882,7 @@ DROP TABLE vector_chain_d2;
 -- 61..100 right-only; the two CTE aggregates make the plan join the
 -- partial aggregates' outputs locally, so the final hashed aggregate
 -- consumes the FULL join's batch output - the shape the fill fix
--- targets.  The plain scalar aggregate over a Hash FULL join keeps
--- the row-wise executor by a separate plan gate.
+-- targets.
 -- randomly distributed: the planner then feeds the join through
 -- motions, whose probes the region chain batch-consumes
 CREATE TABLE vector_fj_l (k int, item int) DISTRIBUTED RANDOMLY;

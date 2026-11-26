@@ -206,19 +206,6 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED &&
 		agg->aggstrategy != AGG_MIXED)
 		return false;
-	if (IsA(outer, HashJoin) &&
-		((HashJoin *) outer)->join.jointype == JOIN_FULL)
-	{
-		/*
-		 * An aggregate over a Hash FULL join: the batch machine's FULL
-		 * path (both the fast probe and the row-driven fallback) loses
-		 * the probe-side rows and misfills the finish, producing wrong
-		 * sums.  Keep the shape row-wise until the batch machine learns
-		 * the FULL join.
-		 */
-		return false;
-	}
-
 
 	vars->outer_ncols = list_length(outer->targetlist);
 	vars->outer_attnos = MemoryContextAlloc(context,

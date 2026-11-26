@@ -1501,10 +1501,20 @@ VectorRegionProbeBatches(VectorRegionState *state)
 {
 	int			col;
 
+	/*
+	 * An aggregate or sort consumes the join batches and outputs rows: the
+	 * region hands no batches out.  This check must stay ahead of the
+	 * nested_batches shortcut to mirror VectorRegionPullOutputBatch, whose
+	 * own aggregate check precedes its nested_batches branch: an agg-root
+	 * join chain (an aggregate over a hash join as a probe leaf) accepted
+	 * here sent the probe feed into a false (no-batch-region) return that
+	 * the feed reads as EOF, dropping the whole probe side.
+	 */
+	if (state->agg != NULL || state->sort != NULL)
+		return false;
 	if (state->nested_batches)
 		return true;
-	if (state->agg != NULL || state->sort != NULL ||
-		state->hj != NULL || state->nestloop != NULL ||
+	if (state->hj != NULL || state->nestloop != NULL ||
 		state->mergejoin != NULL || state->material != NULL ||
 		state->unique != NULL ||
 		state->scan == NULL || state->append != NULL ||
