@@ -80,6 +80,9 @@ VectorBatchDestroy(VectorBatch *batch)
 	if (batch == NULL)
 		return;
 
+	/* a decoded batch's values point into the wire payload */
+	if (batch->wire_data != NULL)
+		pfree(batch->wire_data);
 	MemoryContextDelete(batch->varlena_context);
 	for (col = 0; col < batch->ncols; col++)
 	{
@@ -214,21 +217,28 @@ VectorBatchCopyColumns(VectorBatch *dst, const VectorBatch *src,
  *   u16  nrows
  *   u16  ncols
  *   per column:
- *     u8   kind: 0 = fixed-width by-value, 1 = by-reference blob
+ *     u8   kind: 0 = fixed-width by-value, 1 = by-reference blob,
+ *          2 = fixed-length by-reference (typlen of the column)
  *     u8   pad
  *     u16  typlen (of the column type, for kind 0)
  *     u8   null bitmap, ceil(nrows/8) bytes, padded up to a multiple of 8
  *     kind 0: nrows * typlen raw datum bits
  *     kind 1: u32 blob length, u32 offsets[nrows] (0xFFFFFFFF = NULL),
- *             blob bytes
+ *             blob bytes, every value padded to MAXALIGN
+ *     kind 2: same as kind 1, sizes are the fixed typlen
  *
  * Encode takes an explicit column count (the motion output may be a
  * prefix of the batch columns) and an optional row list so a
  * hash-redistribute sender can partition one batch into per-route
  * payloads without materializing intermediate batches.  The varlena
  * layout is all offsets first, then the blob.
+ *
+ * The MAXALIGN padding keeps every value's offset, and so the datum the
+ * decoder hands out, maxaligned: the decode owns the payload buffer and
+ * points into it instead of copying each value out (a palloc-per-value
+ * batch churned the allocator twice per byte on the wire).
  */
-#define VBATCH_MAGIC	0x54414256	/* 'VBAT' */
+#define VBATCH_MAGIC	0x54414257	/* 'VBAW': v2, MAXALIGNed offsets */
 
 static void
 vbatch_encode_u32(StringInfo buf, uint32 v)
@@ -314,7 +324,7 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 					sz = VARSIZE_ANY(DatumGetPointer(v));
 				}
 				offs[row] = bloblen;
-				bloblen += (uint32) sz;
+				bloblen += (uint32) MAXALIGN(sz);
 			}
 			colblobs[col] = bloblen;
 			total += 4 + (Size) sizeof(uint32) * nrows + bloblen;
@@ -425,6 +435,14 @@ VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 						c->typlen == -2 ? strlen((char *) DatumGetPointer(v)) + 1 :
 						VARSIZE_ANY(DatumGetPointer(v));
 					appendBinaryStringInfo(buf, (char *) DatumGetPointer(v), sz);
+					/*
+					 * Pad to MAXALIGN so the decoder can hand the value
+					 * out in place: the offsets were built from the same
+					 * rounded sizes.
+					 */
+					if ((int) MAXALIGN(sz) > (int) sz)
+						appendBinaryStringInfo(buf, (char *) zeros,
+											   (int) MAXALIGN(sz) - (int) sz);
 				}
 			}
 		}
@@ -457,9 +475,16 @@ vbatch_decode_u16(const char **p, const char *end)
 	return v;
 }
 
+/*
+ * Decode one columnar payload into a batch.  Takes ownership of payload
+ * (a palloc'd, MAXALIGN'd buffer): the batch keeps the pointer and every
+ * by-reference value is handed out in place, pointing into the payload;
+ * VectorBatchDestroy frees it.  The wire's offsets are MAXALIGNed, so
+ * the datums are maxaligned without copying.
+ */
 VectorBatch *
 VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
-					  const char *payload, int len)
+					  char *payload, int len)
 {
 	const char *p = payload;
 	const char *end = payload + len;
@@ -481,6 +506,7 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 			 ncols, tupdesc->natts);
 
 	batch = VectorBatchCreate(parent, tupdesc, Max(nrows, 1), false);
+	batch->wire_data = payload;
 
 	for (col = 0; col < ncols; col++)
 	{
@@ -544,7 +570,7 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 			uint32		bloblen = vbatch_decode_u32(&p, end);
 			const char *offsets = p;
 			const char *blob;
-			MemoryContext oldcxt;
+			Size		sz;
 			/* kind 2: fixed-length pass-by-reference, size is typlen;
 			 * kind 1: varlena (VARSIZE_ANY) or cstring (typlen == -2) */
 			bool		fixed_ref = (kind == 2);
@@ -560,63 +586,60 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 			blob = p;
 			p += bloblen;
 
-			oldcxt = MemoryContextSwitchTo(batch->varlena_context);
+			/*
+			 * The batch owns the payload and the offsets are MAXALIGNed,
+			 * so each value is handed out in place; the loop only
+			 * validates the wire against corruption.
+			 */
 			for (row = 0; row < nrows; row++)
 			{
 				uint32		off;
 
 				memcpy(&off, offsets + (size_t) row * sizeof(uint32), sizeof(off));
-				if (off != 0xFFFFFFFF)
+				if (off == 0xFFFFFFFF)
+					continue;
+				if (off >= bloblen)
+					elog(ERROR, "corrupt vector batch chunk: offset %u beyond blob %u (col %d row %d typlen %d)",
+						 off, bloblen, col, row, typlen);
+				if (typlen == -2)
 				{
-					Size		sz;
-					char	   *dst;
+					Size		next;
 
-					if (off >= bloblen)
-						elog(ERROR, "corrupt vector batch chunk: offset %u beyond blob %u (col %d row %d typlen %d)",
-							 off, bloblen, col, row, typlen);
-					if (typlen == -2)
+					if (row + 1 < nrows)
 					{
-						Size		next;
+						int			r2;
 
-						if (row + 1 < nrows)
+						/*
+						 * size = up to the next non-null offset or the
+						 * blob end
+						 */
+						next = bloblen;
+						for (r2 = row + 1; r2 < nrows; r2++)
 						{
-							int			r2;
+							uint32		o2;
 
-							/*
-							 * size = up to the next non-null offset or the
-							 * blob end
-							 */
-							next = bloblen;
-							for (r2 = row + 1; r2 < nrows; r2++)
+							memcpy(&o2, offsets + (size_t) r2 * sizeof(uint32), sizeof(o2));
+							if (o2 != 0xFFFFFFFF)
 							{
-								uint32		o2;
-
-								memcpy(&o2, offsets + (size_t) r2 * sizeof(uint32), sizeof(o2));
-								if (o2 != 0xFFFFFFFF)
-								{
-									if (o2 > off)
-										next = o2;
-									break;
-								}
+								if (o2 > off)
+									next = o2;
+								break;
 							}
 						}
-						else
-							next = bloblen;
-						sz = next - off;	/* includes NUL */
 					}
-					else if (fixed_ref)
-						sz = (Size) typlen;
 					else
-						sz = VARSIZE_ANY(blob + off);
-					if (sz == 0 || sz > bloblen - off || sz > 0x40000000)
-						elog(ERROR, "corrupt vector batch chunk: bad size %lu at offset %u of %u (col %d row %d typlen %d)",
-							 (unsigned long) sz, off, bloblen, col, row, typlen);
-					dst = (char *) palloc(sz);
-					memcpy(dst, blob + off, sz);
-					c->values[row] = PointerGetDatum(dst);
+						next = bloblen;
+					sz = next - off;	/* includes NUL */
 				}
+				else if (fixed_ref)
+					sz = (Size) typlen;
+				else
+					sz = VARSIZE_ANY(blob + off);
+				if (sz == 0 || sz > bloblen - off || sz > 0x40000000)
+					elog(ERROR, "corrupt vector batch chunk: bad size %lu at offset %u of %u (col %d row %d typlen %d)",
+						 (unsigned long) sz, off, bloblen, col, row, typlen);
+				c->values[row] = PointerGetDatum(blob + off);
 			}
-			MemoryContextSwitchTo(oldcxt);
 		}
 	}
 

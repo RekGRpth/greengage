@@ -502,18 +502,19 @@ EXPLAIN (COSTS OFF) SELECT d, GROUPING(d) FROM cov_aoco GROUP BY ROLLUP (d);
 
 -- joins
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.a = q.a;
-                         QUERY PLAN                         
-------------------------------------------------------------
+                            QUERY PLAN                            
+------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Custom Scan (VectorRegion)
                ->  Partial Aggregate
                      ->  Hash Join
-                           Hash Cond: (p.a = q.a)
+                           Hash Cond: (p.a = vector_region.c1)
                            ->  Seq Scan on cov_aoco p
                            ->  Hash
-                                 ->  Seq Scan on cov_aoco q
-(10 rows)
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on cov_aoco q
+(11 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.d = q.d;
                                      QUERY PLAN                                     
@@ -576,18 +577,19 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_heap q ON p.d = q.d
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE EXISTS (SELECT 1 FROM cov_heap WHERE cov_heap.a = cov_aoco.a);
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                              QUERY PLAN                              
+----------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Custom Scan (VectorRegion)
                ->  Partial Aggregate
                      ->  Hash Semi Join
-                           Hash Cond: (cov_aoco.a = cov_heap.a)
+                           Hash Cond: (cov_aoco.a = vector_region.c1)
                            ->  Seq Scan on cov_aoco
                            ->  Hash
-                                 ->  Seq Scan on cov_heap
-(10 rows)
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on cov_heap
+(11 rows)
 
 -- heap leaf through the row adapter, append over union all
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_heap WHERE d = 'h3';

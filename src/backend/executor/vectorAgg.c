@@ -20,6 +20,7 @@
 #include "miscadmin.h"
 #include "parser/parsetree.h"
 #include "utils/array.h"
+#include "utils/lsyscache.h"
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/tuplesort.h"
@@ -206,19 +207,6 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED &&
 		agg->aggstrategy != AGG_MIXED)
 		return false;
-	if (IsA(outer, HashJoin) &&
-		((HashJoin *) outer)->join.jointype == JOIN_FULL)
-	{
-		/*
-		 * An aggregate over a Hash FULL join: the batch machine's FULL
-		 * path (both the fast probe and the row-driven fallback) loses
-		 * the probe-side rows and misfills the finish, producing wrong
-		 * sums.  Keep the shape row-wise until the batch machine learns
-		 * the FULL join.
-		 */
-		return false;
-	}
-
 
 	vars->outer_ncols = list_length(outer->targetlist);
 	vars->outer_attnos = MemoryContextAlloc(context,
@@ -868,6 +856,48 @@ fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
  */
 #define VFAST_MAXKEYS	4
 #define VFAST_WORDS		(VFAST_MAXKEYS + 1)
+
+/*
+ * Plan-time census of a hashed aggregate's grouping keys: true when two
+ * or more keys are outside the fast group table's reach (anything not
+ * by-value 1/2/4/8 bytes).  Such an aggregate hashes per row through
+ * the standard slot machinery: batched over a motion it loses to the
+ * row executor, so the caller gates the shape out.
+ */
+bool
+VectorAggWideGroupKeys(Agg *agg)
+{
+	TargetEntry *te;
+	int			col;
+	int			slow = 0;
+
+	if (agg->aggstrategy != AGG_HASHED)
+		return false;
+	for (col = 0; col < agg->numCols; col++)
+	{
+		int16		typlen;
+		bool		byval;
+
+		if (agg->grpColIdx[col] <= 0 ||
+			agg->grpColIdx[col] > list_length(outerPlan(agg)->targetlist))
+			return false;
+		te = (TargetEntry *) list_nth(outerPlan(agg)->targetlist,
+									  agg->grpColIdx[col] - 1);
+		if (te == NULL || te->resjunk)
+			return false;
+		get_typlenbyval(exprType((Node *) te->expr), &typlen, &byval);
+		if (!byval || (typlen != 1 && typlen != 2 && typlen != 4 && typlen != 8))
+			slow++;
+	}
+	/*
+	 * One slow key costs about what it saves; two or more lose to the
+	 * row executor consistently (query11's seven text keys, query67's
+	 * rollup levels), while single-text-key shapes measured par and
+	 * stayed net-positive vectorized (query06).
+	 */
+	return slow >= 2;
+}
+
 
 typedef struct VectorAggFastGroups
 {

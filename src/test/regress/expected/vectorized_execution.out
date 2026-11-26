@@ -2674,32 +2674,33 @@ SELECT cnt, count(*) AS custdist FROM
      ON w.id % 2000 = l.id
    GROUP BY l.id) s
 GROUP BY cnt ORDER BY custdist DESC, cnt DESC;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Merge Key: vector_region_3.c2, vector_region_3.c1
+   Merge Key: vector_region_4.c2, vector_region_4.c1
    ->  Sort
-         Sort Key: vector_region_3.c2 DESC, vector_region_3.c1 DESC
+         Sort Key: vector_region_4.c2 DESC, vector_region_4.c1 DESC
          ->  Custom Scan (VectorRegion)
                ->  Finalize HashAggregate
-                     Group Key: vector_region_2.c1
+                     Group Key: vector_region_3.c1
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                           Hash Key: vector_region_2.c1
+                           Hash Key: vector_region_3.c1
                            ->  Custom Scan (VectorRegion)
                                  ->  Partial HashAggregate
-                                       Group Key: (count(vector_region_1.in2))
+                                       Group Key: (count(vector_region_2.in2))
                                        ->  Custom Scan (VectorRegion)
                                              ->  HashAggregate
-                                                   Group Key: l.id
+                                                   Group Key: vector_region_1.c1
                                                    ->  Hash Right Join
-                                                         Hash Cond: ((vector_region.c1 % 2000) = l.id)
+                                                         Hash Cond: ((vector_region.c1 % 2000) = vector_region_1.c1)
                                                          ->  Redistribute Motion 3:3  (slice3; segments: 3)
                                                                Hash Key: (vector_region.c1 % 2000)
                                                                ->  Custom Scan (VectorRegion)
                                                                      ->  Seq Scan on vector_aoco_wide w
                                                          ->  Hash
-                                                               ->  Seq Scan on vector_aoco_test l
-(24 rows)
+                                                               ->  Custom Scan (VectorRegion)
+                                                                     ->  Seq Scan on vector_aoco_test l
+(25 rows)
 
 SELECT cnt, count(*) AS custdist FROM
   (SELECT l.id AS lk, count(w.id) AS cnt
@@ -6076,8 +6077,7 @@ DROP TABLE vector_chain_d2;
 -- 61..100 right-only; the two CTE aggregates make the plan join the
 -- partial aggregates' outputs locally, so the final hashed aggregate
 -- consumes the FULL join's batch output - the shape the fill fix
--- targets.  The plain scalar aggregate over a Hash FULL join keeps
--- the row-wise executor by a separate plan gate.
+-- targets.
 -- randomly distributed: the planner then feeds the join through
 -- motions, whose probes the region chain batch-consumes
 CREATE TABLE vector_fj_l (k int, item int) DISTRIBUTED RANDOMLY;

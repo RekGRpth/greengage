@@ -62,10 +62,15 @@ typedef struct VectorBatch
 	/*
 	 * Known-identity selection: selection[i] == i for all i < nselected.
 	 * Set by every batch fill, cleared by compaction; lets dense qual
-	 * kernels address column arrays contiguously.  Appended at the end of
-	 * the struct to keep the layout stable for the ABI check.
+	 * kernels address column arrays contiguously.
 	 */
 	bool		sel_identity;
+	/*
+	 * Zero-copy motion payload: a decoded batch's by-reference values
+	 * point into this palloc'd wire buffer, so VectorBatchDestroy frees
+	 * it.  NULL for every batch that is not a motion decode.
+	 */
+	char	   *wire_data;
 } VectorBatch;
 
 extern VectorBatch *VectorBatchCreate(MemoryContext parent,
@@ -75,14 +80,15 @@ extern VectorBatch *VectorBatchCreate(MemoryContext parent,
  * Batch interconnect codec: a columnar payload riding one
  * START..MID*..END chunk sequence of a motion stream.  Encode takes an
  * optional row-index list (for hash-redistribute partitioning); decode
- * builds a plain (non-packed) batch owning its varlena memory in the
- * batch's varlena context.
+ * builds a plain (non-packed) batch that owns the payload buffer: its
+ * by-reference values point into the caller-supplied palloc'd payload
+ * (offsets MAXALIGNed by the encoder), and VectorBatchDestroy frees it.
  */
 extern void VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 								  int ncols, const int *rows, int nrows);
 extern VectorBatch *VectorBatchDecodeRows(MemoryContext parent,
 										  TupleDesc tupdesc,
-										  const char *payload, int len);
+										  char *payload, int len);
 extern void VectorBatchDestroy(VectorBatch *batch);
 extern void VectorBatchReset(VectorBatch *batch);
 extern void VectorBatchSetRowCount(VectorBatch *batch, int nrows);
