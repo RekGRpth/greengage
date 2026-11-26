@@ -397,6 +397,7 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 	int			nrows = start_row;
 	int			row = 0;
 	int			k;
+	MemoryContext oldcontext;
 
 	while (nrows < out->capacity)
 	{
@@ -613,6 +614,8 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 			state->row_matched = true;
 			if (state->anti_join)
 				break;		/* ANTI/LASJ: a matched row is never emitted */
+			/* one context switch per emitted row instead of per by-ref value */
+			oldcontext = MemoryContextSwitchTo(out->varlena_context);
 			for (c = 0; c < state->out_ncols; c++)
 			{
 				Datum		value;
@@ -629,9 +632,10 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				{
 					value = slot_getattr(hslot, state->out_src[c], &isnull);
 				}
-				value = VectorBatchCopyDatum(out, c, value, isnull);
+				value = VectorBatchCopyDatumInContext(out, c, value, isnull);
 				VectorBatchSetValue(out, c, nrows, value, isnull);
 			}
+			MemoryContextSwitchTo(oldcontext);
 			nrows++;
 			if (state->semi_join)
 				break;		/* SEMI: only the first match is emitted */
@@ -659,6 +663,7 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 				resume_stopped = true;
 				break;
 			}
+			oldcontext = MemoryContextSwitchTo(out->varlena_context);
 			for (c = 0; c < state->out_ncols; c++)
 			{
 				Datum		value = 0;
@@ -671,9 +676,10 @@ VectorHashProbeBatchFast(VectorHashJoinState *state, int start_row)
 					isnull = VectorBatchIsNull(batch,
 											   state->out_batch_col[c], row);
 				}
-				value = VectorBatchCopyDatum(out, c, value, isnull);
+				value = VectorBatchCopyDatumInContext(out, c, value, isnull);
 				VectorBatchSetValue(out, c, nrows, value, isnull);
 			}
+			MemoryContextSwitchTo(oldcontext);
 			nrows++;
 		}
 		state->resume_active = false;
@@ -693,19 +699,23 @@ VectorHashJoinSetBuildSource(VectorHashJoinState *state,
 static void
 VectorHashJoinCopyResult(VectorHashJoinState *state, TupleTableSlot *slot, int row)
 {
+	MemoryContext oldcontext;
 	int			col;
 
 	slot_getallattrs(slot);
 	if (slot->tts_nvalid != state->output->ncols)
 		elog(ERROR, "hash join output shape changed during execution");
+	/* one context switch per row instead of one per by-ref value */
+	oldcontext = MemoryContextSwitchTo(state->output->varlena_context);
 	for (col = 0; col < state->output->ncols; col++)
 	{
 		Datum		value = slot->tts_values[col];
 		bool		isnull = slot->tts_isnull[col];
 
-		value = VectorBatchCopyDatum(state->output, col, value, isnull);
+		value = VectorBatchCopyDatumInContext(state->output, col, value, isnull);
 		VectorBatchSetValue(state->output, col, row, value, isnull);
 	}
+	MemoryContextSwitchTo(oldcontext);
 }
 
 bool
@@ -1232,6 +1242,7 @@ VectorHashFinishBatch(VectorHashJoinState *state, int start_row)
 	TupleTableSlot *hslot = hj->hj_HashTupleSlot;
 	int			nrows = start_row;
 	int			c;
+	MemoryContext oldcontext;
 
 	if (!state->finish_prepped)
 	{
@@ -1286,6 +1297,7 @@ VectorHashFinishBatch(VectorHashJoinState *state, int start_row)
 
 		ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(tuple), hslot, false);
 		slot_getallattrs(hslot);
+		oldcontext = MemoryContextSwitchTo(out->varlena_context);
 		for (c = 0; c < state->out_ncols; c++)
 		{
 			Datum		value = 0;
@@ -1293,9 +1305,10 @@ VectorHashFinishBatch(VectorHashJoinState *state, int start_row)
 
 			if (!state->out_is_outer[c])
 				value = slot_getattr(hslot, state->out_src[c], &isnull);
-			value = VectorBatchCopyDatum(out, c, value, isnull);
+			value = VectorBatchCopyDatumInContext(out, c, value, isnull);
 			VectorBatchSetValue(out, c, nrows, value, isnull);
 		}
+		MemoryContextSwitchTo(oldcontext);
 		nrows++;
 	}
 	return nrows;
