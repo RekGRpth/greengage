@@ -1570,6 +1570,14 @@ VectorRegionOutputBatchable(VectorRegionState *state)
 	 */
 	if (state->explain_only)
 		return false;
+	/*
+	 * A fast-table aggregate hands its groups out batch-wise through
+	 * VectorRegionAggOutputBatch: the hash build feeds from its batches
+	 * instead of pulling row output one slot at a time.
+	 */
+	if (state->agg != NULL && state->vagg != NULL &&
+		VectorAggFastTableActive(state->vagg))
+		return true;
 	/* an aggregate or sort consumes the join batches: row-wise output */
 	if (state->agg != NULL || state->sort != NULL)
 		return false;
