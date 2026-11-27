@@ -624,9 +624,11 @@ SendBatchChunk(MotionLayerState *mlStates,
  * The wire payload buffer carries its allocation size in a leading
  * Size word (the payload proper starts one MAXALIGN step in, so the
  * datum alignment is preserved): the recycling pool needs the size at
- * hand-back, when nothing else remembers it.
+ * hand-back, when nothing else remembers it.  MAXALIGN keeps the
+ * payload Datum-aligned; offsetof(StringInfoData, data) would be zero
+ * and put the header inside the payload itself.
  */
-#define WIRE_PAYLOAD_HDR	offsetof(StringInfoData, data)
+#define WIRE_PAYLOAD_HDR	MAXALIGN(sizeof(Size))
 
 /*
  * VectorBatchDestroy's recycle hook for fast-table aggregate batches:
