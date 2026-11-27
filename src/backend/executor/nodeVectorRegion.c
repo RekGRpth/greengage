@@ -157,6 +157,12 @@ typedef struct VectorRegionState
 	bool		explain_only;	/* EXPLAIN_ONLY init: no batch was created */
 	bool		agg_out_ready;	/* agg input fully driven, groups ready */
 	bool		agg_out_done;	/* group iterator exhausted */
+	/*
+	 * The agg-root region's output batch, shaped by the aggregate's
+	 * result tupdesc (state->batch carries the input columns instead,
+	 * whose count and types a projection like count(*) does not match).
+	 */
+	VectorBatch *agg_out_batch;
 } VectorRegionState;
 
 typedef struct VectorNestLoopProxy
@@ -1519,13 +1525,13 @@ VectorRegionProbeBatches(VectorRegionState *state)
 	if (state->explain_only)
 		return false;
 	/*
-	 * A fast-table aggregate hands its groups out batch-wise: the probe
-	 * feed of a parent region stays batched end to end.  Wide-keyed or
-	 * streaming aggregates stay declined (their slot-machinery path
-	 * never beats the row executor).
+	 * A hashed (non-sorted) aggregate hands its groups out batch-wise
+	 * through VectorAggNext's projection: the probe feed of a parent
+	 * region stays batched end to end.  Sorted aggregates drive their
+	 * sorted input row by row and stay declined.
 	 */
 	if (state->agg != NULL && state->vagg != NULL &&
-		VectorAggFastTableActive(state->vagg))
+		state->agg->aggstrategy != AGG_SORTED)
 		return true;
 	/*
 	 * An aggregate or sort consumes the join batches and outputs rows: the
@@ -1570,6 +1576,14 @@ VectorRegionOutputBatchable(VectorRegionState *state)
 	 */
 	if (state->explain_only)
 		return false;
+	/*
+	 * A fast-table aggregate hands its groups out batch-wise through
+	 * VectorRegionAggOutputBatch: the hash build feeds from its batches
+	 * instead of pulling row output one slot at a time.
+	 */
+	if (state->agg != NULL && state->vagg != NULL &&
+		VectorAggFastTableActive(state->vagg))
+		return true;
 	/* an aggregate or sort consumes the join batches: row-wise output */
 	if (state->agg != NULL || state->sort != NULL)
 		return false;
@@ -2214,6 +2228,8 @@ VectorRegionEnd(CustomScanState *node)
 		VectorAggDestroy(state->vagg);
 	if (state->batch != NULL)
 		VectorBatchDestroy(state->batch);
+	if (state->agg_out_batch != NULL)
+		VectorBatchDestroy(state->agg_out_batch);
 	if (state->append_quals != NULL)
 	{
 		int			i;
@@ -2418,10 +2434,26 @@ VectorRegionRestrPos(CustomScanState *node)
 static bool
 VectorRegionAggOutputBatch(VectorRegionState *state, VectorBatch **batch)
 {
-	VectorBatch  *batch_out = state->batch;
+	VectorBatch  *batch_out;
 	TupleTableSlot *slot;
 	MemoryContext oldcontext;
 	int			n;
+
+	if (!state->agg_out_batch)
+	{
+		/*
+		 * The output batch must carry the aggregate's projection columns
+		 * (count and types): the parent regions and the motion sender
+		 * read them by the batch's own tupdesc.  state->batch holds the
+		 * aggregate's input columns instead, which a projection like
+		 * count(*) over a join does not match.
+		 */
+		state->agg_out_batch = VectorBatchCreate(
+			state->css.ss.ps.state->es_query_cxt,
+			ExecGetResultType(&state->agg->ss.ps),
+			VECTOR_BATCH_DEFAULT_CAPACITY, false);
+	}
+	batch_out = state->agg_out_batch;
 
 	if (!state->agg_out_ready)
 	{
@@ -2504,7 +2536,7 @@ VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
 	 */
 	if (state->agg != NULL)
 	{
-		if (VectorAggFastTableActive(state->vagg))
+		if (state->agg->aggstrategy != AGG_SORTED)
 			return VectorRegionAggOutputBatch(state, batch);
 		return false;
 	}

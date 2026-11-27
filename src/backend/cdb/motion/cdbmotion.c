@@ -621,6 +621,121 @@ SendBatchChunk(MotionLayerState *mlStates,
 }
 
 /*
+ * The wire payload buffer carries its allocation size in a leading
+ * Size word (the payload proper starts one MAXALIGN step in, so the
+ * datum alignment is preserved): the recycling pool needs the size at
+ * hand-back, when nothing else remembers it.  MAXALIGN keeps the
+ * payload Datum-aligned; offsetof(StringInfoData, data) would be zero
+ * and put the header inside the payload itself.
+ */
+#define WIRE_PAYLOAD_HDR	MAXALIGN(sizeof(Size))
+
+/*
+ * VectorBatchDestroy's recycle hook for fast-table aggregate batches:
+ * the owner pools the shell (columns, selection, varlena context) and
+ * the payload buffer.  Destroy is the release point of the batch
+ * lifetime contract, so nothing can hold the storage once it is
+ * pooled.
+ */
+void
+VectorMotionRecycleBatch(void *owner, VectorBatch *batch)
+{
+	MotionNodeEntry *pMNEntry = (MotionNodeEntry *) owner;
+
+	if (batch->wire_data != NULL)
+	{
+		char	   *raw = batch->wire_data - WIRE_PAYLOAD_HDR;
+		Size		sz = *(Size *) raw;
+
+		if (pMNEntry->wire_pool_count < MOTION_WIRE_POOL_MAX)
+		{
+			pMNEntry->wire_pool[pMNEntry->wire_pool_count] = raw;
+			pMNEntry->wire_pool_cap[pMNEntry->wire_pool_count] = sz;
+			pMNEntry->wire_pool_count++;
+		}
+		else
+		{
+			/* pool full: drop the smallest, keep the bigger buffers */
+			int			i_min = 0;
+			int			i;
+
+			for (i = 1; i < MOTION_WIRE_POOL_MAX; i++)
+				if (pMNEntry->wire_pool_cap[i] < pMNEntry->wire_pool_cap[i_min])
+					i_min = i;
+			if (sz >= pMNEntry->wire_pool_cap[i_min])
+			{
+				pfree(pMNEntry->wire_pool[i_min]);
+				pMNEntry->wire_pool[i_min] = raw;
+				pMNEntry->wire_pool_cap[i_min] = sz;
+			}
+			else
+				pfree(raw);
+		}
+		batch->wire_data = NULL;
+	}
+
+	/* park the shell with its columns and context intact */
+	batch->wire_owner = NULL;
+	batch->wire_recycle = NULL;
+	VectorBatchReset(batch);
+	if (pMNEntry->shell_pool_count < MOTION_SHELL_POOL_MAX)
+		pMNEntry->shell_pool[pMNEntry->shell_pool_count++] = batch;
+	else
+		VectorBatchDestroy(batch);
+}
+
+/*
+ * Take a payload buffer from the recycling pool (the first one big
+ * enough) or allocate a fresh one; the caller assembles into the data
+ * after the size header.
+ */
+static char *
+TakeWireBuffer(MotionNodeEntry *pMNEntry, int len)
+{
+	Size		need = (Size) len + 1 + WIRE_PAYLOAD_HDR;
+	int			i;
+
+	for (i = 0; i < pMNEntry->wire_pool_count; i++)
+	{
+		if (pMNEntry->wire_pool_cap[i] >= need)
+		{
+			char	   *raw = pMNEntry->wire_pool[i];
+
+			pMNEntry->wire_pool[i] = pMNEntry->wire_pool[--pMNEntry->wire_pool_count];
+			pMNEntry->wire_pool_cap[i] = pMNEntry->wire_pool_cap[pMNEntry->wire_pool_count];
+			*(Size *) raw = need;
+			return raw + WIRE_PAYLOAD_HDR;
+		}
+	}
+	{
+		char	   *raw = (char *) palloc(need);
+
+		*(Size *) raw = need;
+		return raw + WIRE_PAYLOAD_HDR;
+	}
+}
+
+/*
+ * Take a recycled batch shell (columns, selection and varlena context
+ * intact) or create one, and wire it to this entry's recycle hook.
+ */
+static VectorBatch *
+TakeMotionBatch(MotionLayerState *mlStates, MotionNodeEntry *pMNEntry)
+{
+	VectorBatch  *batch;
+
+	if (pMNEntry->shell_pool_count > 0)
+		batch = pMNEntry->shell_pool[--pMNEntry->shell_pool_count];
+	else
+		batch = VectorBatchCreate(mlStates->motion_layer_mctx,
+								  pMNEntry->tuple_desc,
+								  VECTOR_BATCH_DEFAULT_CAPACITY, false);
+	batch->wire_owner = pMNEntry;
+	batch->wire_recycle = VectorMotionRecycleBatch;
+	return batch;
+}
+
+/*
  * Reassemble a TC_BATCH_* chunk sequence into one columnar batch and
  * queue it on the motion node entry for a vectorized consumer.
  */
@@ -634,16 +749,17 @@ reconstructBatch(MotionLayerState *mlStates, MotionNodeEntry *pMNEntry,
 	int			len = 0;
 
 	/*
-	 * One payload buffer per batch: the decode hands the buffer over to
-	 * the batch and its by-reference values point into it (zero-copy),
-	 * so the buffer must stay untouched until the batch is destroyed.
-	 * The exact presize never grows the allocation.
+	 * One payload buffer per batch, recycled through the entry's pool at
+	 * destroy: the decode hands the buffer over to the batch and its
+	 * by-reference values point into it (zero-copy), so the buffer must
+	 * stay untouched until the batch is destroyed.  The exact presize
+	 * never grows the allocation.
 	 */
 	for (tcItem = pCSEntry->chunk_list.p_first; tcItem != NULL;
 		 tcItem = tcItem->p_next)
 		len += tcItem->chunk_length - TUPLE_CHUNK_HEADER_SIZE;
 
-	buf.data = (char *) palloc(len + 1);
+	buf.data = TakeWireBuffer(pMNEntry, len);
 	buf.maxlen = len + 1;
 	buf.len = 0;
 	buf.cursor = 0;
@@ -654,9 +770,8 @@ reconstructBatch(MotionLayerState *mlStates, MotionNodeEntry *pMNEntry,
 							   GetChunkDataPtr(tcItem) + TUPLE_CHUNK_HEADER_SIZE,
 							   tcItem->chunk_length - TUPLE_CHUNK_HEADER_SIZE);
 
-	batch = VectorBatchDecodeRows(mlStates->motion_layer_mctx,
-								  pMNEntry->tuple_desc,
-								  buf.data, buf.len);
+	batch = TakeMotionBatch(mlStates, pMNEntry);
+	VectorBatchDecodeRowsInto(batch, buf.data, buf.len);
 
 	{
 		ReadyBatch *node = (ReadyBatch *) palloc(sizeof(ReadyBatch));

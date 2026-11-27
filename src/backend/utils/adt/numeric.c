@@ -547,6 +547,9 @@ static void compute_bucket(Numeric operand, Numeric bound1, Numeric bound2,
 
 static void accum_sum_add(NumericSumAccum *accum, const NumericVar *var1);
 static void do_numeric_accum_var(NumericAggState *state, NumericVar *X);
+#ifdef HAVE_INT128
+static void numeric_agg_flush_fast(NumericAggState *state);
+#endif
 static bool numeric_decode_from_var(NumericVar *var, int64 *mantissa,
 									int *scale, int *dscale);
 static void accum_sum_rescale(NumericSumAccum *accum, const NumericVar *val);
@@ -3928,12 +3931,59 @@ do_numeric_accum_datum(NumericAggState *state, Datum newval)
 	do_numeric_accum_var(state, &X);
 }
 
+#ifdef HAVE_INT128
+/*
+ * Fold the pending int128 accumulation window (see do_numeric_accum_fast())
+ * into state->sumX.  Must be called before sumX is read or modified by any
+ * path other than the window itself, since the window's inputs are not in
+ * sumX until then.  The reconstructed NumericVar carries the window's
+ * display dscale, so that sumX's dscale tracks the input display scales
+ * exactly as the digit-by-digit path does.
+ *
+ * NULL-safe, so callers holding an optional state can call it directly.
+ */
+static void
+numeric_agg_flush_fast(NumericAggState *state)
+{
+	NumericVar	X;
+	MemoryContext old_context;
+	int			align_dscale;
+
+	if (state == NULL || !state->fast_valid)
+		return;
+
+	align_dscale = state->fast_dscale + (4 - state->fast_dscale % 4) % 4;
+
+	init_var(&X);
+	int128_to_numericvar(state->fast_sum, &X);
+	X.weight -= align_dscale / 4;
+	X.dscale = state->fast_dscale;
+
+	old_context = MemoryContextSwitchTo(state->agg_context);
+	accum_sum_add(&state->sumX, &X);
+	MemoryContextSwitchTo(old_context);
+
+	free_var(&X);
+
+	state->fast_valid = false;
+	state->fast_sum = 0;
+}
+#else
+/*
+ * Without int128 support there is no fast window, so every flush below is
+ * a no-op.
+ */
+#define numeric_agg_flush_fast(state)  ((void) (state))
+#endif
+
 /* The transition body shared by the accum entry points above. */
 static void
 do_numeric_accum_var(NumericAggState *state, NumericVar *X)
 {
 	NumericVar	X2;
 	MemoryContext old_context;
+
+	numeric_agg_flush_fast(state);
 
 	/*
 	 * Track the highest input dscale that we've seen, to support inverse
@@ -3974,12 +4024,60 @@ do_numeric_accum_var(NumericAggState *state, NumericVar *X)
  * performs, but skipping make_result() and the subsequent re-parse.  The
  * caller guarantees the mantissa has room for the display-scale padding
  * (|mantissa| <= PG_INT64_MAX / 1000).
+ *
+ * With int128 support, consecutive inputs sharing one dscale are summed
+ * into state->fast_sum as padding-aligned int64 mantissas instead of
+ * entering the base-10000 digit accumulator, so each input costs a single
+ * integer add.  The window keeps exact arithmetic: on a dscale change or
+ * an int128 overflow it is folded into sumX via accum_sum_add() and the
+ * current input starts a new window.  N and the maxScale bookkeeping are
+ * maintained here, because windowed inputs never reach
+ * do_numeric_accum_var().  Every sumX reader folds the window in first
+ * (see numeric_agg_flush_fast()).
  */
 void
 do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
 {
-	NumericVar	X;
 	int			pad = (4 - dscale % 4) % 4;
+
+#ifdef HAVE_INT128
+	int64		aligned = mantissa;
+	int128		new_sum;
+
+	state->N++;
+	if (dscale > state->maxScale)
+	{
+		state->maxScale = dscale;
+		state->maxScaleCount = 1;
+	}
+	else if (dscale == state->maxScale)
+		state->maxScaleCount++;
+
+	while (pad > 0)
+	{
+		aligned *= 10;
+		pad--;
+	}
+
+	if (state->fast_valid)
+	{
+		if (state->fast_dscale == dscale &&
+			!__builtin_add_overflow(state->fast_sum, (int128) aligned,
+									&new_sum))
+		{
+			state->fast_sum = new_sum;
+			return;
+		}
+
+		/* the dscale changed or the window is full: fold it into sumX */
+		numeric_agg_flush_fast(state);
+	}
+
+	state->fast_valid = true;
+	state->fast_dscale = dscale;
+	state->fast_sum = aligned;
+#else
+	NumericVar	X;
 
 	while (pad > 0)
 	{
@@ -3993,6 +4091,7 @@ do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
 	X.dscale = dscale;
 
 	do_numeric_accum_var(state, &X);
+#endif
 }
 
 /*
@@ -4023,6 +4122,8 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 		state->NaNcount--;
 		return true;
 	}
+
+	numeric_agg_flush_fast(state);
 
 	/* load processed number in short-lived context */
 	init_var_from_num(newval, &X);
@@ -4132,6 +4233,10 @@ numeric_combine(PG_FUNCTION_ARGS)
 	state1 = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
+	/* fold any pending int128 fast windows into their sums first */
+	numeric_agg_flush_fast(state1);
+	numeric_agg_flush_fast(state2);
+
 	if (state2 == NULL)
 	{
 		if (state1 == NULL)
@@ -4224,6 +4329,10 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 	state1 = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
+	/* fold any pending int128 fast windows into their sums first */
+	numeric_agg_flush_fast(state1);
+	numeric_agg_flush_fast(state2);
+
 	if (state2 == NULL)
 	{
 		if (state1 == NULL)
@@ -4300,6 +4409,9 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 		elog(ERROR, "aggregate function called in non-aggregate context");
 
 	state = (NumericAggState *) PG_GETARG_POINTER(0);
+
+	/* fold the pending int128 fast window into sumX before reading it */
+	numeric_agg_flush_fast(state);
 
 	/*
 	 * This is a little wasteful since make_result converts the NumericVar
@@ -4422,6 +4534,9 @@ numeric_serialize(PG_FUNCTION_ARGS)
 		elog(ERROR, "aggregate function called in non-aggregate context");
 
 	state = (NumericAggState *) PG_GETARG_POINTER(0);
+
+	/* fold the pending int128 fast window into sumX before reading it */
+	numeric_agg_flush_fast(state);
 
 	/*
 	 * This is a little wasteful since make_result converts the NumericVar
@@ -5334,6 +5449,8 @@ numeric_avg(PG_FUNCTION_ARGS)
 	if (state->NaNcount > 0)	/* there was at least one NaN input */
 		PG_RETURN_NUMERIC(make_result(&const_nan));
 
+	numeric_agg_flush_fast(state);
+
 	N_datum = DirectFunctionCall1(int8_numeric, Int64GetDatum(state->N));
 
 	init_var(&sumX_var);
@@ -5359,6 +5476,8 @@ numeric_sum(PG_FUNCTION_ARGS)
 
 	if (state->NaNcount > 0)	/* there was at least one NaN input */
 		PG_RETURN_NUMERIC(make_result(&const_nan));
+
+	numeric_agg_flush_fast(state);
 
 	init_var(&sumX_var);
 	accum_sum_final(&state->sumX, &sumX_var);
@@ -5403,6 +5522,8 @@ numeric_stddev_internal(NumericAggState *state,
 
 	if (state->NaNcount > 0)
 		return make_result(&const_nan);
+
+	numeric_agg_flush_fast(state);
 
 	init_var(&vN);
 	init_var(&vsumX);
