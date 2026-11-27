@@ -157,6 +157,12 @@ typedef struct VectorRegionState
 	bool		explain_only;	/* EXPLAIN_ONLY init: no batch was created */
 	bool		agg_out_ready;	/* agg input fully driven, groups ready */
 	bool		agg_out_done;	/* group iterator exhausted */
+	/*
+	 * The agg-root region's output batch, shaped by the aggregate's
+	 * result tupdesc (state->batch carries the input columns instead,
+	 * whose count and types a projection like count(*) does not match).
+	 */
+	VectorBatch *agg_out_batch;
 } VectorRegionState;
 
 typedef struct VectorNestLoopProxy
@@ -2222,6 +2228,8 @@ VectorRegionEnd(CustomScanState *node)
 		VectorAggDestroy(state->vagg);
 	if (state->batch != NULL)
 		VectorBatchDestroy(state->batch);
+	if (state->agg_out_batch != NULL)
+		VectorBatchDestroy(state->agg_out_batch);
 	if (state->append_quals != NULL)
 	{
 		int			i;
@@ -2426,10 +2434,26 @@ VectorRegionRestrPos(CustomScanState *node)
 static bool
 VectorRegionAggOutputBatch(VectorRegionState *state, VectorBatch **batch)
 {
-	VectorBatch  *batch_out = state->batch;
+	VectorBatch  *batch_out;
 	TupleTableSlot *slot;
 	MemoryContext oldcontext;
 	int			n;
+
+	if (!state->agg_out_batch)
+	{
+		/*
+		 * The output batch must carry the aggregate's projection columns
+		 * (count and types): the parent regions and the motion sender
+		 * read them by the batch's own tupdesc.  state->batch holds the
+		 * aggregate's input columns instead, which a projection like
+		 * count(*) over a join does not match.
+		 */
+		state->agg_out_batch = VectorBatchCreate(
+			state->css.ss.ps.state->es_query_cxt,
+			ExecGetResultType(&state->agg->ss.ps),
+			VECTOR_BATCH_DEFAULT_CAPACITY, false);
+	}
+	batch_out = state->agg_out_batch;
 
 	if (!state->agg_out_ready)
 	{
