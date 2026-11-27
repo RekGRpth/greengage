@@ -98,6 +98,16 @@ typedef struct NumericAggState
 	int			maxScale;		/* maximum scale seen so far */
 	int64		maxScaleCount;	/* number of values seen with maximum scale */
 	int64		NaNcount;		/* count of NaN values (not included in N!) */
+#ifdef HAVE_INT128
+	/*
+	 * Pending int128 accumulation window fed by do_numeric_accum_fast().
+	 * sumX does not include the window's inputs yet; the window must be
+	 * folded into sumX before sumX is read or modified elsewhere.
+	 */
+	bool		fast_valid;		/* is the window holding pending inputs? */
+	int			fast_dscale;	/* display dscale of the window's inputs */
+	int128		fast_sum;		/* sum of the window's scale-aligned mantissas */
+#endif
 } NumericAggState;
 
 extern NumericAggState *makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2);
