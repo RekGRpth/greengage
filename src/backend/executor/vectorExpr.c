@@ -3083,11 +3083,16 @@ numconst_scaled(VectorExprStep *arg, int target, int64 *out)
 
 /*
  * Bring one ADD/SUB operand to the shared finer scale: hoisted Const
- * operands go through their table, column operands scale in place.
+ * operands go through their table, column operands scale in place.  A
+ * constant of scale zero (the 1 in (1 - x)) makes the target equal the
+ * column operand's own folded scale on every row, so the equality check
+ * skips the call entirely on that dominating shape.
  */
 static bool
 numeric_operand_scale(VectorExprStep *arg, int64 *mant, int scale, int target)
 {
+	if (scale == target)
+		return true;
 	if (arg->kind == VEC_CONST && arg->numconst_valid)
 		return numconst_scaled(arg, target, mant);
 	return numeric_scale_fast(mant, scale, target);
