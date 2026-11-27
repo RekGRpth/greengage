@@ -207,6 +207,23 @@ build_var_map(Agg *agg, MemoryContext context, VectorExprVarMap *vars)
 		agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_SORTED &&
 		agg->aggstrategy != AGG_MIXED)
 		return false;
+	if (IsA(outer, HashJoin))
+	{
+		/*
+		 * The region's join chain consumes the probe side only through
+		 * SeqScan, Motion, nested join chains or batch handouts
+		 * (VectorRegionCreateJoinChain); a chain ending in anything else
+		 * falls back to the row adapter, wrapping a row pipeline in a
+		 * region for pure overhead.  Mirror the acceptance at plan time.
+		 */
+		Plan	   *probe = outerPlan(outer);
+
+		while (IsA(probe, HashJoin))
+			probe = outerPlan(probe);
+		if (!IsA(probe, SeqScan) && !IsA(probe, Motion) &&
+			!IsA(probe, CustomScan))
+			return false;
+	}
 
 	vars->outer_ncols = list_length(outer->targetlist);
 	vars->outer_attnos = MemoryContextAlloc(context,
