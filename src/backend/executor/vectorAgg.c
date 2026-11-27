@@ -881,6 +881,17 @@ fill_input_slot(VectorAggState *state, VectorBatch *batch, int row)
  * the standard slot machinery: batched over a motion it loses to the
  * row executor, so the caller gates the shape out.
  */
+/*
+ * True when this aggregate runs the open-addressing fast group table
+ * (all-by-value fixed-width keys): only such aggregates hand their
+ * groups out batch-wise through VectorRegionAggOutputBatch.
+ */
+bool
+VectorAggFastTableActive(VectorAggState *state)
+{
+	return state->fast != NULL;
+}
+
 bool
 VectorAggWideGroupKeys(Agg *agg)
 {

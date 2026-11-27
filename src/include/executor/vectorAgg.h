@@ -15,6 +15,7 @@ typedef struct VectorAggState VectorAggState;
 
 extern bool VectorAggPlanIsSupported(Agg *agg);
 extern bool VectorAggWideGroupKeys(Agg *agg);
+extern bool VectorAggFastTableActive(VectorAggState *state);
 extern bool VectorAggPackedI32IsSupported(AggState *agg);
 extern VectorAggState *VectorAggCreate(MemoryContext parent, AggState *agg,
 									   VectorBatch *batch);

@@ -155,6 +155,8 @@ typedef struct VectorRegionState
 	VectorBatch **append_batches;	/* per child: private fill batch */
 	bool	   **append_read_attrs;	/* per child: row-reader deform set */
 	bool		explain_only;	/* EXPLAIN_ONLY init: no batch was created */
+	bool		agg_out_ready;	/* agg input fully driven, groups ready */
+	bool		agg_out_done;	/* group iterator exhausted */
 } VectorRegionState;
 
 typedef struct VectorNestLoopProxy
@@ -175,6 +177,7 @@ static bool VectorMotionLeafNext(void *arg);
 static VectorBatch *VectorRegionInputBatch(VectorRegionState *state);
 static bool VectorRegionOutputBatchable(VectorRegionState *state);
 static bool VectorRegionProbeBatches(VectorRegionState *state);
+static bool VectorRegionAggOutputBatch(VectorRegionState *state, VectorBatch **batch);
 static bool VectorRegionProbeSourceFeed(void *arg, VectorBatch **batch);
 static Node *VectorRegionCreateState(CustomScan *cscan);
 static void VectorRegionBegin(CustomScanState *node, EState *estate, int eflags);
@@ -1516,6 +1519,15 @@ VectorRegionProbeBatches(VectorRegionState *state)
 	if (state->explain_only)
 		return false;
 	/*
+	 * A fast-table aggregate hands its groups out batch-wise: the probe
+	 * feed of a parent region stays batched end to end.  Wide-keyed or
+	 * streaming aggregates stay declined (their slot-machinery path
+	 * never beats the row executor).
+	 */
+	if (state->agg != NULL && state->vagg != NULL &&
+		VectorAggFastTableActive(state->vagg))
+		return true;
+	/*
 	 * An aggregate or sort consumes the join batches and outputs rows: the
 	 * region hands no batches out.  This check must stay ahead of the
 	 * nested_batches shortcut to mirror VectorRegionPullOutputBatch, whose
@@ -2333,7 +2345,11 @@ VectorRegionRescan(CustomScanState *node)
 		state->build_motion_leaf->row.eof = false;
 	}
 	if (state->vagg != NULL)
+	{
 		VectorAggReset(state->vagg);
+		state->agg_out_ready = false;
+		state->agg_out_done = false;
+	}
 	else if (state->vhj == NULL)
 	{
 		foreach(lc, node->custom_ps)
@@ -2392,6 +2408,72 @@ VectorRegionRestrPos(CustomScanState *node)
 }
 
 /*
+ * Serve a fast-table aggregate-root region's groups as output batches.
+ * The first pull drives the whole input through the aggregate (the
+ * aggregate is blocking anyway), afterwards VectorAggNext's projection
+ * is copied row by row into the region's output batch.  This replaces
+ * the row-leaf layer a parent region would otherwise run to re-batch
+ * the aggregate's row output.
+ */
+static bool
+VectorRegionAggOutputBatch(VectorRegionState *state, VectorBatch **batch)
+{
+	VectorBatch  *batch_out = state->batch;
+	TupleTableSlot *slot;
+	MemoryContext oldcontext;
+	int			n;
+
+	if (!state->agg_out_ready)
+	{
+		VectorBatch  *input = VectorRegionInputBatch(state);
+		int		   *cursor = state->nested_batches ? &state->join_position : &state->position;
+		AggState    *agg = state->agg;
+
+		while (!agg->input_done &&
+			   (*cursor < input->nselected || VectorRegionNextBatch(state)))
+		{
+			VectorAggProcessBatch(state->vagg, input);
+			*cursor = input->nselected;
+		}
+		VectorAggFinish(state->vagg);
+		state->agg_out_ready = true;
+	}
+
+	if (state->agg_out_done)
+		return false;
+
+	VectorBatchReset(batch_out);
+	oldcontext = MemoryContextSwitchTo(batch_out->varlena_context);
+	for (n = 0; n < batch_out->capacity; n++)
+	{
+		slot = VectorAggNext(state->vagg);
+
+		if (slot == NULL)
+		{
+			state->agg_out_done = true;
+			break;
+		}
+		slot_getallattrs(slot);
+		for (int col = 0; col < batch_out->ncols; col++)
+		{
+			Datum		value = slot->tts_values[col];
+			bool		isnull = slot->tts_isnull[col];
+
+			value = VectorBatchCopyDatumInContext(batch_out, col, value,
+												  isnull);
+			VectorBatchSetValue(batch_out, col, n, value, isnull);
+		}
+	}
+	MemoryContextSwitchTo(oldcontext);
+
+	if (n == 0)
+		return false;
+	VectorBatchSetRowCount(batch_out, n);
+	*batch = batch_out;
+	return true;
+}
+
+/*
  * Sender-side batch interconnect support: when this plan node is a
  * vector region whose output rows are produced natively as batches (a
  * plain scan region or a batch-driven HJ-root region, with no computed
@@ -2410,9 +2492,22 @@ VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
 		return false;
 	state = (VectorRegionState *) ps;
 
-	/* an aggregate or sort consumes the join batches: row-wise output */
-	if (state->agg != NULL || state->sort != NULL)
+	/* a sort consumes the join batches: row-wise output */
+	if (state->sort != NULL)
 		return false;
+
+	/*
+	 * A fast-table aggregate hands its groups out batch-wise through
+	 * VectorRegionAggOutputBatch: the probe feed of a parent region stays
+	 * batched end to end instead of round-tripping every group through
+	 * the region's row output and the parent's row adapter.
+	 */
+	if (state->agg != NULL)
+	{
+		if (VectorAggFastTableActive(state->vagg))
+			return VectorRegionAggOutputBatch(state, batch);
+		return false;
+	}
 
 	if (state->nested_batches)
 	{
