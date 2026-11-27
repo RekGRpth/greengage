@@ -896,6 +896,12 @@ vectorize_mutator(Node *node, VectorizeContext *ctx)
 			{
 				if (!motion_probe_tlist_is_simple(outerPlan(node)))
 					why = "the motion probe targetlist is not a plain projection";
+				else if (gp_vectorized_chain_max_growth > 0 &&
+						 ((Plan *) node)->plan_rows >
+						 outerPlan(node)->plan_rows *
+						 gp_vectorized_chain_max_growth)
+					why = "the chain join multiplies the batched rows beyond "
+						  "gp_vectorized_chain_max_growth";
 			}
 			else
 				why = psprintf("the probe side is a %s, not a simple scan "
