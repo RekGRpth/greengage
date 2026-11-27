@@ -42,6 +42,13 @@
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 
+/*
+ * Numeric Const operands are decoded once per step, and the ADD/SUB path
+ * rescales them through this table indexed by the row-varying target scale
+ * (an AOCS column's folded exact scales oscillate within a few values).
+ */
+#define NUMCONST_SCALE_LUT	16
+
 typedef enum VectorExprKind
 {
 	VEC_VAR,
@@ -195,6 +202,19 @@ typedef struct VectorExprStep
 	struct VectorExprStep **args;
 	int			nargs;
 	VectorColumn *column_cache;	/* VEC_VAR: the aliased batch column */
+
+	/*
+	 * Numeric Const operand (VEC_CONST over numeric), decoded once at step
+	 * build time: the arithmetic path re-reads constants every row, and
+	 * re-decoding the same varlena per row buys nothing.
+	 */
+	bool		numconst_valid;
+	int64		numconst_mant;
+	int			numconst_scale;
+	int			numconst_dscale;
+	int64		numconst_scaled[NUMCONST_SCALE_LUT];
+	uint8		numconst_scaled_ok[NUMCONST_SCALE_LUT];	/* 0 unknown,
+							 * 1 ok, 2 overflow */
 
 	/*
 	 * Deferred numeric results (numeric arithmetic fast path): an aggregate
@@ -1470,6 +1490,12 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 									   DatumGetInt32(c->constvalue), c->constisnull);
 					else
 						value_set(&step->value, row, c->constvalue, c->constisnull);
+				if (c->consttype == NUMERICOID && !c->constisnull)
+					step->numconst_valid =
+						numeric_decode_fast_datum(c->constvalue,
+												  &step->numconst_mant,
+												  &step->numconst_scale,
+												  &step->numconst_dscale);
 				return step;
 			}
 		case T_RelabelType:
@@ -2959,6 +2985,14 @@ numeric_arg_decode(VectorExprStep *arg, int row, uint32 gen,
 		return true;
 	}
 
+	if (arg->kind == VEC_CONST && arg->numconst_valid)
+	{
+		*mant = arg->numconst_mant;
+		*scale = arg->numconst_scale;
+		*dscale = arg->numconst_dscale;
+		return true;
+	}
+
 	if (col != NULL && col->cache_mant != NULL)
 	{
 		if (col->cache_gen != gen)
@@ -3004,6 +3038,59 @@ VectorExprNumericArgDecode(VectorExprStep *arg, int row, uint32 gen,
 						   int64 *mant, int *scale, int *dscale)
 {
 	return numeric_arg_decode(arg, row, gen, mant, scale, dscale);
+}
+
+/*
+ * Scale a hoisted numeric Const operand to the target scale, through the
+ * per-step table: the same few target scales recur across the batch, and
+ * the column operand's folded exact scales make the target oscillate row
+ * by row.
+ */
+static bool
+numconst_scaled(VectorExprStep *arg, int target, int64 *out)
+{
+	int64		m;
+
+	Assert(arg->kind == VEC_CONST && arg->numconst_valid);
+	if (target < arg->numconst_scale || target >= NUMCONST_SCALE_LUT)
+	{
+		m = arg->numconst_mant;
+		if (numeric_scale_fast(&m, arg->numconst_scale, target))
+		{
+			*out = m;
+			return true;
+		}
+		return false;
+	}
+	if (arg->numconst_scaled_ok[target] == 0)
+	{
+		m = arg->numconst_mant;
+		if (numeric_scale_fast(&m, arg->numconst_scale, target))
+		{
+			arg->numconst_scaled[target] = m;
+			arg->numconst_scaled_ok[target] = 1;
+		}
+		else
+			arg->numconst_scaled_ok[target] = 2;
+	}
+	if (arg->numconst_scaled_ok[target] == 1)
+	{
+		*out = arg->numconst_scaled[target];
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Bring one ADD/SUB operand to the shared finer scale: hoisted Const
+ * operands go through their table, column operands scale in place.
+ */
+static bool
+numeric_operand_scale(VectorExprStep *arg, int64 *mant, int scale, int target)
+{
+	if (arg->kind == VEC_CONST && arg->numconst_valid)
+		return numconst_scaled(arg, target, mant);
+	return numeric_scale_fast(mant, scale, target);
 }
 
 /*
@@ -3059,8 +3146,10 @@ eval_numeric_arith_row(VectorExprStep *step, VectorBatch *batch, int row)
 
 					/* Add exactly at the finer scale, then round once. */
 					dres = Max(da, db);
-					ok = numeric_scale_fast(&ma, sa, smax) &&
-						numeric_scale_fast(&mb, sb, smax);
+					ok = numeric_operand_scale(step->args[0], &ma, sa,
+											   smax) &&
+						numeric_operand_scale(step->args[1], &mb, sb,
+											  smax);
 					if (ok)
 					{
 						int64		sum;
