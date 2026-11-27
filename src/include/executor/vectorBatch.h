@@ -71,6 +71,16 @@ typedef struct VectorBatch
 	 * it.  NULL for every batch that is not a motion decode.
 	 */
 	char	   *wire_data;
+	/*
+	 * Motion-layer recycling: destroying a decoded batch hands the shell
+	 * (columns, selection, varlena context) and its payload buffer back
+	 * to the owning motion node through this hook instead of pfreeing
+	 * them part by part.  Destroy is the release point of the batch's
+	 * lifetime contract, so nothing can reference the storage once it is
+	 * pooled.  NULL for non-motion batches.
+	 */
+	void	   *wire_owner;
+	void		(*wire_recycle) (void *owner, struct VectorBatch *batch);
 } VectorBatch;
 
 extern VectorBatch *VectorBatchCreate(MemoryContext parent,
@@ -89,6 +99,14 @@ extern void VectorBatchEncodeRows(StringInfo buf, const VectorBatch *batch,
 extern VectorBatch *VectorBatchDecodeRows(MemoryContext parent,
 										  TupleDesc tupdesc,
 										  char *payload, int len);
+/*
+ * Decode into an existing batch shell (a recycled motion batch):
+ * grows the fixed arrays when the payload's nrows exceed the shell's
+ * capacity; takes ownership of the payload just like
+ * VectorBatchDecodeRows.
+ */
+extern void VectorBatchDecodeRowsInto(VectorBatch *batch,
+									  char *payload, int len);
 extern void VectorBatchDestroy(VectorBatch *batch);
 extern void VectorBatchReset(VectorBatch *batch);
 extern void VectorBatchSetRowCount(VectorBatch *batch, int nrows);

@@ -491,8 +491,31 @@ typedef struct MotionNodeEntry
 	 * wire_data): the decode points its by-reference values into the
 	 * payload, so each batch owns the buffer it was assembled in until
 	 * it is destroyed.
+	 *
+	 * Recycling pools, filled only from VectorBatchDestroy (the release
+	 * point of the batch lifetime contract: nothing can reference the
+	 * storage once it is pooled).  Payload buffers are reused when big
+	 * enough, the newest few kept; batch shells are replayed through
+	 * VectorBatchDecodeRowsInto; queue nodes through the ready list.
 	 */
+#define MOTION_WIRE_POOL_MAX	4
+#define MOTION_SHELL_POOL_MAX	4
+	char		   *wire_pool[MOTION_WIRE_POOL_MAX];
+	Size			wire_pool_cap[MOTION_WIRE_POOL_MAX];
+	int				wire_pool_count;
+	struct VectorBatch *shell_pool[MOTION_SHELL_POOL_MAX];
+	int				shell_pool_count;
+	ReadyBatch	   *rb_pool[MOTION_SHELL_POOL_MAX];
+	int				rb_pool_count;
 }       MotionNodeEntry;
+
+/*
+ * Recycle hook for decoded vector batches: installed by the motion
+ * layer in each batch it decodes, called by VectorBatchDestroy as the
+ * release point of the batch lifetime contract.
+ */
+struct VectorBatch;
+extern void VectorMotionRecycleBatch(void *owner, struct VectorBatch *batch);
 
 
 /*=========================================================================

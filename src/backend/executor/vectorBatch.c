@@ -82,7 +82,20 @@ VectorBatchDestroy(VectorBatch *batch)
 
 	/* a decoded batch's values point into the wire payload */
 	if (batch->wire_data != NULL)
+	{
+		if (batch->wire_recycle != NULL)
+		{
+			/*
+			 * The owner pools the whole shell (columns, selection,
+			 * varlena context, payload buffer): destroy is the release
+			 * point of the lifetime contract, so pooling here cannot
+			 * race a holder.
+			 */
+			(*batch->wire_recycle) (batch->wire_owner, batch);
+			return;
+		}
 		pfree(batch->wire_data);
+	}
 	MemoryContextDelete(batch->varlena_context);
 	for (col = 0; col < batch->ncols; col++)
 	{
@@ -482,31 +495,68 @@ vbatch_decode_u16(const char **p, const char *end)
  * VectorBatchDestroy frees it.  The wire's offsets are MAXALIGNed, so
  * the datums are maxaligned without copying.
  */
-VectorBatch *
-VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
-					  char *payload, int len)
+/*
+ * Parse and validate the payload header; *p advances past it.
+ */
+static void
+vbatch_decode_header(const char **p, const char *end, TupleDesc tupdesc,
+					 int *nrows, int *ncols)
 {
-	const char *p = payload;
-	const char *end = payload + len;
-	VectorBatch *batch;
 	uint32		magic;
-	int			nrows;
-	int			ncols;
-	int			col;
 
-	if (len < 8)
+	if (end - *p < 8)
 		elog(ERROR, "malformed vector batch chunk");
-	magic = vbatch_decode_u32(&p, end);
+	magic = vbatch_decode_u32(p, end);
 	if (magic != VBATCH_MAGIC)
 		elog(ERROR, "bad vector batch magic 0x%x", magic);
-	nrows = vbatch_decode_u16(&p, end);
-	ncols = vbatch_decode_u16(&p, end);
-	if (ncols != tupdesc->natts)
+	*nrows = vbatch_decode_u16(p, end);
+	*ncols = vbatch_decode_u16(p, end);
+	if (*ncols != tupdesc->natts)
 		elog(ERROR, "vector batch column count %d does not match motion output %d",
-			 ncols, tupdesc->natts);
+			 *ncols, tupdesc->natts);
+}
 
-	batch = VectorBatchCreate(parent, tupdesc, Max(nrows, 1), false);
-	batch->wire_data = payload;
+/*
+ * Grow the batch's fixed arrays for a larger capacity (a recycled shell
+ * receiving more rows than its previous batch had).
+ */
+static void
+vbatch_grow(VectorBatch *batch, int capacity)
+{
+	int			col;
+
+	pfree(batch->selection);
+	batch->selection = palloc(sizeof(int32) * capacity);
+	for (col = 0; col < batch->ncols; col++)
+	{
+		VectorColumn *c = &batch->columns[col];
+
+		if (c->i16_values != NULL)
+		{
+			pfree(c->i16_values);
+			c->i16_values = palloc0(sizeof(int16) * capacity);
+		}
+		else if (c->i32_values != NULL)
+		{
+			pfree(c->i32_values);
+			c->i32_values = palloc0(sizeof(int32) * capacity);
+		}
+		else
+		{
+			pfree(c->values);
+			c->values = palloc0(sizeof(Datum) * capacity);
+		}
+		pfree(c->nulls);
+		c->nulls = palloc0(sizeof(uint64) * VECTOR_BATCH_NULLWORDS(capacity));
+	}
+	batch->capacity = capacity;
+}
+
+static void
+vbatch_decode_fill(VectorBatch *batch, TupleDesc tupdesc, const char *p,
+				   const char *end, int nrows, int ncols)
+{
+	int			col;
 
 	for (col = 0; col < ncols; col++)
 	{
@@ -652,5 +702,48 @@ VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
 		for (row = 0; row < nrows; row++)
 			batch->selection[row] = row;
 	}
+}
+
+/*
+ * Decode one columnar payload into a fresh batch.  Takes ownership of
+ * payload (a palloc'd, MAXALIGN'd buffer): the batch keeps the pointer
+ * and every by-reference value is handed out in place, pointing into
+ * the payload; VectorBatchDestroy frees it.
+ */
+VectorBatch *
+VectorBatchDecodeRows(MemoryContext parent, TupleDesc tupdesc,
+					  char *payload, int len)
+{
+	const char *p = payload;
+	const char *end = payload + len;
+	VectorBatch *batch;
+	int			nrows;
+	int			ncols;
+
+	vbatch_decode_header(&p, end, tupdesc, &nrows, &ncols);
+	batch = VectorBatchCreate(parent, tupdesc, Max(nrows, 1), false);
+	batch->wire_data = payload;
+	vbatch_decode_fill(batch, tupdesc, p, end, nrows, ncols);
 	return batch;
+}
+
+/*
+ * Decode into an existing batch shell (a recycled motion batch): grows
+ * the fixed arrays when the payload's nrows exceed the shell's
+ * capacity, takes ownership of the payload just like
+ * VectorBatchDecodeRows.
+ */
+void
+VectorBatchDecodeRowsInto(VectorBatch *batch, char *payload, int len)
+{
+	const char *p = payload;
+	const char *end = payload + len;
+	int			nrows;
+	int			ncols;
+
+	vbatch_decode_header(&p, end, batch->tupdesc, &nrows, &ncols);
+	if (nrows > batch->capacity)
+		vbatch_grow(batch, nrows);
+	batch->wire_data = payload;
+	vbatch_decode_fill(batch, batch->tupdesc, p, end, nrows, ncols);
 }
