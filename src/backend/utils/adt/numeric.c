@@ -3936,9 +3936,9 @@ do_numeric_accum_datum(NumericAggState *state, Datum newval)
  * Fold the pending int128 accumulation window (see do_numeric_accum_fast())
  * into state->sumX.  Must be called before sumX is read or modified by any
  * path other than the window itself, since the window's inputs are not in
- * sumX until then.  The reconstructed NumericVar carries the window's
- * display dscale, so that sumX's dscale tracks the input display scales
- * exactly as the digit-by-digit path does.
+ * sumX until then.  The reconstructed NumericVar carries maxScale as its
+ * dscale, so that sumX's dscale tracks the input display scales exactly
+ * as the digit-by-digit path does.
  *
  * NULL-safe, so callers holding an optional state can call it directly.
  */
@@ -3952,12 +3952,17 @@ numeric_agg_flush_fast(NumericAggState *state)
 	if (state == NULL || !state->fast_valid)
 		return;
 
-	align_dscale = state->fast_dscale + (4 - state->fast_dscale % 4) % 4;
+	align_dscale = state->fast_scale + (4 - state->fast_scale % 4) % 4;
 
 	init_var(&X);
 	int128_to_numericvar(state->fast_sum, &X);
 	X.weight -= align_dscale / 4;
-	X.dscale = state->fast_dscale;
+	/*
+	 * The digit path derives sumX's dscale from the inputs' display
+	 * scales, which maxScale already tracks for every windowed input,
+	 * so carrying maxScale here yields the same accum->dscale.
+	 */
+	X.dscale = state->maxScale;
 
 	old_context = MemoryContextSwitchTo(state->agg_context);
 	accum_sum_add(&state->sumX, &X);
@@ -4019,39 +4024,36 @@ do_numeric_accum_var(NumericAggState *state, NumericVar *X)
 }
 
 /*
- * Accumulate an exactly decoded value (mantissa * 10^-dscale) without
+ * Accumulate an exactly decoded value (mantissa * 10^-scale) without
  * materializing a Numeric: the same var construction numeric_build_fast()
  * performs, but skipping make_result() and the subsequent re-parse.  The
- * caller guarantees the mantissa has room for the display-scale padding
- * (|mantissa| <= PG_INT64_MAX / 1000).
+ * caller guarantees the mantissa has room for the scale padding
+ * (|mantissa| <= PG_INT64_MAX / 1000).  'scale' is the exact scale of the
+ * contribution; 'dscale' is the input's display scale, which only feeds
+ * the maxScale bookkeeping behind the output display scales.
  *
- * With int128 support, consecutive inputs sharing one dscale are summed
+ * With int128 support, consecutive inputs sharing one scale are summed
  * into state->fast_sum as padding-aligned int64 mantissas instead of
  * entering the base-10000 digit accumulator, so each input costs a single
- * integer add.  The window keeps exact arithmetic: on a dscale change or
- * an int128 overflow it is folded into sumX via accum_sum_add() and the
- * current input starts a new window.  N and the maxScale bookkeeping are
- * maintained here, because windowed inputs never reach
- * do_numeric_accum_var().  Every sumX reader folds the window in first
- * (see numeric_agg_flush_fast()).
+ * integer add.  The hot window hit runs inline through
+ * numeric_agg_fast_window_add(); this out-of-line function is the slow
+ * half only - the window is opened here, and folded into sumX via
+ * accum_sum_add() on a scale change or an int128 overflow, after which
+ * the current input starts a new window.  N and the maxScale bookkeeping
+ * are done by the inline half (this function is only called after it
+ * returned false, and does not repeat them), because windowed inputs
+ * never reach do_numeric_accum_var().  Every sumX reader folds the window
+ * in first (see numeric_agg_flush_fast()).
  */
 void
-do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
+do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int scale,
+					  int dscale)
 {
-	int			pad = (4 - dscale % 4) % 4;
+	int			pad = (4 - scale % 4) % 4;
 
 #ifdef HAVE_INT128
 	int64		aligned = mantissa;
 	int128		new_sum;
-
-	state->N++;
-	if (dscale > state->maxScale)
-	{
-		state->maxScale = dscale;
-		state->maxScaleCount = 1;
-	}
-	else if (dscale == state->maxScale)
-		state->maxScaleCount++;
 
 	while (pad > 0)
 	{
@@ -4061,7 +4063,7 @@ do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
 
 	if (state->fast_valid)
 	{
-		if (state->fast_dscale == dscale &&
+		if (state->fast_scale == scale &&
 			!__builtin_add_overflow(state->fast_sum, (int128) aligned,
 									&new_sum))
 		{
@@ -4069,12 +4071,12 @@ do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
 			return;
 		}
 
-		/* the dscale changed or the window is full: fold it into sumX */
+		/* the scale changed or the window is full: fold it into sumX */
 		numeric_agg_flush_fast(state);
 	}
 
 	state->fast_valid = true;
-	state->fast_dscale = dscale;
+	state->fast_scale = scale;
 	state->fast_sum = aligned;
 #else
 	NumericVar	X;
@@ -4087,7 +4089,7 @@ do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int dscale)
 
 	init_var(&X);
 	int64_to_numericvar(mantissa, &X);
-	X.weight -= (dscale + (4 - dscale % 4) % 4) / 4;
+	X.weight -= (scale + (4 - scale % 4) % 4) / 4;
 	X.dscale = dscale;
 
 	do_numeric_accum_var(state, &X);

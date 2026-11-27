@@ -1528,6 +1528,9 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			MemoryContext oldcontext;
 			bool		calcSumX2 = pertrans->aggref->aggfnoid != VEC_AGG_AVG_NUMERIC &&
 				pertrans->aggref->aggfnoid != VEC_AGG_SUM_NUMERIC;
+			int64		mant;
+			int			scale;
+			int			dscale;
 
 			if (pergroupstate->transValueIsNull)
 			{
@@ -1543,14 +1546,14 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				aggstate = (NumericAggState *) DatumGetPointer(pergroupstate->transValue);
 			if (!calcSumX2 && state->deferred[transno])
 			{
-				int64		mant;
-				int			dscale;
-
 				if (VectorExprGetDeferredNumeric(state->args[transno][0], row,
 												 &mant, &dscale))
 				{
 					/* no tmpcontext allocations on this path */
-					do_numeric_accum_fast(aggstate, mant, dscale);
+					if (!numeric_agg_fast_window_add(aggstate, mant, dscale,
+													 dscale))
+						do_numeric_accum_fast(aggstate, mant, dscale,
+											  dscale);
 					return true;
 				}
 				/* the row used the generic build/fmgr path: read its datum */
@@ -1562,8 +1565,26 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 								 DatumGetNumeric(DirectFunctionCall1(int8_numeric,
 																	 value)));
 			else
-				/* decodes inline varlenas without a detoast copy */
-				do_numeric_accum_datum(aggstate, value);
+			{
+				/*
+				 * The row skipped the deferred decode (a generic
+				 * build/fmgr row, or an expression the evaluator cannot
+				 * defer).  An exact int64 mantissa still feeds the
+				 * int128 window at its exact scale; wide or NaN values
+				 * fall back to the detoast-free datum path.
+				 */
+				if (numeric_decode_fast_datum(value, &mant, &scale,
+											  &dscale))
+				{
+					if (!numeric_agg_fast_window_add(aggstate, mant, scale,
+													 dscale))
+						do_numeric_accum_fast(aggstate, mant, scale,
+											  dscale);
+				}
+				else
+					/* decodes inline varlenas without a detoast copy */
+					do_numeric_accum_datum(aggstate, value);
+			}
 			MemoryContextSwitchTo(oldcontext);
 			return true;
 		}
@@ -1928,67 +1949,85 @@ advance_row(VectorAggState *state, AggStatePerGroup pergroup, int row)
 		return;
 	}
 
-	for (transno = 0; transno < agg->numtrans; transno++)
 	{
-		AggStatePerTrans pertrans = &agg->pertrans[transno];
-		int			nargs = pertrans->numInputs;
-		int			argno;
+		/*
+		 * Walk the pertrans array with a pointer: the strided indexing per
+		 * transition shows up in the batch profiles.  'pergroup' stays the
+		 * group's slot base - the byval fast path and the transition bridge
+		 * self-index it by transno.
+		 */
+		AggStatePerTrans pertrans = agg->pertrans;
+		Datum	  **trans_values = state->values;
+		Datum	  ***trans_arg_values = state->arg_values;
+		uint64	 ***trans_arg_nulls = state->arg_nulls;
+		bool	  **trans_nulls = state->nulls;
+		VectorExprState **trans_filters = state->filters;
+		uint64	  **trans_filter_nulls = state->filter_nulls;
+		Datum	  **trans_filter_values = state->filter_values;
+		bool		is_combine = state->is_combine;
 
-		/* eval_arguments() stashed the root arrays: read rows inline */
-		if (state->filters[transno] != NULL)
+		for (transno = 0; transno < agg->numtrans; transno++, pertrans++)
 		{
-			if ((state->filter_nulls[transno][row / 64] >> (row % 64)) & 1 ||
-				!DatumGetBool(state->filter_values[transno][row]))
-				continue;
-		}
-		for (argno = 0; argno < nargs; argno++)
-		{
-			state->values[transno][argno] =
-				state->arg_values[transno][argno][row];
-			state->nulls[transno][argno] =
-				(state->arg_nulls[transno][argno][row / 64] >> (row % 64)) & 1;
-		}
-		if (state->is_combine)
-		{
-			/*
-			 * A combine transition: the input column carries the
-			 * (optionally serialized) partial state from below.
-			 * Deserialize and run the combine through the regular
-			 * transition bridge; the by-value fast paths do not apply.
-			 */
-			advance_combine_row(agg, pertrans, pergroup, transno,
-								state->values[transno][0],
-								state->nulls[transno][0]);
-			continue;
-		}
-		if (pertrans->numSortCols == 0 &&
-			advance_byval_fast(state, pergroup, transno, row))
-			continue;
-		if (pertrans->numSortCols > 0)
-		{
-			Assert(agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_SORTED);
-			if (nargs == 1)
-				tuplesort_putdatum(pertrans->sortstates[agg->current_set],
-								   state->values[transno][0],
-								   state->nulls[transno][0]);
-			else
+			int			nargs = pertrans->numInputs;
+			int			argno;
+
+			/* eval_arguments() stashed the root arrays: read rows inline */
+			if (trans_filters[transno] != NULL)
 			{
-				TupleTableSlot *sortslot = pertrans->sortslot;
-
-				ExecClearTuple(sortslot);
-				for (argno = 0; argno < nargs; argno++)
-				{
-					sortslot->tts_values[argno] = state->values[transno][argno];
-					sortslot->tts_isnull[argno] = state->nulls[transno][argno];
-				}
-				sortslot->tts_nvalid = nargs;
-				ExecStoreVirtualTuple(sortslot);
-				tuplesort_puttupleslot(pertrans->sortstates[agg->current_set], sortslot);
+				if ((trans_filter_nulls[transno][row / 64] >> (row % 64)) & 1 ||
+					!DatumGetBool(trans_filter_values[transno][row]))
+					continue;
 			}
+			for (argno = 0; argno < nargs; argno++)
+			{
+				trans_values[transno][argno] =
+					trans_arg_values[transno][argno][row];
+				trans_nulls[transno][argno] =
+					(trans_arg_nulls[transno][argno][row / 64] >> (row % 64)) & 1;
+			}
+			if (is_combine)
+			{
+				/*
+				 * A combine transition: the input column carries the
+				 * (optionally serialized) partial state from below.
+				 * Deserialize and run the combine through the regular
+				 * transition bridge; the by-value fast paths do not apply.
+				 */
+				advance_combine_row(agg, pertrans, pergroup,
+									transno,
+									trans_values[transno][0],
+									trans_nulls[transno][0]);
+				continue;
+			}
+			if (pertrans->numSortCols == 0 &&
+				advance_byval_fast(state, pergroup, transno, row))
+				continue;
+			if (pertrans->numSortCols > 0)
+			{
+				Assert(agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_SORTED);
+				if (nargs == 1)
+					tuplesort_putdatum(pertrans->sortstates[agg->current_set],
+									   trans_values[transno][0],
+									   trans_nulls[transno][0]);
+				else
+				{
+					TupleTableSlot *sortslot = pertrans->sortslot;
+
+					ExecClearTuple(sortslot);
+					for (argno = 0; argno < nargs; argno++)
+					{
+						sortslot->tts_values[argno] = trans_values[transno][argno];
+						sortslot->tts_isnull[argno] = trans_nulls[transno][argno];
+					}
+					sortslot->tts_nvalid = nargs;
+					ExecStoreVirtualTuple(sortslot);
+					tuplesort_puttupleslot(pertrans->sortstates[agg->current_set], sortslot);
+				}
+			}
+			else
+				VectorAggAdvanceTransition(agg, pergroup, transno,
+										   trans_values[transno], trans_nulls[transno]);
 		}
-		else
-			VectorAggAdvanceTransition(agg, pergroup, transno,
-									   state->values[transno], state->nulls[transno]);
 	}
 }
 

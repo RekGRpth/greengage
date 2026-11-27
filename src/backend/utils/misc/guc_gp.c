@@ -4471,7 +4471,7 @@ struct config_real ConfigureNamesReal_gp[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&gp_vectorized_chain_max_growth,
-		1e-6, 0.0, 1e6,
+		0.0, 0.0, 1e6,
 		NULL, NULL, NULL
 	},
 

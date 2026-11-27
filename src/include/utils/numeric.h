@@ -105,7 +105,7 @@ typedef struct NumericAggState
 	 * folded into sumX before sumX is read or modified elsewhere.
 	 */
 	bool		fast_valid;		/* is the window holding pending inputs? */
-	int			fast_dscale;	/* display dscale of the window's inputs */
+	int			fast_scale;		/* exact scale the window's mantissas align to */
 	int128		fast_sum;		/* sum of the window's scale-aligned mantissas */
 #endif
 } NumericAggState;
@@ -150,7 +150,58 @@ extern Numeric numeric_li_value(float8 f, Numeric y0, Numeric y1);
 extern void do_numeric_accum(NumericAggState *state, Numeric newval);
 extern void do_numeric_accum_datum(NumericAggState *state, Datum newval);
 extern void do_numeric_accum_fast(NumericAggState *state, int64 mantissa,
-								  int dscale);
+								  int scale, int dscale);
+
+#ifdef HAVE_INT128
+/*
+ * The hot int128 accumulation window step: N and maxScale bookkeeping plus
+ * one checked add, all inline so an aggregate over decoded numerics costs
+ * no call per row.  Returns false when the out-of-line
+ * do_numeric_accum_fast() must run: the first window input, a scale
+ * change, an int128 overflow, or (without the guard below matching) never
+ * on this build.  On false the state is untouched apart from the
+ * bookkeeping, which the slow path does not repeat.
+ */
+static inline bool
+numeric_agg_fast_window_add(NumericAggState *state, int64 mantissa,
+							int scale, int dscale)
+{
+	int64		aligned = mantissa;
+	int			pad = (4 - scale % 4) % 4;
+	int128		new_sum;
+
+	state->N++;
+	if (dscale > state->maxScale)
+	{
+		state->maxScale = dscale;
+		state->maxScaleCount = 1;
+	}
+	else if (dscale == state->maxScale)
+		state->maxScaleCount++;
+
+	while (pad > 0)
+	{
+		aligned *= 10;
+		pad--;
+	}
+
+	if (state->fast_valid && state->fast_scale == scale &&
+		!__builtin_add_overflow(state->fast_sum, (int128) aligned,
+								&new_sum))
+	{
+		state->fast_sum = new_sum;
+		return true;
+	}
+	return false;
+}
+#else
+static inline bool
+numeric_agg_fast_window_add(NumericAggState *state, int64 mantissa,
+							int scale, int dscale)
+{
+	return false;
+}
+#endif
 extern bool numeric_decode_fast_datum(Datum value, int64 *mantissa,
 									  int *scale, int *dscale);
 extern int cmp_numeric_datums(Datum num1, Datum num2);
