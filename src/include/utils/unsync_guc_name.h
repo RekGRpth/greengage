@@ -256,6 +256,7 @@
 		"gp_vmem_protect_segworker_cache_limit",
 		"gp_vectorized_execution",
 		"gp_vectorized_cost_margin",
+		"gp_vectorized_chain_max_growth",
 		"gp_vectorized_cost_op_factor",
 		"gp_vectorized_explain_decisions",
 		"gp_vectorized_min_rows",

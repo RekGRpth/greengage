@@ -259,6 +259,7 @@ int			gp_vectorized_execution = GP_VECTORIZED_EXECUTION_FORCE;
 int			gp_vectorized_min_rows = 10000;
 double		gp_vectorized_cost_op_factor = 0.25;
 double		gp_vectorized_cost_margin = 0.25;
+double		gp_vectorized_chain_max_growth = 0.0;
 bool		gp_vectorized_explain_decisions = false;
 
 /* Optimizer related gucs */
@@ -4460,6 +4461,17 @@ struct config_real ConfigureNamesReal_gp[] =
 		},
 		&gp_vectorized_cost_margin,
 		0.25, 0.0, 10.0,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"gp_vectorized_chain_max_growth", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Declines a join chain region wrap whose join multiplies the batched row count beyond this factor; zero disables the check."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_vectorized_chain_max_growth,
+		1e-6, 0.0, 1e6,
 		NULL, NULL, NULL
 	},
 

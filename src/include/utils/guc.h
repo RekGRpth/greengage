@@ -418,6 +418,7 @@ extern int	gp_vectorized_execution;
 extern int	gp_vectorized_min_rows;
 extern double gp_vectorized_cost_op_factor;
 extern double gp_vectorized_cost_margin;
+extern double gp_vectorized_chain_max_growth;
 extern bool gp_vectorized_explain_decisions;
 
 /* Optimizer related gucs */
