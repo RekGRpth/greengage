@@ -1694,8 +1694,15 @@ build_step(Expr *expr, VectorBatch *batch, const VectorExprVarMap *vars,
 				step->u.subscript.nlower = nlower;
 				step->u.subscript.upperprovided = palloc0(sizeof(bool) * Max(nupper, 1));
 				step->u.subscript.lowerprovided = palloc0(sizeof(bool) * Max(nlower, 1));
-				step->u.subscript.upperindex = palloc0(sizeof(int) * Max(nupper, 1));
-				step->u.subscript.lowerindex = palloc0(sizeof(int) * Max(nlower, 1));
+				/*
+				 * array_get_slice fills the missing subscript positions up
+				 * to the array's own ndim, which can exceed the number of
+				 * bracket groups (a one-group slice of a two-dimensional
+				 * column): size the index buffers for any array, exactly
+				 * like the standard executor's ARRAY_MAXDIM stacks.
+				 */
+				step->u.subscript.upperindex = palloc0(sizeof(int) * MAXDIM);
+				step->u.subscript.lowerindex = palloc0(sizeof(int) * MAXDIM);
 				step->args[0] = build_step(sr->refexpr, batch, vars, case_test);
 				if (step->args[0] == NULL)
 					return NULL;
