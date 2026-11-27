@@ -4757,6 +4757,13 @@ defer_arith_children(VectorExprStep *step, int capacity, MemoryContext context)
 {
 	int			i;
 
+	/*
+	 * Optional argument slots stay NULL - a SubscriptingRef leaves a hole
+	 * for every omitted slice bound - and the eval loop skips them the
+	 * same way.
+	 */
+	if (step == NULL)
+		return;
 	if (step_is_numeric_arith(step))
 	{
 		for (i = 0; i < step->nargs; i++)

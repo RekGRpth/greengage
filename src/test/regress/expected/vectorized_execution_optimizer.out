@@ -5231,3 +5231,44 @@ RESET optimizer_enable_mergejoin;
 RESET gp_vectorized_execution;
 DROP TABLE vector_fj_l;
 DROP TABLE vector_fj_r;
+-- ---- Array slices with omitted bounds over a wrapped scan ----
+-- The deferred-numeric walker recursed into every step argument
+-- unchecked, while a SubscriptingRef leaves a NULL argument hole for
+-- each omitted slice bound: a slice projection over a wrapped scan
+-- segfaulted the coordinator while the region initialized its
+-- projection (the constant-array slices above pass every bound and
+-- never hit the hole).  Randomly distributed so the plain-scan
+-- region wraps the projection; ORDER BY keeps the output stable.
+-- The second row's arrays carry non-default lower bounds, so the
+-- sliced results pin the bound preservation too.
+CREATE TABLE vector_slice_lb (k int, a int2[], b int2[][])
+  DISTRIBUTED RANDOMLY;
+INSERT INTO vector_slice_lb
+VALUES (1, '{1,2,3,4,5}', '{{1,2,3}, {4,5,6}, {7,8,9}}'),
+       (2, '[0:4]={1,2,3,4,5}', '[0:2][0:2]={{1,2,3}, {4,5,6}, {7,8,9}}');
+SET gp_vectorized_execution = force;
+SELECT k, a[:3] AS head3, b[:2][:2] AS corner FROM vector_slice_lb
+ORDER BY k;
+ k |   head3   |          corner           
+---+-----------+---------------------------
+ 1 | {1,2,3}   | {{1,2},{4,5}}
+ 2 | {1,2,3,4} | {{1,2,3},{4,5,6},{7,8,9}}
+(2 rows)
+
+SELECT k, a[2:] AS tail, b[2:][2:] AS inner FROM vector_slice_lb
+ORDER BY k;
+ k |   tail    |     inner     
+---+-----------+---------------
+ 1 | {2,3,4,5} | {{5,6},{8,9}}
+ 2 | {3,4,5}   | {{9}}
+(2 rows)
+
+SELECT k, a[:] AS whole, b[:] AS bwhole FROM vector_slice_lb ORDER BY k;
+ k |    whole    |          bwhole           
+---+-------------+---------------------------
+ 1 | {1,2,3,4,5} | {{1,2,3},{4,5,6},{7,8,9}}
+ 2 | {1,2,3,4,5} | {{1,2,3},{4,5,6},{7,8,9}}
+(2 rows)
+
+RESET gp_vectorized_execution;
+DROP TABLE vector_slice_lb;
