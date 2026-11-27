@@ -105,7 +105,7 @@ typedef struct NumericAggState
 	 * folded into sumX before sumX is read or modified elsewhere.
 	 */
 	bool		fast_valid;		/* is the window holding pending inputs? */
-	int			fast_dscale;	/* display dscale of the window's inputs */
+	int			fast_scale;		/* exact scale the window's mantissas align to */
 	int128		fast_sum;		/* sum of the window's scale-aligned mantissas */
 #endif
 } NumericAggState;
@@ -150,7 +150,7 @@ extern Numeric numeric_li_value(float8 f, Numeric y0, Numeric y1);
 extern void do_numeric_accum(NumericAggState *state, Numeric newval);
 extern void do_numeric_accum_datum(NumericAggState *state, Datum newval);
 extern void do_numeric_accum_fast(NumericAggState *state, int64 mantissa,
-								  int dscale);
+								  int scale, int dscale);
 extern bool numeric_decode_fast_datum(Datum value, int64 *mantissa,
 									  int *scale, int *dscale);
 extern int cmp_numeric_datums(Datum num1, Datum num2);

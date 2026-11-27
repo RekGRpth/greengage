@@ -1528,6 +1528,9 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 			MemoryContext oldcontext;
 			bool		calcSumX2 = pertrans->aggref->aggfnoid != VEC_AGG_AVG_NUMERIC &&
 				pertrans->aggref->aggfnoid != VEC_AGG_SUM_NUMERIC;
+			int64		mant;
+			int			scale;
+			int			dscale;
 
 			if (pergroupstate->transValueIsNull)
 			{
@@ -1543,14 +1546,11 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				aggstate = (NumericAggState *) DatumGetPointer(pergroupstate->transValue);
 			if (!calcSumX2 && state->deferred[transno])
 			{
-				int64		mant;
-				int			dscale;
-
 				if (VectorExprGetDeferredNumeric(state->args[transno][0], row,
 												 &mant, &dscale))
 				{
 					/* no tmpcontext allocations on this path */
-					do_numeric_accum_fast(aggstate, mant, dscale);
+					do_numeric_accum_fast(aggstate, mant, dscale, dscale);
 					return true;
 				}
 				/* the row used the generic build/fmgr path: read its datum */
@@ -1562,8 +1562,21 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 								 DatumGetNumeric(DirectFunctionCall1(int8_numeric,
 																	 value)));
 			else
-				/* decodes inline varlenas without a detoast copy */
-				do_numeric_accum_datum(aggstate, value);
+			{
+				/*
+				 * The row skipped the deferred decode (a generic
+				 * build/fmgr row, or an expression the evaluator cannot
+				 * defer).  An exact int64 mantissa still feeds the
+				 * int128 window at its exact scale; wide or NaN values
+				 * fall back to the detoast-free datum path.
+				 */
+				if (numeric_decode_fast_datum(value, &mant, &scale,
+											  &dscale))
+					do_numeric_accum_fast(aggstate, mant, scale, dscale);
+				else
+					/* decodes inline varlenas without a detoast copy */
+					do_numeric_accum_datum(aggstate, value);
+			}
 			MemoryContextSwitchTo(oldcontext);
 			return true;
 		}
