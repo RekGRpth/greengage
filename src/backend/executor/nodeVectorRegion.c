@@ -1519,13 +1519,13 @@ VectorRegionProbeBatches(VectorRegionState *state)
 	if (state->explain_only)
 		return false;
 	/*
-	 * A fast-table aggregate hands its groups out batch-wise: the probe
-	 * feed of a parent region stays batched end to end.  Wide-keyed or
-	 * streaming aggregates stay declined (their slot-machinery path
-	 * never beats the row executor).
+	 * A hashed (non-sorted) aggregate hands its groups out batch-wise
+	 * through VectorAggNext's projection: the probe feed of a parent
+	 * region stays batched end to end.  Sorted aggregates drive their
+	 * sorted input row by row and stay declined.
 	 */
 	if (state->agg != NULL && state->vagg != NULL &&
-		VectorAggFastTableActive(state->vagg))
+		state->agg->aggstrategy != AGG_SORTED)
 		return true;
 	/*
 	 * An aggregate or sort consumes the join batches and outputs rows: the
@@ -2504,7 +2504,7 @@ VectorRegionPullOutputBatch(PlanState *ps, VectorBatch **batch)
 	 */
 	if (state->agg != NULL)
 	{
-		if (VectorAggFastTableActive(state->vagg))
+		if (state->agg->aggstrategy != AGG_SORTED)
 			return VectorRegionAggOutputBatch(state, batch);
 		return false;
 	}
