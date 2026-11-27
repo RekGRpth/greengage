@@ -4035,12 +4035,15 @@ do_numeric_accum_var(NumericAggState *state, NumericVar *X)
  * With int128 support, consecutive inputs sharing one scale are summed
  * into state->fast_sum as padding-aligned int64 mantissas instead of
  * entering the base-10000 digit accumulator, so each input costs a single
- * integer add.  The window keeps exact arithmetic: on a scale change or
- * an int128 overflow it is folded into sumX via accum_sum_add() and the
- * current input starts a new window.  N and the maxScale bookkeeping are
- * maintained here, because windowed inputs never reach
- * do_numeric_accum_var().  Every sumX reader folds the window in first
- * (see numeric_agg_flush_fast()).
+ * integer add.  The hot window hit runs inline through
+ * numeric_agg_fast_window_add(); this out-of-line function is the slow
+ * half only - the window is opened here, and folded into sumX via
+ * accum_sum_add() on a scale change or an int128 overflow, after which
+ * the current input starts a new window.  N and the maxScale bookkeeping
+ * are done by the inline half (this function is only called after it
+ * returned false, and does not repeat them), because windowed inputs
+ * never reach do_numeric_accum_var().  Every sumX reader folds the window
+ * in first (see numeric_agg_flush_fast()).
  */
 void
 do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int scale,
@@ -4051,15 +4054,6 @@ do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int scale,
 #ifdef HAVE_INT128
 	int64		aligned = mantissa;
 	int128		new_sum;
-
-	state->N++;
-	if (dscale > state->maxScale)
-	{
-		state->maxScale = dscale;
-		state->maxScaleCount = 1;
-	}
-	else if (dscale == state->maxScale)
-		state->maxScaleCount++;
 
 	while (pad > 0)
 	{

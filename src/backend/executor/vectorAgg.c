@@ -1550,7 +1550,10 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 												 &mant, &dscale))
 				{
 					/* no tmpcontext allocations on this path */
-					do_numeric_accum_fast(aggstate, mant, dscale, dscale);
+					if (!numeric_agg_fast_window_add(aggstate, mant, dscale,
+													 dscale))
+						do_numeric_accum_fast(aggstate, mant, dscale,
+											  dscale);
 					return true;
 				}
 				/* the row used the generic build/fmgr path: read its datum */
@@ -1572,7 +1575,12 @@ advance_byval_fast(VectorAggState *state, AggStatePerGroup pergroup,
 				 */
 				if (numeric_decode_fast_datum(value, &mant, &scale,
 											  &dscale))
-					do_numeric_accum_fast(aggstate, mant, scale, dscale);
+				{
+					if (!numeric_agg_fast_window_add(aggstate, mant, scale,
+													 dscale))
+						do_numeric_accum_fast(aggstate, mant, scale,
+											  dscale);
+				}
 				else
 					/* decodes inline varlenas without a detoast copy */
 					do_numeric_accum_datum(aggstate, value);
