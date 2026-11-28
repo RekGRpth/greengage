@@ -462,33 +462,95 @@ leaf_has_expensive_byref(VectorizeContext *ctx, Plan *leaf)
  * wait on each other in a circle the row executor's per-row pacing avoids.
  * Subtree candidates carrying one stay row-wise.
  */
+typedef struct
+{
+	bool		has_subplan;	/* a SubPlan expression in the subtree */
+	bool		has_motion;		/* a Motion plan node in the subtree */
+} RegionSubplanContext;
+
+/*
+ * SubPlan expressions are visited as nodes, but their plan trees are not
+ * descended into: a Motion found anywhere else in the region subtree is
+ * one the region's own execution interleaves with the subplan reads.
+ */
 static bool
-region_subtree_has_subplan_walker(Node *node, void *context)
+region_subplan_walk_expr(Node *node, RegionSubplanContext *ctx)
 {
 	if (node == NULL)
 		return false;
-
-	/*
-	 * The SubPlan node itself is the marker: plan_tree_walker descends into
-	 * its plan tree too, but finding the node is enough.
-	 */
 	if (IsA(node, SubPlan))
 	{
-		*((bool *) context) = true;
+		ctx->has_subplan = true;
 		return true;
 	}
-
-	return plan_tree_walker(node, region_subtree_has_subplan_walker,
-							context, true);
+	return expression_tree_walker(node, region_subplan_walk_expr, ctx);
 }
 
 static bool
-region_subtree_has_subplan(Plan *plan)
+region_subplan_walk_expr_list(List *exprs, RegionSubplanContext *ctx)
 {
-	bool		found = false;
+	ListCell   *lc;
 
-	(void) region_subtree_has_subplan_walker((Node *) plan, &found);
-	return found;
+	foreach(lc, exprs)
+	{
+		if (region_subplan_walk_expr((Node *) lfirst(lc), ctx))
+			return true;
+	}
+	return false;
+}
+
+static bool
+region_subplan_walk_plan(Plan *plan, RegionSubplanContext *ctx)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, Motion))
+	{
+		ctx->has_motion = true;
+	}
+	else
+	{
+		if (plan->initPlan != NIL &&
+			region_subplan_walk_expr_list(plan->initPlan, ctx))
+			return true;
+		if (plan->qual != NIL &&
+			region_subplan_walk_expr_list(plan->qual, ctx))
+			return true;
+		if (plan->targetlist != NIL &&
+			region_subplan_walk_expr_list(plan->targetlist, ctx))
+			return true;
+	}
+
+	if (IsA(plan, CustomScan))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((CustomScan *) plan)->custom_plans)
+		{
+			if (region_subplan_walk_plan((Plan *) lfirst(lc), ctx))
+				return true;
+		}
+		return false;
+	}
+
+	if (region_subplan_walk_plan(plan->lefttree, ctx))
+		return true;
+	return region_subplan_walk_plan(plan->righttree, ctx);
+}
+
+/*
+ * The gang-deadlock combination: a SubPlan the region evaluates between
+ * its input motions, plus those input motions themselves.  Either alone
+ * is safe.
+ */
+static bool
+region_subtree_has_subplan_and_motion(Plan *plan)
+{
+	RegionSubplanContext ctx = {false, false};
+
+	(void) region_subplan_walk_plan(plan, &ctx);
+	return ctx.has_subplan && ctx.has_motion;
 }
 
 static bool
@@ -498,7 +560,7 @@ auto_allowed(VectorizeContext *ctx, Plan *plan)
 	double		vector_cost;
 	double		quota;
 
-	if (region_subtree_has_subplan(plan))
+	if (region_subtree_has_subplan_and_motion(plan))
 	{
 		decision(ctx, plan, "the subtree carries a SubPlan whose motion "
 				 "can gang-deadlock the region");
