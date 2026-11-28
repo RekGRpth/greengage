@@ -272,6 +272,22 @@ reset enable_hashjoin; reset optimizer_enable_hashjoin;
 reset enable_nestloop; reset optimizer_enable_nljoin;
 reset enable_mergejoin; reset optimizer_enable_mergejoin;
 
+
+-- The same deadlock-prone join under the vectorized executor: its region
+-- wrap used to gang-deadlock the interconnect (the subplan's broadcast
+-- readers and the input motion sender waiting on each other in a circle).
+-- The vectorizer declines regions for subplan-carrying subtrees, so the
+-- query must run row-wise and complete.
+set gp_vectorized_execution = force;
+
+select count(1)
+from
+  t_motion_deadlock_1 x join t_motion_deadlock_2 y
+  on x.b = y.a and
+     x.b + y.a > (select count(1) from t_motion_deadlock_3 z where z.b < x.a + y.b);
+
+reset gp_vectorized_execution;
+
 drop table t_motion_deadlock_1;
 drop table t_motion_deadlock_2;
 drop table t_motion_deadlock_3;
@@ -301,6 +317,8 @@ update mv_15719 set a = 6;
 drop view mv_15719 cascade;
 
 ------------
+
+
 reset gp_interconnect_queue_depth;
 reset gp_interconnect_snd_queue_depth;
 reset gp_autostats_mode;

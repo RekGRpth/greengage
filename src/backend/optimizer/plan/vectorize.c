@@ -454,12 +454,56 @@ leaf_has_expensive_byref(VectorizeContext *ctx, Plan *leaf)
 		get_rel_am(rte->relid) != AO_COLUMN_TABLE_AM_OID;
 }
 
+/*
+ * A SubPlan in a covered subtree owns a plan slice of its own (a correlated
+ * count's broadcast input, for example).  The region evaluates such a
+ * subplan between its input motions, and with a shallow interconnect queue
+ * the subplan's motion readers and the region's input motion senders can
+ * wait on each other in a circle the row executor's per-row pacing avoids.
+ * Subtree candidates carrying one stay row-wise.
+ */
+static bool
+region_subtree_has_subplan_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	/*
+	 * The SubPlan node itself is the marker: plan_tree_walker descends into
+	 * its plan tree too, but finding the node is enough.
+	 */
+	if (IsA(node, SubPlan))
+	{
+		*((bool *) context) = true;
+		return true;
+	}
+
+	return plan_tree_walker(node, region_subtree_has_subplan_walker,
+							context, true);
+}
+
+static bool
+region_subtree_has_subplan(Plan *plan)
+{
+	bool		found = false;
+
+	(void) region_subtree_has_subplan_walker((Node *) plan, &found);
+	return found;
+}
+
 static bool
 auto_allowed(VectorizeContext *ctx, Plan *plan)
 {
 	double		pg_cost;
 	double		vector_cost;
 	double		quota;
+
+	if (region_subtree_has_subplan(plan))
+	{
+		decision(ctx, plan, "the subtree carries a SubPlan whose motion "
+				 "can gang-deadlock the region");
+		return false;
+	}
 
 	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_FORCE)
 		return true;
