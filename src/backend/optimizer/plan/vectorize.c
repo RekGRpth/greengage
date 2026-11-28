@@ -478,6 +478,7 @@ region_subplan_walk_expr(Node *node, RegionSubplanContext *ctx)
 {
 	if (node == NULL)
 		return false;
+	elog(DEBUG1, "walk_expr: %d", (int) nodeTag(node));
 	if (IsA(node, SubPlan))
 	{
 		ctx->has_subplan = true;
@@ -486,40 +487,37 @@ region_subplan_walk_expr(Node *node, RegionSubplanContext *ctx)
 	return expression_tree_walker(node, region_subplan_walk_expr, ctx);
 }
 
-static bool
+static void
 region_subplan_walk_expr_list(List *exprs, RegionSubplanContext *ctx)
 {
 	ListCell   *lc;
 
 	foreach(lc, exprs)
-	{
-		if (region_subplan_walk_expr((Node *) lfirst(lc), ctx))
-			return true;
-	}
-	return false;
+		region_subplan_walk_expr((Node *) lfirst(lc), ctx);
 }
 
-static bool
+/*
+ * Motion nodes mark the region's inter-slice inputs: the gang-deadlock
+ * combination needs one of those PLUS a SubPlan (whose own slice's
+ * broadcast the region reads between input pulls), so both are collected
+ * over the whole subtree - an early exit would miss the second marker.
+ */
+static void
 region_subplan_walk_plan(Plan *plan, RegionSubplanContext *ctx)
 {
 	if (plan == NULL)
-		return false;
+		return;
+
+	elog(DEBUG1, "walk_plan: %s initPlan=%d qual=%d left=%d right=%d custom=%d",
+		 plan_node_name(plan),
+		 plan->initPlan != NIL, plan->qual != NIL,
+		 plan->lefttree != NULL, plan->righttree != NULL,
+		 IsA(plan, CustomScan));
 
 	if (IsA(plan, Motion))
 	{
 		ctx->has_motion = true;
-	}
-	else
-	{
-		if (plan->initPlan != NIL &&
-			region_subplan_walk_expr_list(plan->initPlan, ctx))
-			return true;
-		if (plan->qual != NIL &&
-			region_subplan_walk_expr_list(plan->qual, ctx))
-			return true;
-		if (plan->targetlist != NIL &&
-			region_subplan_walk_expr_list(plan->targetlist, ctx))
-			return true;
+		return;
 	}
 
 	if (IsA(plan, CustomScan))
@@ -527,16 +525,19 @@ region_subplan_walk_plan(Plan *plan, RegionSubplanContext *ctx)
 		ListCell   *lc;
 
 		foreach(lc, ((CustomScan *) plan)->custom_plans)
-		{
-			if (region_subplan_walk_plan((Plan *) lfirst(lc), ctx))
-				return true;
-		}
-		return false;
+			region_subplan_walk_plan((Plan *) lfirst(lc), ctx);
+		return;
 	}
 
-	if (region_subplan_walk_plan(plan->lefttree, ctx))
-		return true;
-	return region_subplan_walk_plan(plan->righttree, ctx);
+	if (plan->initPlan != NIL)
+		region_subplan_walk_expr_list(plan->initPlan, ctx);
+	if (plan->qual != NIL)
+		region_subplan_walk_expr_list(plan->qual, ctx);
+	if (plan->targetlist != NIL)
+		region_subplan_walk_expr_list(plan->targetlist, ctx);
+
+	region_subplan_walk_plan(plan->lefttree, ctx);
+	region_subplan_walk_plan(plan->righttree, ctx);
 }
 
 /*
@@ -549,7 +550,10 @@ region_subtree_has_subplan_and_motion(Plan *plan)
 {
 	RegionSubplanContext ctx = {false, false};
 
-	(void) region_subplan_walk_plan(plan, &ctx);
+	region_subplan_walk_plan(plan, &ctx);
+	if (ctx.has_subplan || ctx.has_motion)
+		elog(DEBUG1, "vectorize gate debug: %s has_subplan=%d has_motion=%d",
+			 plan_node_name(plan), ctx.has_subplan, ctx.has_motion);
 	return ctx.has_subplan && ctx.has_motion;
 }
 
