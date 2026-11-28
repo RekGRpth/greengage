@@ -98,6 +98,7 @@
 #include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeMergejoin.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1777,4 +1778,40 @@ ExecReScanMergeJoin(MergeJoinState *node)
 	if (node->js.ps.righttree->chgParam == NULL)
 		ExecReScan(node->js.ps.righttree);
 
+}
+
+bool
+VectorMergeJoinPlanIsSupported(MergeJoin *node)
+{
+	if (node->mergeclauses == NIL || node->join.plan.initPlan != NIL ||
+		node->join.plan.extParam != NULL || node->join.plan.allParam != NULL)
+		return false;
+	switch (node->join.jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_RIGHT:
+		case JOIN_FULL:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+			return true;
+		default:
+			return false;
+	}
+}
+
+TupleTableSlot *
+VectorMergeJoinNext(MergeJoinState *node)
+{
+	Instrumentation *instr = node->js.ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the mergejoin directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
+	result = ExecMergeJoin((PlanState *) node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(result) ? 0 : 1);
+	return result;
 }

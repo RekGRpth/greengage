@@ -548,3 +548,34 @@ ExecSquelchMaterial(MaterialState *node)
 		ExecSquelchNode(outerPlanState(node));
 	}
 }
+
+bool
+VectorMaterialPlanIsSupported(Material *node)
+{
+	return node->plan.qual == NIL && node->plan.initPlan == NIL &&
+		node->plan.extParam == NULL && node->plan.allParam == NULL;
+}
+
+TupleTableSlot *
+VectorMaterialNext(MaterialState *node, PlanState *outer_proxy,
+				   PlanState *outer_original)
+{
+	Instrumentation *instr = node->ss.ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the material directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
+	result = ExecMaterial((PlanState *) node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(result) ? 0 : 1);
+
+	if (TupIsNull(result))
+	{
+		outerPlanState(node) = outer_original;
+		ExecSquelchMaterial(node);
+		outerPlanState(node) = outer_proxy;
+	}
+	return result;
+}

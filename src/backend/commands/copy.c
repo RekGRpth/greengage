@@ -86,6 +86,10 @@
 #include "utils/resscheduler.h"
 #include "utils/string_utils.h"
 #include "partitioning/partdesc.h"
+#include "executor/vectorBatch.h"
+#include "utils/date.h"
+#include "utils/datetime.h"
+#include "utils/numeric.h"
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
@@ -99,6 +103,39 @@ typedef enum CopyInsertMethod
 	CIM_MULTI,					/* always use table_multi_insert */
 	CIM_MULTI_CONDITIONAL		/* use table_multi_insert only if valid */
 } CopyInsertMethod;
+
+/*
+ * Per-column formatter dispatch for the vectorized COPY TO path (see
+ * CopyToBatchGate).  Columns without a fast kernel stay on the regular
+ * output-function path; the output is byte-identical either way.
+ */
+typedef enum CopyBatchColumnKind
+{
+	COPY_BATCH_FMGR,			/* generic output function call */
+	COPY_BATCH_INT2,
+	COPY_BATCH_INT4,
+	COPY_BATCH_INT8,
+	COPY_BATCH_BOOL,
+	COPY_BATCH_DATE,			/* ISO DateStyle only */
+	COPY_BATCH_NUMERIC,
+	COPY_BATCH_TEXT				/* text/bpchar/varchar raw bytes */
+} CopyBatchColumnKind;
+
+/*
+ * Per-column input dispatch for the vectorized COPY FROM fast parse path
+ * (stored as ints in CopyStateData.fast_kinds to keep copy.h lean).
+ */
+typedef enum CopyFastKind
+{
+	COPY_FAST_FMGR,				/* regular input function on a C string */
+	COPY_FAST_INT2,
+	COPY_FAST_INT4,
+	COPY_FAST_INT8,
+	COPY_FAST_BOOL,
+	COPY_FAST_DATE,				/* canonical YYYY-MM-DD only */
+	COPY_FAST_NUMERIC,			/* plain integer text only */
+	COPY_FAST_TEXT				/* raw bytes into a varlena */
+} CopyFastKind;
 
 /*
  * No more than this many tuples per CopyMultiInsertBuffer
@@ -228,6 +265,11 @@ static uint64 CopyTo(CopyState cstate);
 static uint64 CopyDispatchOnSegment(CopyState cstate, const CopyStmt *stmt);
 static uint64 CopyToQueryOnSegment(CopyState cstate);
 static bool CopyReadLine(CopyState cstate);
+static void CopyDispatchSendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg);
+static void CopyDispatchFlushBatches(CopyState cstate, CdbCopy *cdbCopy);
+static void CopyDispatchAppendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg);
+static bool CopyFromFastGate(CopyState cstate);
+static int *CopyFromFastAssignKinds(CopyState cstate, TupleDesc tupDesc);
 static bool CopyReadLineText(CopyState cstate);
 static int	CopyReadAttributesText(CopyState cstate, int stop_processing_at_field);
 static int	CopyReadAttributesCSV(CopyState cstate, int stop_processing_at_field);
@@ -3015,6 +3057,638 @@ CopyToQueryOnSegment(CopyState cstate)
 }
 
 /*
+ * Sign-aware integer-to-string helpers that return the digit length, so the
+ * COPY TO fast path can emit values into the row buffer without a second
+ * strlen() pass (the plain pg_itoa/pg_ltoa/pg_lltoa are NUL-terminating).
+ */
+static inline int
+CopyItoa16(int16 v, char *a)
+{
+	if (v >= 0)
+		return pg_ultoa_n((uint32) v, a);
+	a[0] = '-';
+	return 1 + pg_ultoa_n((uint32) - (int32) v, a + 1);
+}
+
+static inline int
+CopyItoa32(int32 v, char *a)
+{
+	if (v >= 0)
+		return pg_ultoa_n((uint32) v, a);
+	a[0] = '-';
+	return 1 + pg_ultoa_n((uint32) - (int64) v, a + 1);
+}
+
+static inline int
+CopyItoa64(int64 v, char *a)
+{
+	if (v >= 0)
+		return pg_ulltoa_n((uint64) v, a);
+	a[0] = '-';
+	return 1 + pg_ulltoa_n((uint64) 0 - (uint64) v, a + 1);
+}
+
+/*
+ * CopyAttributeOutTextLen: same escaping as CopyAttributeOutText, but takes
+ * an explicit byte length instead of relying on NUL termination, so text
+ * values can be emitted straight out of the batch scan buffers without a
+ * detoast/copy.  Only the safe-encoding loop is implemented; callers must
+ * gate on cstate->encoding_embeds_ascii (see CopyToBatchGate).
+ */
+static void
+CopyAttributeOutTextLen(CopyState cstate, const char *ptr, int len)
+{
+	const char *start;
+	const char *end = ptr + len;
+	char		c;
+	char		delimc = cstate->delim[0];
+	char		escapec = cstate->escape[0];
+
+#define COPY_DUMPSOFAR() \
+	do { \
+		if (ptr > start) \
+			CopySendData(cstate, start, ptr - start); \
+	} while (0)
+
+	if (cstate->escape_off)
+	{
+		CopySendData(cstate, ptr, len);
+		return;
+	}
+
+	start = ptr;
+	while (ptr < end)
+	{
+		c = *ptr;
+		if ((unsigned char) c < (unsigned char) 0x20)
+		{
+			/*
+			 * \r and \n must be escaped, the others are traditional.  We
+			 * prefer to dump these using the C-like notation, rather than
+			 * a backslash and the literal character.
+			 */
+			switch (c)
+			{
+				case '\b':
+					c = 'b';
+					break;
+				case '\f':
+					c = 'f';
+					break;
+				case '\n':
+					c = 'n';
+					break;
+				case '\r':
+					c = 'r';
+					break;
+				case '\t':
+					c = 't';
+					break;
+				case '\v':
+					c = 'v';
+					break;
+				default:
+					/* If it's the delimiter, must backslash it */
+					if (c == delimc)
+						break;
+					/* All ASCII control chars are length 1 */
+					ptr++;
+					continue;	/* fall to end of loop */
+			}
+			/* if we get here, we need to convert the control char */
+			COPY_DUMPSOFAR();
+			CopySendChar(cstate, escapec);
+			CopySendChar(cstate, c);
+			start = ++ptr;		/* do not include char in next run */
+		}
+		else if (c == escapec || c == delimc)
+		{
+			COPY_DUMPSOFAR();
+			CopySendChar(cstate, escapec);
+			start = ptr++;		/* we include char in next run */
+		}
+		else
+			ptr++;
+	}
+
+	COPY_DUMPSOFAR();
+#undef COPY_DUMPSOFAR
+}
+
+/*
+ * CSV output for a length-delimited value: quotes it iff the value contains
+ * the delimiter, the quote, \n or \r, equals the null marker, is exactly
+ * "\." in a single-column copy, or force_quote is set; embedded quote and
+ * escape characters are escaped exactly like CopyAttributeOutCSV.  Only the
+ * safe-encoding case is implemented; callers gate on
+ * cstate->encoding_embeds_ascii.
+ */
+static void
+CopyAttributeOutCSVLeng(CopyState cstate, const char *ptr, int len,
+						bool force_quote, bool single_attr)
+{
+	char		delimc = cstate->delim[0];
+	char		quotec = cstate->quote[0];
+	char		escapec = cstate->escape[0];
+	bool		use_quote = force_quote;
+	const char *p;
+	const char *end = ptr + len;
+
+	if (!use_quote)
+	{
+		for (p = ptr; p < end; p++)
+		{
+			if (*p == delimc || *p == quotec || *p == '\n' || *p == '\r')
+			{
+				use_quote = true;
+				break;
+			}
+		}
+	}
+
+	if (!use_quote && len == cstate->null_print_len &&
+		memcmp(ptr, cstate->null_print, len) == 0)
+		use_quote = true;
+
+	if (!use_quote && single_attr && len == 2 && memcmp(ptr, "\\.", 2) == 0)
+		use_quote = true;
+
+	if (!use_quote)
+	{
+		CopySendData(cstate, ptr, len);
+		return;
+	}
+
+	CopySendChar(cstate, quotec);
+	for (p = ptr; p < end; p++)
+	{
+		char		c = *p;
+
+		if (c == quotec || c == escapec)
+			CopySendChar(cstate, escapec);
+		CopySendChar(cstate, c);
+	}
+	CopySendChar(cstate, quotec);
+}
+
+/*
+ * Returns true iff the COPY TO row loop can use the vectorized AOCS batch
+ * reader with the fast per-column formatters.  Anything unsupported keeps
+ * the plain row-by-row path; the output is byte-identical either way.
+ */
+static bool
+CopyToBatchGate(CopyState cstate, Relation rel)
+{
+	/* this is a perf feature enabled under gp_vectorized_execution */
+	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_OFF)
+		return false;
+
+	/* binary has its own framing; a missing quote option cannot be fast */
+	if (cstate->binary || cstate->quote == NULL)
+		return false;
+
+	/*
+	 * The text escaping kernel reads batch values in server encoding and
+	 * emits them in the same encoding, so the file encoding must be the
+	 * database encoding (cstate->need_transcoding is also set for multibyte
+	 * encodings where no conversion actually happens), and it must not be
+	 * an encoding in which ASCII bytes can appear inside multibyte
+	 * characters.
+	 */
+	if (cstate->file_encoding != GetDatabaseEncoding() ||
+		cstate->encoding_embeds_ascii)
+		return false;
+
+	/* the batch reader is implemented for AO column storage */
+	if (!RelationStorageIsAoCols(rel))
+		return false;
+
+	/* only the plain top-level relation; partitioned parents fall back */
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+		return false;
+
+	/* the batch reader needs at least one projected column */
+	if (cstate->attnumlist == NIL)
+		return false;
+
+	return true;
+}
+
+/*
+ * Assign the formatter kind for every copied column.  Types without a
+ * dedicated kernel stay on COPY_BATCH_FMGR; date columns require the ISO
+ * DateStyle since the fast kernel only emits that format.
+ */
+static CopyBatchColumnKind *
+CopyToBatchAssignKinds(CopyState cstate, TupleDesc tupDesc)
+{
+	CopyBatchColumnKind *kinds = palloc(tupDesc->natts * sizeof(CopyBatchColumnKind));
+	ListCell   *cur;
+
+	foreach(cur, cstate->attnumlist)
+	{
+		int			attnum = lfirst_int(cur);
+		Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
+		CopyBatchColumnKind kind = COPY_BATCH_FMGR;
+
+		switch (attr->atttypid)
+		{
+			case INT2OID:
+				kind = COPY_BATCH_INT2;
+				break;
+			case INT4OID:
+				kind = COPY_BATCH_INT4;
+				break;
+			case INT8OID:
+				kind = COPY_BATCH_INT8;
+				break;
+			case BOOLOID:
+				kind = COPY_BATCH_BOOL;
+				break;
+			case DATEOID:
+				if (DateStyle == USE_ISO_DATES)
+					kind = COPY_BATCH_DATE;
+				break;
+			case NUMERICOID:
+				kind = COPY_BATCH_NUMERIC;
+				break;
+			case TEXTOID:
+			case BPCHAROID:
+			case VARCHAROID:
+				kind = COPY_BATCH_TEXT;
+				break;
+			default:
+				break;
+		}
+		kinds[attnum - 1] = kind;
+	}
+	return kinds;
+}
+
+/*
+ * Flush the accumulated batch buffer of CopyBatchOneRowTo rows to the
+ * destination.  Only COPY_FILE and COPY_NEW_FE defer their per-row sends;
+ * for those destinations this replaces the per-row CopySendEndOfRow with
+ * one send per batch (the bytes are identical, only the chunking differs).
+ */
+static void
+CopyFlushBatch(CopyState cstate)
+{
+	StringInfo	fe_msgbuf = cstate->fe_msgbuf;
+
+	if (fe_msgbuf->len == 0)
+		return;
+
+	switch (cstate->copy_dest)
+	{
+		case COPY_FILE:
+			if (fwrite(fe_msgbuf->data, fe_msgbuf->len, 1,
+					   cstate->copy_file) != 1 ||
+				ferror(cstate->copy_file))
+			{
+				if (cstate->is_program)
+				{
+					if (errno == EPIPE)
+					{
+						/*
+						 * The pipe will be closed automatically on error at
+						 * the end of transaction, but we might get a better
+						 * error message from the subprocess' exit code than
+						 * just "Broken Pipe"
+						 */
+						close_program_pipes(cstate, true);
+
+						/*
+						 * If close_program_pipes() didn't throw an error,
+						 * the program terminated normally, but closed the
+						 * pipe first. Restore errno, and throw an error.
+						 */
+						errno = EPIPE;
+					}
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not write to COPY program: %m")));
+				}
+				else
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not write to COPY file: %m")));
+			}
+			break;
+		case COPY_NEW_FE:
+			(void) pq_putmessage('d', fe_msgbuf->data, fe_msgbuf->len);
+			break;
+		default:
+			/* nothing deferred for other destinations */
+			return;
+	}
+
+	/* Update the progress */
+	cstate->bytes_processed += fe_msgbuf->len;
+	pgstat_progress_update_param(PROGRESS_COPY_BYTES_PROCESSED,
+								 cstate->bytes_processed);
+
+	resetStringInfo(fe_msgbuf);
+}
+
+/*
+ * Emit one row of a VectorBatch during CopyTo.  Must produce byte-identical
+ * output to CopyOneRowTo; only the value access and the per-column
+ * formatting differ.  For COPY_FILE and COPY_NEW_FE the row is only
+ * accumulated (the newline included) and the caller flushes once per batch
+ * with CopyFlushBatch; other destinations send per row as before.
+ */
+static void
+CopyBatchOneRowTo(CopyState cstate, VectorBatch *batch, int row,
+				  const CopyBatchColumnKind *kinds)
+{
+	bool		need_delim = false;
+	bool		csv = cstate->csv_mode;
+	bool		single_attr = list_length(cstate->attnumlist) == 1;
+	ListCell   *cur;
+
+	foreach(cur, cstate->attnumlist)
+	{
+		int			attnum = lfirst_int(cur);
+		int			col = attnum - 1;
+		Datum		value = VectorBatchGetDatum(batch, col, row);
+		bool		isnull = VectorBatchIsNull(batch, col, row);
+		bool		force_quote = csv && cstate->force_quote_flags[attnum - 1];
+
+		if (need_delim)
+			CopySendChar(cstate, cstate->delim[0]);
+		need_delim = true;
+
+		if (isnull)
+		{
+			CopySendString(cstate, cstate->null_print_client);
+			continue;
+		}
+
+		switch (kinds[col])
+		{
+			case COPY_BATCH_INT2:
+				{
+					char		tmp[MAXINT8LEN + 1];
+					int			len = CopyItoa16(DatumGetInt16(value), tmp);
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_INT4:
+				{
+					char		tmp[MAXINT8LEN + 1];
+					int			len = CopyItoa32(DatumGetInt32(value), tmp);
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_INT8:
+				{
+					char		tmp[MAXINT8LEN + 1];
+					int			len = CopyItoa64(DatumGetInt64(value), tmp);
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_BOOL:
+				if (csv)
+				{
+					char		c = DatumGetBool(value) ? 't' : 'f';
+
+					CopyAttributeOutCSVLeng(cstate, &c, 1, force_quote,
+											single_attr);
+				}
+				else
+					CopySendChar(cstate, DatumGetBool(value) ? 't' : 'f');
+				break;
+			case COPY_BATCH_DATE:
+				{
+					DateADT		dt = DatumGetInt32(value);
+					char		tmp[MAXDATELEN + 1];
+					int			len;
+
+					if (DATE_NOT_FINITE(dt))
+					{
+						EncodeSpecialDate(dt, tmp);
+						len = strlen(tmp);
+					}
+					else
+					{
+						struct pg_tm tt,
+								   *tm = &tt;
+						char	   *p = tmp;
+
+						j2date(dt + POSTGRES_EPOCH_JDATE,
+							   &tm->tm_year, &tm->tm_mon, &tm->tm_mday);
+
+						/* same output as EncodeDateOnly with USE_ISO_DATES */
+						p = pg_ultostr_zeropad(p,
+											   (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
+						*p++ = '-';
+						p = pg_ultostr_zeropad(p, tm->tm_mon, 2);
+						*p++ = '-';
+						p = pg_ultostr_zeropad(p, tm->tm_mday, 2);
+						if (tm->tm_year <= 0)
+						{
+							memcpy(p, " BC", 3);	/* Don't copy NUL */
+							p += 3;
+						}
+						len = p - tmp;
+					}
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, tmp, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, tmp, len);
+					break;
+				}
+			case COPY_BATCH_NUMERIC:
+				{
+					int64		mant;
+					int			scale;
+					int			dscale;
+					bool		decoded = numeric_decode_fast_datum(value, &mant,
+																	&scale, &dscale);
+					char		nbuf[MAXINT8LEN + 4];
+					int			len = 0;
+
+					/*
+					 * nbuf must hold a sign, "0." and dscale digits (3 + dscale
+					 * bytes at most); leave the exotic display scales to the
+					 * exact fmgr output path below.
+					 */
+					if (dscale > MAXINT8LEN)
+						decoded = false;
+
+					/*
+					 * The decoded mantissa covers every decimal digit of the
+					 * base-10000 fold, which can be more precision than the
+					 * display scale carries; numeric_out cuts those digits
+					 * (always zeroes in a canonical numeric).  Align the
+					 * exponent to dscale the same way before rendering.
+					 */
+					if (decoded && scale > dscale)
+					{
+						int64		div = 1;
+						int			extra = scale - dscale;
+
+						for (int i = 0; i < extra; i++)
+						{
+							if (div > PG_INT64_MAX / 10)
+							{
+								decoded = false;
+								break;
+							}
+							div *= 10;
+						}
+						if (decoded)
+							mant = mant / div;	/* truncate toward zero */
+					}
+					else if (decoded && scale < dscale)
+					{
+						if (!numeric_scale_fast(&mant, scale, dscale))
+							decoded = false;
+					}
+
+					if (decoded)
+					{
+						char		tmp[MAXINT8LEN + 1];
+						int			tlen = CopyItoa64(mant, tmp);
+						bool		negative = (tmp[0] == '-');
+						int			digits = tlen - (negative ? 1 : 0);
+						const char *digitsp = tmp + (negative ? 1 : 0);
+
+						/*
+						 * The value is mantissa * 10^-dscale, printed with
+						 * exactly dscale digits after the decimal point, the
+						 * same representation numeric_out produces.
+						 */
+						if (dscale > 0)
+						{
+							if (digits > dscale)
+							{
+								int			ipart = tlen - dscale;
+
+								memcpy(nbuf, tmp, ipart);
+								nbuf[ipart] = '.';
+								memcpy(nbuf + ipart + 1, tmp + ipart, dscale);
+								len = ipart + 1 + dscale;
+							}
+							else
+							{
+								len = 0;
+								if (negative)
+									nbuf[len++] = '-';
+								nbuf[len++] = '0';
+								nbuf[len++] = '.';
+								for (int z = digits; z < dscale; z++)
+									nbuf[len++] = '0';
+								memcpy(nbuf + len, digitsp, digits);
+								len += digits;
+							}
+						}
+						else
+						{
+							memcpy(nbuf, tmp, tlen);
+							len = tlen;
+						}
+					}
+					else
+					{
+						/* NaN or a mantissa beyond int64: exact fmgr path */
+						char	   *string;
+
+						string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
+													value);
+						if (csv)
+						{
+							CopyAttributeOutCSVLeng(cstate, string,
+													strlen(string), force_quote,
+													single_attr);
+							break;
+						}
+						CopySendData(cstate, string, strlen(string));
+						break;
+					}
+
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, nbuf, len, force_quote,
+												single_attr);
+					else
+						CopySendData(cstate, nbuf, len);
+					break;
+				}
+			case COPY_BATCH_TEXT:
+				{
+					char	   *vp = (char *) DatumGetPointer(value);
+
+					if (VARATT_IS_EXTERNAL(vp) || VARATT_IS_COMPRESSED(vp))
+					{
+						/* cannot happen in AO column storage; be safe */
+						char	   *string;
+
+						string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
+													value);
+						if (csv)
+							CopyAttributeOutCSVLeng(cstate, string,
+													strlen(string),
+													force_quote, single_attr);
+						else
+							CopyAttributeOutTextLen(cstate, string,
+													strlen(string));
+					}
+					else if (csv)
+						CopyAttributeOutCSVLeng(cstate, VARDATA_ANY(vp),
+												VARSIZE_ANY_EXHDR(vp),
+												force_quote, single_attr);
+					else
+						CopyAttributeOutTextLen(cstate, VARDATA_ANY(vp),
+												VARSIZE_ANY_EXHDR(vp));
+					break;
+				}
+			case COPY_BATCH_FMGR:
+				{
+					char	   *string;
+
+					string = OutputFunctionCall(&cstate->out_functions[attnum - 1],
+												value);
+					if (csv)
+						CopyAttributeOutCSVLeng(cstate, string, strlen(string),
+												force_quote, single_attr);
+					else
+						CopyAttributeOutTextLen(cstate, string, strlen(string));
+					break;
+				}
+		}
+	}
+
+	/*
+	 * Terminate the row with a newline.  For COPY_FILE and COPY_NEW_FE the
+	 * accumulated buffer is flushed once per batch by CopyFlushBatch;
+	 * other destinations send per row as before (a writable external table
+	 * lets the caller do it, see external_insert()).
+	 */
+	if (cstate->copy_dest == COPY_FILE || cstate->copy_dest == COPY_NEW_FE)
+		CopySendChar(cstate, '\n');
+	else if (cstate->copy_dest != COPY_CALLBACK)
+		CopySendEndOfRow(cstate);
+}
+
+/*
  * Copy from relation or query TO file.
  */
 static uint64
@@ -3214,33 +3888,84 @@ CopyTo(CopyState cstate)
 					 * to the underlying CO AM layer to handle it - the behavior should be same
 					 * as SELECT * which is to choose one column to scan.
 					 */
-					scandesc = table_beginscan_es(rel, GetActiveSnapshot(), 0, NULL, 
-													cstate->attnumlist ? proj : NULL, 
+					scandesc = table_beginscan_es(rel, GetActiveSnapshot(), 0, NULL,
+													cstate->attnumlist ? proj : NULL,
 													NULL);
-					slot = table_slot_create(rel, NULL);
 
-					while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+					if (rel == cstate->rel && CopyToBatchGate(cstate, rel))
 					{
-						CHECK_FOR_INTERRUPTS();
+						VectorBatch	   *batch;
+						CopyBatchColumnKind *kinds;
+						MemoryContext	oldrowctx;
+						int				row;
 
-						/* Deconstruct the tuple ... */
-						slot_getallattrs(slot);
+						kinds = CopyToBatchAssignKinds(cstate, tupDesc);
+						batch = VectorBatchCreate(CurrentMemoryContext,
+												  RelationGetDescr(rel),
+												  VECTOR_BATCH_DEFAULT_CAPACITY,
+												  true);
 
-						/* Format and send the data */
-						CopyOneRowTo(cstate, slot);
+						/* generic output functions may palloc per value */
+						oldrowctx = MemoryContextSwitchTo(cstate->rowcontext);
 
-						/*
-						* Increment the number of processed tuples, and report the
-						* progress.
-						*/
-						pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
-													 ++processed);
+						while (aocs_getnext_batch((AOCSScanDesc) scandesc, batch))
+						{
+							MemoryContextReset(cstate->rowcontext);
+
+							for (row = 0; row < batch->nrows; row++)
+							{
+								CHECK_FOR_INTERRUPTS();
+
+								/* Format and send the data */
+								CopyBatchOneRowTo(cstate, batch, row, kinds);
+
+								/*
+								* Increment the number of processed tuples, and report the
+								* progress.
+								*/
+								pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+															 ++processed);
 #ifdef FAULT_INJECTOR
-						if (processed == 2)
-							SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
+								if (processed == 2)
+									SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
 #endif
+							}
+
+							/* one send per batch for file and FE destinations */
+							CopyFlushBatch(cstate);
+						}
+
+						MemoryContextSwitchTo(oldrowctx);
+						VectorBatchDestroy(batch);
+						pfree(kinds);
 					}
-					ExecDropSingleTupleTableSlot(slot);
+					else
+					{
+						slot = table_slot_create(rel, NULL);
+
+						while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+						{
+							CHECK_FOR_INTERRUPTS();
+
+							/* Deconstruct the tuple ... */
+							slot_getallattrs(slot);
+
+							/* Format and send the data */
+							CopyOneRowTo(cstate, slot);
+
+							/*
+							* Increment the number of processed tuples, and report the
+							* progress.
+							*/
+							pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+														 ++processed);
+#ifdef FAULT_INJECTOR
+							if (processed == 2)
+								SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
+#endif
+						}
+						ExecDropSingleTupleTableSlot(slot);
+					}
 					table_endscan(scandesc);
 					pfree(proj);
 					pfree(cstate->out_functions);
@@ -3884,6 +4609,17 @@ CopyFrom(CopyState cstate)
 	GpDistributionData *distData = NULL; /* distribution data used to compute target seg */
 
 	Assert(cstate->rel);
+
+	/*
+	 * Set up the fast text parse path (see CopyFastParseFields); kinds are
+	 * per physical attribute, shared by the QD prefix and the full list.
+	 * Done here because the gate depends on state (SREH, dispatch mode)
+	 * that is only complete after BeginCopyFrom/DoCopy.
+	 */
+	cstate->fast_parse = CopyFromFastGate(cstate);
+	if (cstate->fast_parse)
+		cstate->fast_kinds = CopyFromFastAssignKinds(cstate,
+													 RelationGetDescr(cstate->rel));
 
 	/*
 	 * The target must be a plain, foreign, or partitioned relation, or have
@@ -4807,6 +5543,9 @@ CopyFrom(CopyState cstate)
 		int64		total_completed_from_qes;
 		int64		total_rejected_from_qes;
 
+		/* send any still-pending forwarded row frames */
+		CopyDispatchFlushBatches(cstate, cdbCopy);
+
 		cdbCopyEnd(cdbCopy,
 				   &total_completed_from_qes,
 				   &total_rejected_from_qes);
@@ -5261,6 +6000,556 @@ NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields)
 	return NextCopyFromRawFieldsX(cstate, fields, nfields, -1);
 }
 
+/*
+ * Sign-aware decimal parsers for the COPY FROM fast path.  They accept a
+ * strict subset of the regular input functions (no whitespace, no trailing
+ * garbage) and never throw: any doubt makes the caller fall back to the
+ * regular per-field path, which produces the exact error messages.
+ */
+static bool
+CopyFastInt(const char *p, int len, int64 minval, int64 maxval, int64 *out)
+{
+	int64		acc = 0;
+	bool		neg = false;
+	int			i = 0;
+
+	if (len <= 0)
+		return false;
+	if (p[0] == '-')
+	{
+		neg = true;
+		i = 1;
+	}
+	else if (p[0] == '+')
+		i = 1;
+	if (i >= len)
+		return false;
+	for (; i < len; i++)
+	{
+		int			d = p[i] - '0';
+
+		if (d < 0 || d > 9)
+			return false;
+		if (acc > (PG_INT64_MAX - d) / 10)
+			return false;
+		acc = acc * 10 + d;
+	}
+	if (neg)
+		acc = -acc;
+	if (acc < minval || acc > maxval)
+		return false;
+	*out = acc;
+	return true;
+}
+
+static bool
+CopyFastBool(const char *p, int len, bool *out)
+{
+	if (len == 1 && p[0] == 't')
+		*out = true;
+	else if (len == 1 && p[0] == 'f')
+		*out = false;
+	else if (len == 4 && memcmp(p, "true", 4) == 0)
+		*out = true;
+	else if (len == 5 && memcmp(p, "false", 5) == 0)
+		*out = false;
+	else
+		return false;
+	return true;
+}
+
+/*
+ * Accepts only the canonical zero-padded ISO form YYYY-MM-DD, which parses
+ * as year-month-day under any DateStyle.  Validation mirrors date_in:
+ * month/day bounds, the Julian overflow guard and the date range check.
+ */
+static bool
+CopyFastDate(const char *p, int len, Datum *out)
+{
+	int			year,
+				mon,
+				mday;
+	int			mdays;
+	DateADT		date;
+	static const int mdays_tab[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+	if (len != 10 || p[4] != '-' || p[7] != '-')
+		return false;
+	year = mon = mday = 0;
+	for (int i = 0; i < 4; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		year = year * 10 + (p[i] - '0');
+	}
+	for (int i = 5; i < 7; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		mon = mon * 10 + (p[i] - '0');
+	}
+	for (int i = 8; i < 10; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		mday = mday * 10 + (p[i] - '0');
+	}
+	if (mon < 1 || mon > 12)
+		return false;
+	mdays = mdays_tab[mon];
+	if (mon == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
+		mdays = 29;
+	if (mday < 1 || mday > mdays)
+		return false;
+	if (!IS_VALID_JULIAN(year, mon, mday))
+		return false;
+	date = date2j(year, mon, mday) - POSTGRES_EPOCH_JDATE;
+	if (!IS_VALID_DATE(date))
+		return false;
+	*out = Int32GetDatum(date);
+	return true;
+}
+
+static bool
+CopyFastNumeric(const char *p, int len, Datum *out)
+{
+	int64		acc = 0;
+	int			dscale = 0;
+	bool		neg = false;
+	bool		saw_digit = false;
+	bool		saw_point = false;
+	int			i = 0;
+
+	if (len <= 0)
+		return false;
+	if (p[0] == '-')
+	{
+		neg = true;
+		i = 1;
+	}
+	else if (p[0] == '+')
+		i = 1;
+	for (; i < len; i++)
+	{
+		int			d = p[i] - '0';
+
+		if (d < 0 || d > 9)
+		{
+			/* a single decimal point switches to the fraction part */
+			if (p[i] == '.' && !saw_point)
+			{
+				saw_point = true;
+				continue;
+			}
+			return false;
+		}
+		saw_digit = true;
+		if (acc > (PG_INT64_MAX - d) / 10)
+			return false;
+		acc = acc * 10 + d;
+		if (saw_point)
+			dscale++;
+	}
+	if (!saw_digit)
+		return false;
+	if (neg)
+		acc = -acc;
+	/*
+	 * The display-scale padding inside numeric_build_fast can overflow for
+	 * a mantissa that fit the accumulator; let the caller fall back to the
+	 * regular numeric_in, which builds the value without the fast-path
+	 * limits.
+	 */
+	{
+		Numeric		num = numeric_build_fast(acc, dscale);
+
+		if (num == NULL)
+			return false;
+		*out = PointerGetDatum(num);
+	}
+	return true;
+}
+
+/*
+ * Returns true iff COPY FROM can use the fast text parse path.  Anything
+ * unsupported keeps the regular per-field path; the parsed data is
+ * identical either way.
+ */
+static bool
+CopyFromFastGate(CopyState cstate)
+{
+	/* perf feature enabled under gp_vectorized_execution */
+	if (gp_vectorized_execution == GP_VECTORIZED_EXECUTION_OFF)
+		return false;
+
+	/* binary and escapeless external-table input stay on the regular path */
+	if (cstate->binary || cstate->escape_off)
+		return false;
+
+	/*
+	 * Clean rows are never rejected by the fast kernels: anything doubtful
+	 * falls back to the regular per-field path, whose error is caught by
+	 * the SREH machinery as before.  Ignored input columns keep the regular
+	 * path.
+	 */
+	if (cstate->convert_select_flags)
+		return false;
+
+	/*
+	 * FORCE_NOT_NULL / FORCE_NULL rewrite null-marker matches in the regular
+	 * per-field conversion loop, which the fast path skips.
+	 */
+	if (cstate->force_notnull != NIL || cstate->force_null != NIL)
+		return false;
+
+	/*
+	 * The fast path reads raw file bytes without encoding conversion and
+	 * does not need the multibyte grouping of the line reader.
+	 */
+	if (cstate->file_encoding != GetDatabaseEncoding() ||
+		cstate->encoding_embeds_ascii)
+		return false;
+
+	/*
+	 * The fast parse covers utility/direct mode, the QD routing prefix
+	 * (whose residual fields the QE re-parses with the same kernels).
+	 */
+	return true;
+}
+
+/*
+ * Assign the per-column fast input kernel kind.  Types without a kernel
+ * stay on COPY_FAST_FMGR, which behaves exactly like the regular path.
+ */
+static int *
+CopyFromFastAssignKinds(CopyState cstate, TupleDesc tupDesc)
+{
+	int		   *kinds = palloc(tupDesc->natts * sizeof(int));
+
+	for (int i = 0; i < tupDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupDesc, i);
+		int			kind = COPY_FAST_FMGR;
+
+		switch (attr->atttypid)
+		{
+			case INT2OID:
+				kind = COPY_FAST_INT2;
+				break;
+			case INT4OID:
+				kind = COPY_FAST_INT4;
+				break;
+			case INT8OID:
+				kind = COPY_FAST_INT8;
+				break;
+			case BOOLOID:
+				kind = COPY_FAST_BOOL;
+				break;
+			case DATEOID:
+				kind = COPY_FAST_DATE;
+				break;
+			case NUMERICOID:
+				/*
+				 * The kernel parses plain integer/decimal text but does
+				 * not apply atttypmod (rounding/saturation), which
+				 * numeric_in performs; typmod'd columns keep the regular
+				 * input function.
+				 */
+				kind = attr->atttypmod >= 0 ? COPY_FAST_FMGR : COPY_FAST_NUMERIC;
+				break;
+			case TEXTOID:
+				kind = COPY_FAST_TEXT;
+				break;
+			default:
+				break;
+		}
+		kinds[i] = kind;
+	}
+	return kinds;
+}
+
+/*
+ * Fast text-mode parse of the current input line.  The line must already
+ * be read into line_buf.  Returns true when every field was parsed with
+ * the fast kernels; values/nulls are then filled for the processed
+ * fields, and line_buf.cursor/stopped_processing_at_delim are updated
+ * exactly like the regular path does.  Returns false when this line must
+ * go through the regular per-field path (its conversion loop overwrites
+ * everything this function may have written).
+ */
+static bool
+CopyFastParseFields(CopyState cstate, Datum *values, bool *nulls,
+					List *attnumlist, AttrNumber attr_count,
+					int stop_processing_at_field)
+{
+	char	   *line_start = cstate->line_buf.data + cstate->line_buf.cursor;
+	char	   *line_end = cstate->line_buf.data + cstate->line_buf.len;
+	char	   *p;
+	int			limit;
+	int			nfields = 0;
+	bool		last_had_delim = false;
+	bool		delim_off = cstate->delim_off;
+	char		delimc = cstate->delim[0];
+	bool		csv = cstate->csv_mode;
+	char		quotec = csv ? cstate->quote[0] : '\0';
+	char		escapec = csv ? cstate->escape[0] : '\0';
+	ListCell   *cur;
+	int			fieldno = 0;
+
+	/* same special-escape suppression as the per-character loop */
+	if (quotec == escapec)
+		escapec = '\0';
+
+	/* FILL MISSING FIELDS changes the missing-field rules */
+	if (cstate->fill_missing)
+		return false;
+
+	/*
+	 * Single fused scan over the processed fields: record each field's end
+	 * pointer in raw_fields and bail out on anything the regular path must
+	 * handle (text-mode escapes and the end-of-copy marker; CSV fields with
+	 * doubled quotes, escapes or mixed quoting).  The remainder after the
+	 * QD's processing limit is not scanned here; it is forwarded raw.
+	 * In CSV mode only two field forms are accepted: fully unquoted, or a
+	 * single clean "inner" pair.
+	 */
+	limit = (stop_processing_at_field >= 0) ?
+		stop_processing_at_field : attr_count;
+
+	p = line_start;
+	while (nfields < limit)
+	{
+		if (nfields + 1 > cstate->max_fields)
+		{
+			cstate->max_fields *= 2;
+			cstate->raw_fields = repalloc(cstate->raw_fields,
+										  cstate->max_fields * sizeof(char *));
+		}
+		if (csv && p < line_end && *p == quotec)
+		{
+			char	   *inner = p + 1;
+			char	   *q1 = memchr(inner, quotec, line_end - inner);
+
+			if (q1 == NULL ||
+				memchr(inner, escapec, q1 - inner) != NULL)
+				return false;
+			if (q1 + 1 < line_end && (delim_off || q1[1] != delimc))
+				return false;
+			p = (q1 + 1 < line_end) ? q1 + 1 : line_end;
+		}
+		else
+		{
+			while (p < line_end)
+			{
+				char		c = *p;
+
+				if (c == delimc && !delim_off)
+					break;
+				if (csv ? c == quotec : c == '\\')
+					return false;
+				p++;
+			}
+		}
+		cstate->raw_fields[nfields] = p;	/* end of field value, exclusive */
+		nfields++;
+		/* true unless the field ended at the line end */
+		last_had_delim = (p < line_end);
+		if (!last_had_delim)
+			break;
+		p++;						/* skip the delimiter */
+	}
+
+	/*
+	 * The scan may not have run at all: zero fields to process on this
+	 * side (a QE whose columns the QD fully processed) leaves
+	 * last_had_delim at its initial false even when the residual is
+	 * non-empty, and the count check below then accepts the row while
+	 * dropping the residual - data the regular path rejects as extra
+	 * data after the last expected column.  Recompute from the scan
+	 * position; it agrees with the loop's bookkeeping on every path the
+	 * loop did run.
+	 */
+	last_had_delim = (p < line_end);
+
+	if (stop_processing_at_field >= 0)
+	{
+		if (nfields < limit)
+			return false;
+	}
+	else if (nfields + (last_had_delim ? 1 : 0) != attr_count)
+		return false;
+
+	/*
+	 * Convert the recorded fields to values/nulls.
+	 */
+	resetStringInfo(&cstate->attribute_buf);
+	p = line_start;
+	foreach(cur, attnumlist)
+	{
+		int			attnum = lfirst_int(cur);
+		int			m = attnum - 1;
+		Form_pg_attribute att = TupleDescAttr(cstate->rel->rd_att, m);
+		const char *sp;
+		int			flen;
+		bool		quoted = false;
+
+		if (fieldno == limit)
+			break;
+
+		sp = p;
+		p = cstate->raw_fields[fieldno];
+		fieldno++;
+
+		if (csv && sp < p && *sp == quotec)
+		{
+			/* pass 1 validated this field: a clean "inner" pair */
+			char	   *q1;
+
+			sp++;
+			q1 = memchr(sp, quotec, p - sp);
+
+			/*
+			 * Pass 1 validated this field: the closing quote must sit
+			 * exactly at p - 1 and the inner slice must hold no quote or
+			 * escape characters.  Anything else falls back to the
+			 * regular path for this line.
+			 */
+			if (q1 == NULL || q1 != p - 1 ||
+				memchr(sp, quotec, q1 - sp) != NULL ||
+				(escapec != '\0' &&
+				 memchr(sp, escapec, q1 - sp) != NULL))
+				return false;
+			flen = q1 - sp;
+			quoted = true;
+		}
+		else
+			flen = p - sp;
+		if (p < line_end)
+			p++;			/* skip the delimiter */
+
+		/* raw match against the null marker, like the regular split */
+		if (!quoted && flen == cstate->null_print_len &&
+			(flen == 0 || memcmp(sp, cstate->null_print, flen) == 0))
+			continue;			/* values[m] == 0, nulls[m] == true */
+
+		switch (cstate->fast_kinds[m])
+		{
+			case COPY_FAST_INT2:
+				{
+					int64		v;
+
+					if (!CopyFastInt(sp, flen, PG_INT16_MIN, PG_INT16_MAX, &v))
+						return false;
+					values[m] = Int16GetDatum((int16) v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_INT4:
+				{
+					int64		v;
+
+					if (!CopyFastInt(sp, flen, PG_INT32_MIN, PG_INT32_MAX, &v))
+						return false;
+					values[m] = Int32GetDatum((int32) v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_INT8:
+				{
+					int64		v;
+
+					if (!CopyFastInt(sp, flen, PG_INT64_MIN, PG_INT64_MAX, &v))
+						return false;
+					values[m] = Int64GetDatum(v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_BOOL:
+				{
+					bool		v;
+
+					if (!CopyFastBool(sp, flen, &v))
+						return false;
+					values[m] = BoolGetDatum(v);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_DATE:
+				if (!CopyFastDate(sp, flen, &values[m]))
+					return false;
+				nulls[m] = false;
+				break;
+			case COPY_FAST_NUMERIC:
+				if (!CopyFastNumeric(sp, flen, &values[m]))
+					return false;
+				nulls[m] = false;
+				break;
+			case COPY_FAST_TEXT:
+				{
+					text	   *t = (text *) palloc(flen + VARHDRSZ);
+
+					SET_VARSIZE(t, flen + VARHDRSZ);
+					memcpy(VARDATA(t), sp, flen);
+					values[m] = PointerGetDatum(t);
+					nulls[m] = false;
+					break;
+				}
+			case COPY_FAST_FMGR:
+			default:
+				{
+					/*
+					 * Scratch space in attribute_buf, which the regular
+					 * path resets per line anyway; each field's string
+					 * starts at the position this field was appended at.
+					 */
+					char	   *string;
+					int			startpos = cstate->attribute_buf.len;
+
+					appendBinaryStringInfo(&cstate->attribute_buf, sp, flen);
+					appendStringInfoCharMacro(&cstate->attribute_buf, '\0');
+					string = cstate->attribute_buf.data + startpos;
+
+					cstate->cur_attname = NameStr(att->attname);
+					cstate->cur_attval = string;
+					values[m] = InputFunctionCall(&cstate->in_functions[m],
+												  string,
+												  cstate->typioparams[m],
+												  att->atttypmod);
+					nulls[m] = false;
+					cstate->cur_attname = NULL;
+					cstate->cur_attval = NULL;
+					break;
+				}
+		}
+	}
+
+	/*
+	 * Bookkeeping identical to CopyReadAttributesText: when the QD stops at
+	 * its processing limit (including zero fields, i.e. replicated tables
+	 * forwarding the whole line), the residual for the QE starts at the
+	 * current position, flagged as after-a-delimiter.
+	 */
+	if (stop_processing_at_field >= 0)
+	{
+		/*
+		 * Mirror the regular split's bookkeeping: the QE owes more fields
+		 * only when a delimiter follows the last processed field.  Marking
+		 * a line-ended scan as stopped-at-delimiter made the QE parse an
+		 * empty residual as one empty field instead of reporting the
+		 * columns it still owes as missing data.
+		 */
+		cstate->stopped_processing_at_delim = (p < line_end);
+		cstate->line_buf.cursor = p - cstate->line_buf.data;
+	}
+	else
+	{
+		cstate->stopped_processing_at_delim = false;
+		cstate->line_buf.cursor = line_end - cstate->line_buf.data;
+	}
+
+	return true;
+}
+
 static bool
 NextCopyFromRawFieldsX(CopyState cstate, char ***fields, int *nfields,
 					   int stop_processing_at_field)
@@ -5502,20 +6791,65 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 		int			fldct;
 		int			fieldno;
 		char	   *string;
+		bool		fast_row = false;
 
 		/* read raw fields in the next line */
 		if (cstate->dispatch_mode != COPY_EXECUTOR)
 		{
-			if (!NextCopyFromRawFieldsX(cstate, &field_strings, &fldct,
-										stop_processing_at_field))
+			if (cstate->fast_parse)
+			{
+				bool		done;
+
+				/* on input just throw the header line away */
+				if (cstate->cur_lineno == 0 && cstate->header_line)
+				{
+					cstate->cur_lineno++;
+					if (CopyReadLine(cstate))
+						return false;	/* done */
+				}
+
+				cstate->cur_lineno++;
+
+				done = CopyReadLine(cstate);
+				if (done && cstate->line_buf.len == 0)
+					return false;
+
+				fast_row = CopyFastParseFields(cstate, values, nulls,
+											   attnumlist, attr_count,
+											   stop_processing_at_field);
+				if (fast_row)
+					goto defaults;
+
+				/*
+				 * Fast-parse fallback: split the current line the regular
+				 * way (it is already in line_buf); the regular conversion
+				 * loop below provides the exact error messages and
+				 * semantics.
+				 */
+				fldct = cstate->csv_mode ?
+					CopyReadAttributesCSV(cstate, stop_processing_at_field) :
+					CopyReadAttributesText(cstate, stop_processing_at_field);
+				field_strings = cstate->raw_fields;
+			}
+			else if (!NextCopyFromRawFieldsX(cstate, &field_strings, &fldct,
+											 stop_processing_at_field))
 				return false;
 		}
 		else
 		{
 			/*
 			 * We have received the raw line from the QD, and we just
-			 * need to split it into raw fields.
+			 * need to split it into raw fields.  The fast parse handles
+			 * the residual fields from line_buf.cursor; anything it
+			 * cannot prove goes to the regular split below.
 			 */
+			if (cstate->fast_parse &&
+				cstate->stopped_processing_at_delim &&
+				cstate->line_buf.cursor <= cstate->line_buf.len &&
+				CopyFastParseFields(cstate, values, nulls,
+									attnumlist, attr_count, -1))
+				goto defaults;
+
 			if (cstate->stopped_processing_at_delim &&
 				cstate->line_buf.cursor <= cstate->line_buf.len)
 			{
@@ -5529,11 +6863,17 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 			field_strings = cstate->raw_fields;
 		}
 
-		/* 
+		/*
+		 * The regular path: field-count checks and the per-field
+		 * conversion loop.  Skipped when the fast parse produced the row.
+		 */
+		if (!fast_row)
+		{
+		/*
 		 * Check for overflowing fields.
-		 * GPDB: Change below condition compared to upstream to 
-		 * greater than or equal to 0 as in QE, 
-		 * attr_count may be equal to 0, 
+		 * GPDB: Change below condition compared to upstream to
+		 * greater than or equal to 0 as in QE,
+		 * attr_count may be equal to 0,
 		 * when all fields are processed in the QD.
 		 */
 		if (fldct > attr_count)
@@ -5627,6 +6967,7 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 		}
 
 		Assert(fieldno == attr_count);
+		}							/* end of !fast_row regular path */
 	}
 	else if (attr_count)
 	{
@@ -5702,6 +7043,7 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 	 * (We could improve this, and compute immutable defaults that don't
 	 * affect which segment the row belongs to, in the QE.)
 	 */
+defaults:;
   if (cstate->dispatch_mode != COPY_EXECUTOR)
   {
 	for (i = 0; i < num_defaults; i++)
@@ -6188,10 +7530,16 @@ SendCopyFromForwardedTuple(CopyState cstate,
 	frame->fld_count = num_sent_fields;
 	frame->delim_seen_at_end = cstate->stopped_processing_at_delim;
 
+	/* coalesce the frame into the target segment's batch buffer */
 	if (toAll)
-		cdbCopySendDataToAll(cdbCopy, msgbuf->data, msgbuf->len);
+	{
+		int			i;
+
+		for (i = 0; i < cdbCopy->total_segs; i++)
+			CopyDispatchAppendBatch(cstate, cdbCopy, i);
+	}
 	else
-		cdbCopySendData(cdbCopy, target_seg, msgbuf->data, msgbuf->len);
+		CopyDispatchAppendBatch(cstate, cdbCopy, target_seg);
 }
 
 static void
@@ -6207,6 +7555,69 @@ SendCopyFromForwardedHeader(CopyState cstate, CdbCopy *cdbCopy)
 	cdbCopySendDataToAll(cdbCopy, (char *) &header_frame, sizeof(header_frame));
 }
 
+/*
+ * Frames forwarded to a segment accumulate in that segment's batch buffer
+ * and go out as one libpq copy-data chunk per COPY_DISPATCH_BATCH_FLUSH
+ * bytes; the receiving side reads the copy stream through buffered
+ * pq_getcopydata, so the message boundaries are transparent to it.
+ */
+#define COPY_DISPATCH_BATCH_FLUSH	32768
+
+/* Send one segment's pending frames and clear its batch buffer. */
+static void
+CopyDispatchSendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg)
+{
+	StringInfo	b;
+
+	if (cstate->dispatch_batch == NULL)
+		return;
+	b = cstate->dispatch_batch[target_seg];
+	if (b == NULL || b->len == 0)
+		return;
+
+	cdbCopySendData(cdbCopy, target_seg, b->data, b->len);
+	resetStringInfo(b);
+}
+
+/* Flush every segment's pending frames, preserving the frame order. */
+static void
+CopyDispatchFlushBatches(CopyState cstate, CdbCopy *cdbCopy)
+{
+	int			i;
+
+	if (cstate->dispatch_batch == NULL)
+		return;
+	for (i = 0; i < cstate->dispatch_nbatch; i++)
+		CopyDispatchSendBatch(cstate, cdbCopy, i);
+}
+
+/*
+ * Append the frame built in dispatch_msgbuf to the target segment's batch
+ * buffer, flushing the buffer when it reaches the batch size.
+ */
+static void
+CopyDispatchAppendBatch(CopyState cstate, CdbCopy *cdbCopy, int target_seg)
+{
+	StringInfo	b;
+
+	if (cstate->dispatch_batch == NULL)
+	{
+		cstate->dispatch_nbatch = cdbCopy->total_segs;
+		cstate->dispatch_batch = palloc0(cstate->dispatch_nbatch *
+										 sizeof(StringInfoData));
+	}
+	Assert(target_seg >= 0 && target_seg < cstate->dispatch_nbatch);
+	if (cstate->dispatch_batch[target_seg] == NULL)
+		cstate->dispatch_batch[target_seg] = makeStringInfo();
+
+	b = cstate->dispatch_batch[target_seg];
+	appendBinaryStringInfo(b, cstate->dispatch_msgbuf->data,
+						   cstate->dispatch_msgbuf->len);
+
+	if (b->len >= COPY_DISPATCH_BATCH_FLUSH)
+		CopyDispatchSendBatch(cstate, cdbCopy, target_seg);
+}
+
 static void
 SendCopyFromForwardedError(CopyState cstate, CdbCopy *cdbCopy, char *errormsg)
 {
@@ -6216,6 +7627,10 @@ SendCopyFromForwardedError(CopyState cstate, CdbCopy *cdbCopy, char *errormsg)
 	int			errormsg_len = strlen(errormsg);
 
 	msgbuf = cstate->dispatch_msgbuf;
+
+	/* pending row frames must precede the error frame in the stream */
+	CopyDispatchFlushBatches(cstate, cdbCopy);
+
 	resetStringInfo(msgbuf);
 	enlargeStringInfo(msgbuf, SizeOfCopyFromDispatchError);
 	/* allocate space for the header (we'll fill it in last). */
@@ -6376,6 +7791,7 @@ CopyReadLineText(CopyState cstate)
 	bool		first_char_in_line = true;
 	bool		in_quote = false,
 				last_was_esc = false;
+	bool		csv_bulk_at_line_start;
 	char		quotec = '\0';
 	char		escapec = '\0';
 
@@ -6414,6 +7830,15 @@ CopyReadLineText(CopyState cstate)
 	copy_raw_buf = cstate->raw_buf;
 	raw_buf_ptr = cstate->raw_buf_index;
 	copy_buf_len = cstate->raw_buf_len;
+
+	/*
+	 * The CSV bulk scan below derives the line end from the quote state,
+	 * so it is only valid at the start of a line; after the per-character
+	 * loop has consumed any characters the quote state is no longer
+	 * derivable from the remaining bytes.  The text bulk scan does not
+	 * need this: a newline always ends a line in text mode.
+	 */
+	csv_bulk_at_line_start = true;
 
 	for (;;)
 	{
@@ -6455,7 +7880,125 @@ CopyReadLineText(CopyState cstate)
 			need_data = false;
 		}
 
+		/*
+		 * Bulk scan: in plain text mode with a known LF line terminator,
+		 * a line containing no backslash can be transferred wholesale
+		 * with a couple of memchr calls.  Everything special (escapes,
+		 * the end-of-copy marker, CR-style line endings, unknown EOL on
+		 * the first line, ASCII-embedding encodings) is left to the
+		 * per-character loop below.
+		 */
+		if (!cstate->csv_mode && !cstate->encoding_embeds_ascii &&
+			cstate->eol_type == EOL_NL &&
+			raw_buf_ptr < copy_buf_len)
+		{
+			char	   *nl = memchr(copy_raw_buf + raw_buf_ptr, '\n',
+									 copy_buf_len - raw_buf_ptr);
+			int			nl_pos;
+
+			if (nl != NULL)
+			{
+				nl_pos = nl - copy_raw_buf;
+
+				if (raw_buf_ptr < nl_pos &&
+					memchr(copy_raw_buf + raw_buf_ptr, '\\',
+						   nl_pos - raw_buf_ptr) != NULL)
+				{
+					/*
+					 * A backslash anywhere in the line may be an escape
+					 * or the start of the end-of-copy marker; leave the
+					 * line to the per-character loop.
+					 */
+				}
+				else
+				{
+					/* consume through the newline; the tail REFILL
+					 * LINEBUF at the end of the function transfers the
+					 * line into line_buf */
+					raw_buf_ptr = nl_pos + 1;
+					break;
+				}
+			}
+		}
+		else if (csv_bulk_at_line_start &&
+				 cstate->csv_mode && !cstate->encoding_embeds_ascii &&
+				 cstate->eol_type == EOL_NL &&
+				 cstate->quote != NULL &&
+				 raw_buf_ptr < copy_buf_len)
+		{
+			/*
+			 * CSV bulk scan: with the default escape (equal to the quote,
+			 * so no special escape processing) the line end can be located
+			 * with strcspn jumps over the specials {quote, newline, \},
+			 * toggling the quote state only on the quote hits.  A \ jumps
+			 * to the per-character loop (a possible \. marker line);
+			 * running out of chunk before the newline does too, and the
+			 * per-character loop replays the same bytes from the line
+			 * start.  A non-default escape keeps its own state machine
+			 * and is left to the per-character loop entirely.
+			 */
+			int			p = raw_buf_ptr;
+			bool		in_quote = false;
+			int			nl_pos = -1;
+			bool		bail = false;
+			long		embedded_nl = 0;
+			char		quotec = cstate->quote[0];
+			char		escapec = cstate->escape[0];
+			char		scan_set[4];
+
+			if (quotec == escapec || escapec == '\0')
+				escapec = '\0';
+			else
+				bail = true;	/* non-default escape: per-character loop */
+
+			if (!bail)
+			{
+				scan_set[0] = quotec;
+				scan_set[1] = '\n';
+				scan_set[2] = '\\';
+				scan_set[3] = '\0';
+
+				while (p < copy_buf_len)
+				{
+					int			skip = strcspn(copy_raw_buf + p, scan_set);
+
+					p += skip;
+					if (p >= copy_buf_len)
+						break;	/* no specials left in the chunk */
+					if (copy_raw_buf[p] == '\\')
+					{
+						bail = true;
+						break;
+					}
+					if (copy_raw_buf[p] == '\n')
+					{
+						if (!in_quote)
+						{
+							nl_pos = p;
+							break;
+						}
+						embedded_nl++;	/* newline inside a quoted field */
+						p++;
+						continue;
+					}
+					/* a quote: toggle the state and skip it */
+					p++;
+					in_quote = !in_quote;
+				}
+			}
+
+			if (!bail && nl_pos >= 0)
+			{
+				if (embedded_nl)
+					cstate->cur_lineno += embedded_nl;
+				raw_buf_ptr = nl_pos + 1;
+				break;
+			}
+			/* otherwise the per-character loop replays from the line start */
+		}
+
 		/* OK to fetch a character */
+		csv_bulk_at_line_start = false;
 		prev_raw_ptr = raw_buf_ptr;
 		c = copy_raw_buf[raw_buf_ptr++];
 

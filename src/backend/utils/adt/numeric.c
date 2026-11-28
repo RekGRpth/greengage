@@ -463,6 +463,7 @@ static void init_var_from_var(const NumericVar *value, NumericVar *dest);
 static void init_ro_var_from_var(const NumericVar *value, NumericVar *dest);
 static void set_var_from_num(Numeric value, NumericVar *dest);
 static void init_var_from_num(Numeric value, NumericVar *dest);
+static bool init_var_from_datum(Datum value, NumericVar *dest);
 static char *get_str_from_var(const NumericVar *var);
 static char *get_str_from_var_sci(const NumericVar *var, int rscale);
 
@@ -545,6 +546,12 @@ static void compute_bucket(Numeric operand, Numeric bound1, Numeric bound2,
 						   const NumericVar *count_var, NumericVar *result_var);
 
 static void accum_sum_add(NumericSumAccum *accum, const NumericVar *var1);
+static void do_numeric_accum_var(NumericAggState *state, NumericVar *X);
+#ifdef HAVE_INT128
+static void numeric_agg_flush_fast(NumericAggState *state);
+#endif
+static bool numeric_decode_from_var(NumericVar *var, int64 *mantissa,
+									int *scale, int *dscale);
 static void accum_sum_rescale(NumericSumAccum *accum, const NumericVar *val);
 static void accum_sum_carry(NumericSumAccum *accum);
 static void accum_sum_reset(NumericSumAccum *accum);
@@ -2204,6 +2211,34 @@ cmp_numerics(Numeric num1, Numeric num2)
 }
 
 /*
+ * Like cmp_numerics(), but takes the datums as stored and skips the detoast
+ * copies for inline varlenas.  NaN ordering matches cmp_numerics().
+ */
+int
+cmp_numeric_datums(Datum num1, Datum num2)
+{
+	NumericVar	v1,
+				v2;
+	bool		ok1 = init_var_from_datum(num1, &v1);
+	bool		ok2 = init_var_from_datum(num2, &v2);
+
+	if (!ok1 || !ok2)
+		return cmp_numerics(DatumGetNumeric(num1), DatumGetNumeric(num2));
+
+	if (v1.sign == NUMERIC_NAN)
+	{
+		if (v2.sign == NUMERIC_NAN)
+			return 0;			/* NAN = NAN */
+		return 1;				/* NAN > non-NAN */
+	}
+	if (v2.sign == NUMERIC_NAN)
+		return -1;				/* non-NAN < NAN */
+
+	return cmp_var_common(v1.digits, v1.ndigits, v1.weight, v1.sign,
+						  v2.digits, v2.ndigits, v2.weight, v2.sign);
+}
+
+/*
  * in_range support function for numeric.
  */
 Datum
@@ -3858,8 +3893,6 @@ void
 do_numeric_accum(NumericAggState *state, Numeric newval)
 {
 	NumericVar	X;
-	NumericVar	X2;
-	MemoryContext old_context;
 
 	/* Count NaN inputs separately from all else */
 	if (NUMERIC_IS_NAN(newval))
@@ -3871,23 +3904,109 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	/* load processed number in short-lived context */
 	init_var_from_num(newval, &X);
 
+	do_numeric_accum_var(state, &X);
+}
+
+/*
+ * Like do_numeric_accum(), but takes the datum as stored and skips the
+ * detoast copy for inline varlenas.  Falls back to the detoasting variant
+ * for external, compressed, or over-wide datums.
+ */
+void
+do_numeric_accum_datum(NumericAggState *state, Datum newval)
+{
+	NumericVar	X;
+
+	if (!init_var_from_datum(newval, &X))
+	{
+		do_numeric_accum(state, DatumGetNumeric(newval));
+		return;
+	}
+	if (X.sign == NUMERIC_NAN)
+	{
+		state->NaNcount++;
+		return;
+	}
+
+	do_numeric_accum_var(state, &X);
+}
+
+#ifdef HAVE_INT128
+/*
+ * Fold the pending int128 accumulation window (see do_numeric_accum_fast())
+ * into state->sumX.  Must be called before sumX is read or modified by any
+ * path other than the window itself, since the window's inputs are not in
+ * sumX until then.  The reconstructed NumericVar carries maxScale as its
+ * dscale, so that sumX's dscale tracks the input display scales exactly
+ * as the digit-by-digit path does.
+ *
+ * NULL-safe, so callers holding an optional state can call it directly.
+ */
+static void
+numeric_agg_flush_fast(NumericAggState *state)
+{
+	NumericVar	X;
+	MemoryContext old_context;
+	int			align_dscale;
+
+	if (state == NULL || !state->fast_valid)
+		return;
+
+	align_dscale = state->fast_scale + (4 - state->fast_scale % 4) % 4;
+
+	init_var(&X);
+	int128_to_numericvar(state->fast_sum, &X);
+	X.weight -= align_dscale / 4;
+	/*
+	 * The digit path derives sumX's dscale from the inputs' display
+	 * scales, which maxScale already tracks for every windowed input,
+	 * so carrying maxScale here yields the same accum->dscale.
+	 */
+	X.dscale = state->maxScale;
+
+	old_context = MemoryContextSwitchTo(state->agg_context);
+	accum_sum_add(&state->sumX, &X);
+	MemoryContextSwitchTo(old_context);
+
+	free_var(&X);
+
+	state->fast_valid = false;
+	state->fast_sum = 0;
+}
+#else
+/*
+ * Without int128 support there is no fast window, so every flush below is
+ * a no-op.
+ */
+#define numeric_agg_flush_fast(state)  ((void) (state))
+#endif
+
+/* The transition body shared by the accum entry points above. */
+static void
+do_numeric_accum_var(NumericAggState *state, NumericVar *X)
+{
+	NumericVar	X2;
+	MemoryContext old_context;
+
+	numeric_agg_flush_fast(state);
+
 	/*
 	 * Track the highest input dscale that we've seen, to support inverse
 	 * transitions (see do_numeric_discard).
 	 */
-	if (X.dscale > state->maxScale)
+	if (X->dscale > state->maxScale)
 	{
-		state->maxScale = X.dscale;
+		state->maxScale = X->dscale;
 		state->maxScaleCount = 1;
 	}
-	else if (X.dscale == state->maxScale)
+	else if (X->dscale == state->maxScale)
 		state->maxScaleCount++;
 
 	/* if we need X^2, calculate that in short-lived context */
 	if (state->calcSumX2)
 	{
 		init_var(&X2);
-		mul_var(&X, &X, &X2, X.dscale * 2);
+		mul_var(X, X, &X2, X->dscale * 2);
 	}
 
 	/* The rest of this needs to work in the aggregate context */
@@ -3896,12 +4015,85 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	state->N++;
 
 	/* Accumulate sums */
-	accum_sum_add(&(state->sumX), &X);
+	accum_sum_add(&(state->sumX), X);
 
 	if (state->calcSumX2)
 		accum_sum_add(&(state->sumX2), &X2);
 
 	MemoryContextSwitchTo(old_context);
+}
+
+/*
+ * Accumulate an exactly decoded value (mantissa * 10^-scale) without
+ * materializing a Numeric: the same var construction numeric_build_fast()
+ * performs, but skipping make_result() and the subsequent re-parse.  The
+ * caller guarantees the mantissa has room for the scale padding
+ * (|mantissa| <= PG_INT64_MAX / 1000).  'scale' is the exact scale of the
+ * contribution; 'dscale' is the input's display scale, which only feeds
+ * the maxScale bookkeeping behind the output display scales.
+ *
+ * With int128 support, consecutive inputs sharing one scale are summed
+ * into state->fast_sum as padding-aligned int64 mantissas instead of
+ * entering the base-10000 digit accumulator, so each input costs a single
+ * integer add.  The hot window hit runs inline through
+ * numeric_agg_fast_window_add(); this out-of-line function is the slow
+ * half only - the window is opened here, and folded into sumX via
+ * accum_sum_add() on a scale change or an int128 overflow, after which
+ * the current input starts a new window.  N and the maxScale bookkeeping
+ * are done by the inline half (this function is only called after it
+ * returned false, and does not repeat them), because windowed inputs
+ * never reach do_numeric_accum_var().  Every sumX reader folds the window
+ * in first (see numeric_agg_flush_fast()).
+ */
+void
+do_numeric_accum_fast(NumericAggState *state, int64 mantissa, int scale,
+					  int dscale)
+{
+	int			pad = (4 - scale % 4) % 4;
+
+#ifdef HAVE_INT128
+	int64		aligned = mantissa;
+	int128		new_sum;
+
+	while (pad > 0)
+	{
+		aligned *= 10;
+		pad--;
+	}
+
+	if (state->fast_valid)
+	{
+		if (state->fast_scale == scale &&
+			!__builtin_add_overflow(state->fast_sum, (int128) aligned,
+									&new_sum))
+		{
+			state->fast_sum = new_sum;
+			return;
+		}
+
+		/* the scale changed or the window is full: fold it into sumX */
+		numeric_agg_flush_fast(state);
+	}
+
+	state->fast_valid = true;
+	state->fast_scale = scale;
+	state->fast_sum = aligned;
+#else
+	NumericVar	X;
+
+	while (pad > 0)
+	{
+		mantissa *= 10;
+		pad--;
+	}
+
+	init_var(&X);
+	int64_to_numericvar(mantissa, &X);
+	X.weight -= (scale + (4 - scale % 4) % 4) / 4;
+	X.dscale = dscale;
+
+	do_numeric_accum_var(state, &X);
+#endif
 }
 
 /*
@@ -3932,6 +4124,8 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 		state->NaNcount--;
 		return true;
 	}
+
+	numeric_agg_flush_fast(state);
 
 	/* load processed number in short-lived context */
 	init_var_from_num(newval, &X);
@@ -4041,6 +4235,10 @@ numeric_combine(PG_FUNCTION_ARGS)
 	state1 = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
+	/* fold any pending int128 fast windows into their sums first */
+	numeric_agg_flush_fast(state1);
+	numeric_agg_flush_fast(state2);
+
 	if (state2 == NULL)
 	{
 		if (state1 == NULL)
@@ -4133,6 +4331,10 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 	state1 = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
+	/* fold any pending int128 fast windows into their sums first */
+	numeric_agg_flush_fast(state1);
+	numeric_agg_flush_fast(state2);
+
 	if (state2 == NULL)
 	{
 		if (state1 == NULL)
@@ -4209,6 +4411,9 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 		elog(ERROR, "aggregate function called in non-aggregate context");
 
 	state = (NumericAggState *) PG_GETARG_POINTER(0);
+
+	/* fold the pending int128 fast window into sumX before reading it */
+	numeric_agg_flush_fast(state);
 
 	/*
 	 * This is a little wasteful since make_result converts the NumericVar
@@ -4331,6 +4536,9 @@ numeric_serialize(PG_FUNCTION_ARGS)
 		elog(ERROR, "aggregate function called in non-aggregate context");
 
 	state = (NumericAggState *) PG_GETARG_POINTER(0);
+
+	/* fold the pending int128 fast window into sumX before reading it */
+	numeric_agg_flush_fast(state);
 
 	/*
 	 * This is a little wasteful since make_result converts the NumericVar
@@ -5243,6 +5451,8 @@ numeric_avg(PG_FUNCTION_ARGS)
 	if (state->NaNcount > 0)	/* there was at least one NaN input */
 		PG_RETURN_NUMERIC(make_result(&const_nan));
 
+	numeric_agg_flush_fast(state);
+
 	N_datum = DirectFunctionCall1(int8_numeric, Int64GetDatum(state->N));
 
 	init_var(&sumX_var);
@@ -5268,6 +5478,8 @@ numeric_sum(PG_FUNCTION_ARGS)
 
 	if (state->NaNcount > 0)	/* there was at least one NaN input */
 		PG_RETURN_NUMERIC(make_result(&const_nan));
+
+	numeric_agg_flush_fast(state);
 
 	init_var(&sumX_var);
 	accum_sum_final(&state->sumX, &sumX_var);
@@ -5312,6 +5524,8 @@ numeric_stddev_internal(NumericAggState *state,
 
 	if (state->NaNcount > 0)
 		return make_result(&const_nan);
+
+	numeric_agg_flush_fast(state);
 
 	init_var(&vN);
 	init_var(&vsumX);
@@ -6262,6 +6476,74 @@ init_var_from_num(Numeric num, NumericVar *dest)
 	dest->dscale = NUMERIC_DSCALE(num);
 	dest->digits = NUMERIC_DIGITS(num);
 	dest->buf = dest->ndb;
+}
+
+/*
+ * Initialize a read-only NumericVar straight from an inline (1-byte or
+ * 4-byte uncompressed header) varlena datum, without the detoast copy that
+ * DatumGetNumeric() would make for the 1-byte-header values AOCS blocks
+ * hand out.  Digits are copied into the var's local buffer (at most
+ * NUMERIC_LOCAL_NDIG groups, aligned); 1-byte payloads would not be safe to
+ * dereference in place anyway.  Returns false for external or compressed
+ * datums and for values too wide for the local buffer; the caller then
+ * detoasts.
+ */
+static bool
+init_var_from_datum(Datum value, NumericVar *dest)
+{
+	char	   *ptr = (char *) DatumGetPointer(value);
+	char	   *data;
+	int			len;
+	uint16		header;
+
+	if (VARATT_IS_4B_U(ptr))
+	{
+		data = VARDATA_4B(ptr);
+		len = VARSIZE_4B(ptr) - VARHDRSZ;
+	}
+	else if (VARATT_IS_1B(ptr) && !VARATT_IS_1B_E(ptr))
+	{
+		data = VARDATA_1B(ptr);
+		len = VARSIZE_1B(ptr) - VARHDRSZ_SHORT;
+	}
+	else
+		return false;
+
+	/* a truncated payload cannot carry even the sign header */
+	if (len < (int32) sizeof(uint16))
+		return false;
+
+	memcpy(&header, data, sizeof(uint16));
+	dest->buf = dest->ndb;
+	if ((header & NUMERIC_SIGN_MASK) == NUMERIC_SHORT)
+	{
+		dest->sign = (header & NUMERIC_SHORT_SIGN_MASK) ? NUMERIC_NEG : NUMERIC_POS;
+		dest->dscale = (header & NUMERIC_SHORT_DSCALE_MASK) >>
+			NUMERIC_SHORT_DSCALE_SHIFT;
+		dest->weight = (header & NUMERIC_SHORT_WEIGHT_SIGN_MASK ?
+						~NUMERIC_SHORT_WEIGHT_MASK : 0) |
+			(header & NUMERIC_SHORT_WEIGHT_MASK);
+		data += sizeof(uint16);
+		len -= sizeof(uint16);
+	}
+	else
+	{
+		int16		weight;
+
+		memcpy(&weight, data + sizeof(uint16), sizeof(int16));
+		dest->sign = header & NUMERIC_SIGN_MASK;
+		dest->dscale = header & NUMERIC_DSCALE_MASK;
+		dest->weight = weight;
+		data += sizeof(uint16) + sizeof(int16);
+		len -= sizeof(uint16) + sizeof(int16);
+	}
+	dest->ndigits = len / sizeof(NumericDigit);
+	if (dest->ndigits > NUMERIC_LOCAL_NDIG)
+		return false;		/* too wide for the local buffer */
+	if (dest->ndigits > 0)
+		memcpy(dest->ndb, data, dest->ndigits * sizeof(NumericDigit));
+	dest->digits = dest->ndb;
+	return true;
 }
 
 
@@ -9915,4 +10197,193 @@ accum_sum_combine(NumericSumAccum *accum, NumericSumAccum *accum2)
 	accum_sum_add(accum, &tmp_var);
 
 	free_var(&tmp_var);
+}
+
+/* ---------------------------------------------------------------------
+ * Fast int64 helpers for the vectorized expression evaluator.
+ *
+ * A datum is decoded into an exact (mantissa, scale) pair, where
+ * value == mantissa * 10^-scale and scale = 4 * (ndigits - weight - 1)
+ * (or 0, when the value has trailing base-10000 zero groups folded in).
+ * The display scale is returned separately: arithmetic must pad results
+ * to the display scale the calculator functions produce so that outputs
+ * are identical to the fmgr path.
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Decode 'num' into (mantissa, scale) with value == mantissa * 10^-scale,
+ * plus its display scale.  Returns false for NaN or values whose mantissa
+ * does not fit in int64.
+ */
+bool
+numeric_decode_fast(Numeric num, int64 *mantissa, int *scale, int *dscale)
+{
+	NumericVar	var;
+
+	init_var_from_num(num, &var);
+	return numeric_decode_from_var(&var, mantissa, scale, dscale);
+}
+
+/*
+ * Like numeric_decode_fast(), but takes the datum as stored and skips the
+ * detoast copy for inline varlenas (AOCS blocks store small numerics with
+ * 1-byte headers).  Falls back to the detoasting decode for external,
+ * compressed, or over-wide datums.
+ */
+bool
+numeric_decode_fast_datum(Datum value, int64 *mantissa, int *scale,
+						  int *dscale)
+{
+	NumericVar	var;
+
+	if (!init_var_from_datum(value, &var))
+		return numeric_decode_fast(DatumGetNumeric(value), mantissa, scale,
+								   dscale);
+	return numeric_decode_from_var(&var, mantissa, scale, dscale);
+}
+
+/* The exact (mantissa, scale, dscale) fold shared by the decoders above. */
+static bool
+numeric_decode_from_var(NumericVar *var, int64 *mantissa, int *scale,
+						int *dscale)
+{
+	int64		total = 0;
+	int			i;
+
+	if (var->sign == NUMERIC_NAN)
+		return false;
+
+	for (i = 0; i < var->ndigits; i++)
+	{
+		if (total > (PG_INT64_MAX - (int64) var->digits[i]) / NBASE)
+			return false;
+		total = total * NBASE + var->digits[i];
+	}
+	if (var->sign == NUMERIC_NEG)
+		total = -total;
+
+	*scale = (var->ndigits - var->weight - 1) * DEC_DIGITS;
+	while (*scale < 0)
+	{
+		if (total > PG_INT64_MAX / 10 || total < PG_INT64_MIN / 10)
+			return false;
+		total *= 10;
+		(*scale)++;
+	}
+	if (*scale > NUMERIC_MAX_DISPLAY_SCALE)
+		return false;
+
+	*mantissa = total;
+	*dscale = var->dscale;
+	return true;
+}
+
+/*
+ * Scale 'mantissa' from 'scale' up to 'target' decimal places, rejecting
+ * overflow.  target must not be below scale.
+ */
+bool
+numeric_scale_fast(int64 *mantissa, int scale, int target)
+{
+	while (scale < target)
+	{
+		if (*mantissa > PG_INT64_MAX / 10 || *mantissa < PG_INT64_MIN / 10)
+			return false;
+		*mantissa *= 10;
+		scale++;
+	}
+	return scale == target;
+}
+
+/*
+ * Rescale 'mantissa' from 'scale' to 'target' decimal places.  Scaling up
+ * pads with zeroes; scaling down rounds half away from zero, like round_var.
+ */
+bool
+numeric_round_scale_fast(int64 *mantissa, int scale, int target)
+{
+	int64		div;
+	int64		q,
+				r;
+
+	if (scale < target)
+		return numeric_scale_fast(mantissa, scale, target);
+	if (scale == target)
+		return true;
+
+	div = 1;
+	for (int i = 0; i < scale - target; i++)
+	{
+		if (div > PG_INT64_MAX / 10)
+			return false;
+		div *= 10;
+	}
+	q = *mantissa / div;
+	r = *mantissa % div;
+	if (r < 0)
+	{
+		if (-r >= div + r)
+			q--;
+	}
+	else
+	{
+		if (r >= div - r)
+			q++;
+	}
+	*mantissa = q;
+	return true;
+}
+
+/*
+ * Multiply two decoded values, retaining the int128 product inside this C
+ * helper rather than in generated LLVM IR.  The display scale is rounded once.
+ */
+bool
+numeric_mul_fast(int64 left, int64 right, int scale, int dscale,
+				 int64 *mantissa)
+{
+#ifdef HAVE_INT128
+	int128		product = (int128) left * (int128) right;
+
+	if (product > PG_INT64_MAX || product < PG_INT64_MIN)
+		return false;
+	*mantissa = (int64) product;
+	return numeric_round_scale_fast(mantissa, scale, dscale);
+#else
+	return false;
+#endif
+}
+
+/*
+ * Build a numeric with the given mantissa and display scale:
+ * value == mantissa * 10^-dscale.
+ */
+Numeric
+numeric_build_fast(int64 mantissa, int dscale)
+{
+	NumericVar	var;
+	Numeric		result;
+	int			pad = (4 - dscale % 4) % 4;
+
+	/*
+	 * int64_to_numericvar builds digits for the value 'mantissa'; shifting
+	 * the weight left by (dscale + pad) / 4 digit groups turns that into
+	 * mantissa * 10^-dscale, with dscale as the display scale.
+	 */
+	while (pad > 0)
+	{
+		if (mantissa > PG_INT64_MAX / 10 || mantissa < PG_INT64_MIN / 10)
+			return NULL;
+		mantissa *= 10;
+		pad--;
+	}
+
+	init_var(&var);
+	int64_to_numericvar(mantissa, &var);
+	var.weight -= (dscale + (4 - dscale % 4) % 4) / 4;
+	var.dscale = dscale;
+	result = make_result(&var);
+	free_var(&var);
+	return result;
 }

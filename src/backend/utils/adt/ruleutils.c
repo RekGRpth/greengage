@@ -4709,6 +4709,9 @@ set_deparse_planstate(deparse_namespace *dpns, PlanState *ps)
 		dpns->outer_planstate = ((MergeAppendState *) ps)->mergeplans[0];
 	else if (IsA(ps, ModifyTableState))
 		dpns->outer_planstate = ((ModifyTableState *) ps)->mt_plans[0];
+	else if (IsA(ps, CustomScanState) &&
+			 ((CustomScanState *) ps)->custom_ps != NIL)
+		dpns->outer_planstate = linitial(((CustomScanState *) ps)->custom_ps);
 	else
 		dpns->outer_planstate = outerPlanState(ps);
 

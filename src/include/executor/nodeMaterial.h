@@ -23,4 +23,9 @@ extern void ExecMaterialRestrPos(MaterialState *node);
 extern void ExecReScanMaterial(MaterialState *node);
 extern void ExecSquelchMaterial(MaterialState *node);
 
+extern bool VectorMaterialPlanIsSupported(Material *node);
+extern TupleTableSlot *VectorMaterialNext(MaterialState *node,
+										PlanState *outer_proxy,
+										PlanState *outer_original);
+
 #endif							/* NODEMATERIAL_H */

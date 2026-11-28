@@ -1,0 +1,665 @@
+-- ---- Vector coverage canary ----
+-- Pins which plan shapes the vector post-pass takes for each expression
+-- and operator form, under force.  Any change of the region eligibility
+-- shows here as an expected-file diff, in both directions: a newly
+-- wrapped form and a newly rejected one.  Keep the forms additive; when
+-- a form's coverage intentionally changes, update the answer files with
+-- the same discipline as any other expected output.
+CREATE TABLE cov_aoco (a int, b bigint, c numeric(10,2), d text,
+                       e bpchar(5), f float8, g date, h timestamp,
+                       i bool, j int2, k varchar(10))
+WITH (appendonly = true, orientation = column)
+DISTRIBUTED BY (a);
+INSERT INTO cov_aoco
+SELECT i, i, (i % 100)::numeric(10,2), 'd' || (i % 7), 'E' || (i % 5),
+       i * 1.5, date '2020-01-01' + (i % 30),
+       timestamp '2020-01-01' + (i % 30) * interval '1 day',
+       (i % 2) = 0, (i % 50)::int2, 'v' || (i % 9)
+FROM generate_series(1, 2000) AS i;
+CREATE TABLE cov_heap (a int, d text) DISTRIBUTED BY (a);
+INSERT INTO cov_heap SELECT i, 'h' || (i % 11) FROM generate_series(1, 2000) AS i;
+ANALYZE cov_aoco;
+ANALYZE cov_heap;
+SET gp_vectorized_execution = force;
+-- comparisons, by specialized family
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE j = 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (j = 3)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a = 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (a = 3)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE b = 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (b = 3)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE c > 10;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (c > '10'::numeric)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE f > 1.5;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (f > '1.5'::double precision)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE g >= date '2020-01-10';
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (g >= '01-10-2020'::date)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE h >= timestamp '2020-01-10 00:00';
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (h >= 'Fri Jan 10 00:00:00 2020'::timestamp without time zone)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE i;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: i
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d = 'd3';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (d = 'd3'::text)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d <> 'd3';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (d <> 'd3'::text)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE e = 'E3';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (e = 'E3'::bpchar)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE k = 'v3';
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((k)::text = 'v3'::text)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d < 'd3';  -- ordering compare stays row-wise
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (d < 'd3'::text)
+(7 rows)
+
+-- boolean composition and conditional forms
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a = 3 AND b = 3;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: ((a = 3) AND (b = 3))
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a = 3 OR b = 3;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: ((a = 3) OR (b = 3))
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d IS NULL OR e IS NOT NULL;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((d IS NULL) OR (e IS NOT NULL))
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE i IS TRUE;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (i IS TRUE)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco
+  WHERE CASE WHEN a % 2 = 0 THEN d ELSE e END = 'd3';
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (CASE WHEN ((a % 2) = 0) THEN (d)::bpchar ELSE e END = 'd3'::bpchar)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE COALESCE(d, e) = 'd3';
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (COALESCE(d, (e)::text) = 'd3'::text)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE NULLIF(a, 3) = 4;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (NULLIF(a, 3) = 4)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE GREATEST(a, 3) = a;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (GREATEST(a, 3) = a)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE LEAST(a, 3) = 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (LEAST(a, 3) = 3)
+(6 rows)
+
+-- arithmetic, by specialized family
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a + 1 > 3;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((a + 1) > 3)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE b * 2 > 3;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((b * 2) > 3)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE c * 1.5 > 10;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((c * 1.5) > '10'::numeric)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE f * 2.0 > 1.5;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((f * '2'::double precision) > '1.5'::double precision)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a / 2 > 1;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: ((a / 2) > 1)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a % 2 = 0;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: ((a % 2) = 0)
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a + a % 3 * 2 - 1 > 0;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (((a + ((a % 3) * 2)) - 1) > 0)
+(7 rows)
+
+-- IN lists: constant set (specialized) and dynamic array (generic)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a IN (1, 2, 3);
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 2:1  (slice1; segments: 2)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (a = ANY ('{1,2,3}'::integer[]))
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d IN ('d1', 'd2');
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (d = ANY ('{d1,d2}'::text[]))
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE e NOT IN ('E1', 'E2');
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (e <> ALL ('{E1,E2}'::bpchar[]))
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a = ANY (ARRAY[1, a % 3]);
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (a = ANY (ARRAY[1, (a % 3)]))
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d LIKE 'd%';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (d ~~ 'd%'::text)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE d LIKE '%3' ESCAPE '#';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+                           Filter: (d ~~ '%3'::text)
+(7 rows)
+
+-- aggregates, plain and grouped
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), avg(c), min(g), max(h) FROM cov_aoco;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM cov_aoco GROUP BY a;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (VectorRegion)
+         ->  HashAggregate
+               Group Key: cov_aoco.a
+               ->  Seq Scan on cov_aoco
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT d, count(*) FROM cov_aoco GROUP BY d;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (VectorRegion)
+         ->  Finalize HashAggregate
+               Group Key: vector_region.c1
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: vector_region.c1
+                     ->  Custom Scan (VectorRegion)
+                           ->  Partial HashAggregate
+                                 Group Key: cov_aoco.d
+                                 ->  Seq Scan on cov_aoco
+(11 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(DISTINCT d) FROM cov_aoco;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FILTER (WHERE i) FROM cov_aoco;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_aoco
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT d, count(*) FROM cov_aoco GROUP BY d ORDER BY d LIMIT 5;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: vector_region_1.c1
+         ->  Limit
+               ->  Sort
+                     Sort Key: vector_region_1.c1
+                     ->  Custom Scan (VectorRegion)
+                           ->  Finalize HashAggregate
+                                 Group Key: vector_region.c1
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: vector_region.c1
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Partial HashAggregate
+                                                   Group Key: cov_aoco.d
+                                                   ->  Seq Scan on cov_aoco
+(16 rows)
+
+EXPLAIN (COSTS OFF) SELECT DISTINCT a FROM cov_aoco;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (VectorRegion)
+         ->  HashAggregate
+               Group Key: cov_aoco.a
+               ->  Seq Scan on cov_aoco
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT d, GROUPING(d) FROM cov_aoco GROUP BY ROLLUP (d);
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (VectorRegion)
+         ->  Finalize HashAggregate
+               Group Key: vector_region.c1, vector_region.c3
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: vector_region.c1, vector_region.c3
+                     ->  Custom Scan (VectorRegion)
+                           ->  Partial MixedAggregate
+                                 Hash Key: cov_aoco.d
+                                 Group Key: ()
+                                 ->  Seq Scan on cov_aoco
+(12 rows)
+
+-- joins
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.a = q.a;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Hash Join
+                           Hash Cond: (p.a = vector_region.c1)
+                           ->  Seq Scan on cov_aoco p
+                           ->  Hash
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on cov_aoco q
+(11 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.d = q.d;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Hash Join
+                           Hash Cond: (vector_region.c1 = vector_region_1.c1)
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: vector_region.c1
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on cov_aoco p
+                           ->  Hash
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: vector_region_1.c1
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Seq Scan on cov_aoco q
+(16 rows)
+
+SET enable_hashjoin = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_aoco q ON p.a = q.a;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Custom Scan (VectorRegion)
+                     ->  Merge Join
+                           Merge Cond: (p.a = vector_region.c1)
+                           ->  Sort
+                                 Sort Key: p.a
+                                 ->  Seq Scan on cov_aoco p
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Sort
+                                       Sort Key: q.a
+                                       ->  Seq Scan on cov_aoco q
+(14 rows)
+
+RESET enable_hashjoin;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco p JOIN cov_heap q ON p.d = q.d;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Hash Join
+                           Hash Cond: (vector_region.c1 = vector_region_1.c1)
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: vector_region.c1
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on cov_aoco p
+                           ->  Hash
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: vector_region_1.c1
+                                       ->  Custom Scan (VectorRegion)
+                                             ->  Seq Scan on cov_heap q
+(16 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE EXISTS (SELECT 1 FROM cov_heap WHERE cov_heap.a = cov_aoco.a);
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Hash Semi Join
+                           Hash Cond: (cov_aoco.a = vector_region.c1)
+                           ->  Seq Scan on cov_aoco
+                           ->  Hash
+                                 ->  Custom Scan (VectorRegion)
+                                       ->  Seq Scan on cov_heap
+(11 rows)
+
+-- heap leaf through the row adapter, append over union all
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_heap WHERE d = 'h3';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Partial Aggregate
+                     ->  Seq Scan on cov_heap
+                           Filter: (d = 'h3'::text)
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_heap WHERE a IN (1, 2);
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 2:1  (slice1; segments: 2)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_heap
+                     Filter: (a = ANY ('{1,2}'::integer[]))
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM
+  (SELECT a, d FROM cov_heap UNION ALL SELECT a, e FROM cov_aoco) t;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Append
+                     ->  Custom Scan (VectorRegion)
+                           ->  Seq Scan on cov_heap
+                     ->  Subquery Scan on "*SELECT* 2"
+                           ->  Custom Scan (VectorRegion)
+                                 ->  Seq Scan on cov_aoco
+(10 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM
+  (SELECT a, d FROM cov_heap UNION ALL SELECT a, d FROM cov_heap) t
+GROUP BY a;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (VectorRegion)
+         ->  HashAggregate
+               Group Key: vector_region.c1
+               ->  Custom Scan (VectorRegion)
+                     ->  Append
+                           ->  Seq Scan on cov_heap
+                           ->  Seq Scan on cov_heap cov_heap_1
+(9 rows)
+
+-- uncorrelated initplan/subplan
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cov_aoco WHERE a = (SELECT max(a) FROM cov_heap);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Custom Scan (VectorRegion)
+                       ->  Partial Aggregate
+                             ->  Seq Scan on cov_heap
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Custom Scan (VectorRegion)
+               ->  Seq Scan on cov_aoco
+                     Filter: (a = $0)
+(12 rows)
+
+RESET gp_vectorized_execution;
+DROP TABLE cov_aoco;
+DROP TABLE cov_heap;

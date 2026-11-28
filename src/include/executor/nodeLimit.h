@@ -20,4 +20,15 @@ extern LimitState *ExecInitLimit(Limit *node, EState *estate, int eflags);
 extern void ExecEndLimit(LimitState *node);
 extern void ExecReScanLimit(LimitState *node);
 
+typedef enum VectorLimitResult
+{
+	VECTOR_LIMIT_SKIP,
+	VECTOR_LIMIT_EMIT,
+	VECTOR_LIMIT_EOF
+} VectorLimitResult;
+
+extern bool VectorLimitPlanIsSupported(Limit *limit);
+extern bool VectorLimitStart(LimitState *node);
+extern VectorLimitResult VectorLimitNext(LimitState *node);
+
 #endif							/* NODELIMIT_H */

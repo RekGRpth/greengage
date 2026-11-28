@@ -45,7 +45,7 @@ OBJS=$(WIN32RES)
 OBJS += llvmjit.o llvmjit_error.o llvmjit_inline.o llvmjit_wrap.o SectionMemoryManager.o
 
 # Code generation
-OBJS += llvmjit_expr.o llvmjit_deform.o
+OBJS += llvmjit_expr.o llvmjit_deform.o llvmjit_vector.o
 
 all: all-shared-lib llvmjit_types.bc
 

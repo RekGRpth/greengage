@@ -42,6 +42,12 @@ extern void ExecParallelHashTableSetCurrentBatch(HashJoinTable hashtable,
 extern bool ExecHashTableInsert(HashState *hashState, HashJoinTable hashtable,
 								TupleTableSlot *slot,
 								uint32 hashvalue);
+extern void ExecHashSkewTableInsert(HashState *hashState,
+									HashJoinTable hashtable,
+									TupleTableSlot *slot,
+									uint32 hashvalue,
+									int bucketNumber);
+extern void ExecHashIncreaseNumBuckets(HashJoinTable hashtable);
 extern void ExecParallelHashTableInsert(HashJoinTable hashtable,
 										TupleTableSlot *slot,
 										uint32 hashvalue);

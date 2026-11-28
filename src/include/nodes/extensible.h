@@ -82,6 +82,13 @@ extern const ExtensibleNodeMethods *GetExtensibleNodeMethods(const char *name,
 #define CUSTOMPATH_SUPPORT_MARK_RESTORE		0x0002
 
 /*
+ * Greengage memory quota policy flags for CustomScan.flags.  Keep these
+ * above the capability bits that upstream may add.
+ */
+#define CUSTOMSCAN_GP_MEMORY_INTENSIVE	0x0100
+#define CUSTOMSCAN_GP_BLOCKING			0x0200
+
+/*
  * Custom path methods.  Mostly, we just need to know how to convert a
  * CustomPath to a plan.
  */

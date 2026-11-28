@@ -2466,6 +2466,7 @@ typedef struct SortState
 	bool		delayEagerFree;		/* is it safe to free memory used by this node,
 									 * when this node has outputted its last row? */
 	TuplesortInstrumentation sortstats; /* holds stats, if the Sort is eagerly free'd */
+	void	   *vector_sort_state;	/* private state of native batch sort */
 
 } SortState;
 

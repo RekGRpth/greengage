@@ -385,6 +385,17 @@ typedef struct ChunkSorterEntry
 	bool		end_of_stream;
 }	ChunkSorterEntry;
 
+/*
+ * A decoded vector-executor batch waiting on an unsorted motion
+ * receiver.  Populated only from TC_BATCH_* chunk sequences.
+ */
+struct VectorBatch;
+typedef struct ReadyBatch
+{
+	struct VectorBatch *batch;
+	struct ReadyBatch *next;
+} ReadyBatch;
+
 /* This is the entry data-structure for a motion node. */
 typedef struct MotionNodeEntry
 {
@@ -457,7 +468,54 @@ typedef struct MotionNodeEntry
 	uint64          stat_tuples_available;  /* Total tuples awaiting receive. */
 	uint64          stat_tuples_available_hwm;              /* High-water-mark of this
 		* value. */
+
+	/*
+	 * Batches decoded from TC_BATCH_* chunk sequences on an unsorted
+	 * receiver, consumed before the tuple FIFO by a vectorized consumer.
+	 * Appended at the end to keep the struct layout stable for the ABI check.
+	 */
+	ReadyBatch	   *ready_batch_head;
+	ReadyBatch	   *ready_batch_tail;
+	/*
+	 * Lazy batch-to-row vending for a row-wise consumer: instead of
+	 * forming every queued batch's rows into the FIFO up front, hold
+	 * the decoded batch and form one row per RecvTupleFrom call.  A
+	 * batch stream of n rows then costs one heap_form_minimal_tuple
+	 * per row and an O(1) teardown, instead of n forms plus a FIFO
+	 * holding n entries that teardown frees one by one.
+	 */
+	struct VectorBatch *pending_batch;
+	int32           pending_row;
+	/*
+	 * The chunk-assembly buffer moved into the decoded batch (its
+	 * wire_data): the decode points its by-reference values into the
+	 * payload, so each batch owns the buffer it was assembled in until
+	 * it is destroyed.
+	 *
+	 * Recycling pools, filled only from VectorBatchDestroy (the release
+	 * point of the batch lifetime contract: nothing can reference the
+	 * storage once it is pooled).  Payload buffers are reused when big
+	 * enough, the newest few kept; batch shells are replayed through
+	 * VectorBatchDecodeRowsInto; queue nodes through the ready list.
+	 */
+#define MOTION_WIRE_POOL_MAX	4
+#define MOTION_SHELL_POOL_MAX	4
+	char		   *wire_pool[MOTION_WIRE_POOL_MAX];
+	Size			wire_pool_cap[MOTION_WIRE_POOL_MAX];
+	int				wire_pool_count;
+	struct VectorBatch *shell_pool[MOTION_SHELL_POOL_MAX];
+	int				shell_pool_count;
+	ReadyBatch	   *rb_pool[MOTION_SHELL_POOL_MAX];
+	int				rb_pool_count;
 }       MotionNodeEntry;
+
+/*
+ * Recycle hook for decoded vector batches: installed by the motion
+ * layer in each batch it decodes, called by VectorBatchDestroy as the
+ * release point of the batch lifetime contract.
+ */
+struct VectorBatch;
+extern void VectorMotionRecycleBatch(void *owner, struct VectorBatch *batch);
 
 
 /*=========================================================================

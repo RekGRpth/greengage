@@ -21,6 +21,8 @@
 #include "libpq-int.h"
 #include "cdb/cdbconn.h"
 #include "cdb/cdbmotion.h"
+#include "executor/vectorBatch.h"
+#include "access/htup_details.h"
 #include "cdb/cdbvars.h"
 #include "cdb/htupfifo.h"
 #include "cdb/ml_ipc.h"
@@ -53,7 +55,8 @@ static MotionNodeEntry *getMotionNodeEntry(MotionLayerState *mlStates, int16 mot
 static ChunkSorterEntry *getChunkSorterEntry(MotionLayerState *mlStates,
 					MotionNodeEntry *motNodeEntry,
 					int16 srcRoute);
-static void addChunkToSorter(ChunkTransportState *transportStates,
+static void addChunkToSorter(MotionLayerState *mlStates,
+							 ChunkTransportState *transportStates,
 							 MotionNodeEntry *pMNEntry,
 							 TupleChunkListItem tcItem,
 							 int16 motNodeID,
@@ -278,6 +281,7 @@ UpdateMotionLayerNode(MotionLayerState *mlStates, int16 motNodeID, bool preserve
 	{
 		/* Create a tuple-store for the motion node's incoming tuples. */
 		pEntry->ready_tuples = htfifo_create();
+		/* ready_batch_head/tail stay NULL: mnEntries is zero-allocated */
 	}
 	else
 		pEntry->ready_tuples = NULL;
@@ -522,6 +526,321 @@ SendTuple(MotionLayerState *mlStates,
 }
 
 /*
+ * Send one encoded vector batch (VectorBatchEncodeRows payload) to a
+ * single route.  The payload is split over TC_BATCH_START..MID*..END
+ * chunks the same way large tuples are, so the interconnect treats it
+ * as opaque bytes.
+ */
+SendReturnCode
+SendBatchChunk(MotionLayerState *mlStates,
+			   ChunkTransportState *transportStates,
+			   int16 motNodeID,
+			   const char *payload, int32 len,
+			   int16 targetRoute)
+{
+	MotionNodeEntry *pMNEntry;
+	const char *pos = payload;
+	int32		remaining = len;
+	MemoryContext oldCtxt;
+
+	if (gp_motion_slice_noop != 0 && (gp_motion_slice_noop & (1 << currentSliceId)) != 0)
+		return SEND_COMPLETE;
+
+	pMNEntry = getMotionNodeEntry(mlStates, motNodeID);
+	oldCtxt = MemoryContextSwitchTo(mlStates->motion_layer_mctx);
+
+	{
+		int32		space = Gp_max_tuple_chunk_size - TUPLE_CHUNK_HEADER_SIZE;
+
+		/*
+		 * A batch that fits one chunk travels as a single TC_BATCH_END
+		 * chunk carrying the whole payload (a bare END marker would be
+		 * payload-less and may not survive the interconnect).
+		 */
+		if (len <= space)
+		{
+			TupleChunkListItem item = getChunkFromCache(&pMNEntry->ser_tup_info.chunkCache);
+
+			SetChunkDataSize(item->chunk_data, len);
+			SetChunkType(item->chunk_data, TC_BATCH_END);
+			memcpy(item->chunk_data + TUPLE_CHUNK_HEADER_SIZE, payload, len);
+			item->chunk_length = len + TUPLE_CHUNK_HEADER_SIZE;
+			item->inplace = NULL;
+			item->p_next = NULL;
+			if (!SendTupleChunkToAMS(mlStates, transportStates, motNodeID,
+									 targetRoute, item))
+			{
+				pMNEntry->stopped = true;
+				MemoryContextSwitchTo(oldCtxt);
+				return STOP_SENDING;
+			}
+			MemoryContextSwitchTo(oldCtxt);
+			return SEND_COMPLETE;
+		}
+
+		for (;;)
+		{
+			TupleChunkListItem item;
+			int32		n = Min(space, remaining);
+			bool		last = (remaining <= space);
+			TupleChunkType tcType;
+
+			if (pos == payload)
+				tcType = TC_BATCH_START;
+			else
+				tcType = last ? TC_BATCH_END : TC_BATCH_MID;
+
+			item = getChunkFromCache(&pMNEntry->ser_tup_info.chunkCache);
+			SetChunkDataSize(item->chunk_data, n);
+			SetChunkType(item->chunk_data, tcType);
+			if (n > 0)
+				memcpy(item->chunk_data + TUPLE_CHUNK_HEADER_SIZE, pos, n);
+			item->chunk_length = n + TUPLE_CHUNK_HEADER_SIZE;
+			item->inplace = NULL;
+			item->p_next = NULL;
+
+			if (!SendTupleChunkToAMS(mlStates, transportStates, motNodeID,
+									 targetRoute, item))
+			{
+				pMNEntry->stopped = true;
+				MemoryContextSwitchTo(oldCtxt);
+				return STOP_SENDING;
+			}
+
+			pos += n;
+			remaining -= n;
+
+			if (last)
+				break;
+		}
+
+	}
+
+	MemoryContextSwitchTo(oldCtxt);
+	return SEND_COMPLETE;
+}
+
+/*
+ * The wire payload buffer carries its allocation size in a leading
+ * Size word (the payload proper starts one MAXALIGN step in, so the
+ * datum alignment is preserved): the recycling pool needs the size at
+ * hand-back, when nothing else remembers it.  MAXALIGN keeps the
+ * payload Datum-aligned; offsetof(StringInfoData, data) would be zero
+ * and put the header inside the payload itself.
+ */
+#define WIRE_PAYLOAD_HDR	MAXALIGN(sizeof(Size))
+
+/*
+ * VectorBatchDestroy's recycle hook for fast-table aggregate batches:
+ * the owner pools the shell (columns, selection, varlena context) and
+ * the payload buffer.  Destroy is the release point of the batch
+ * lifetime contract, so nothing can hold the storage once it is
+ * pooled.
+ */
+void
+VectorMotionRecycleBatch(void *owner, VectorBatch *batch)
+{
+	MotionNodeEntry *pMNEntry = (MotionNodeEntry *) owner;
+
+	if (batch->wire_data != NULL)
+	{
+		char	   *raw = batch->wire_data - WIRE_PAYLOAD_HDR;
+		Size		sz = *(Size *) raw;
+
+		if (pMNEntry->wire_pool_count < MOTION_WIRE_POOL_MAX)
+		{
+			pMNEntry->wire_pool[pMNEntry->wire_pool_count] = raw;
+			pMNEntry->wire_pool_cap[pMNEntry->wire_pool_count] = sz;
+			pMNEntry->wire_pool_count++;
+		}
+		else
+		{
+			/* pool full: drop the smallest, keep the bigger buffers */
+			int			i_min = 0;
+			int			i;
+
+			for (i = 1; i < MOTION_WIRE_POOL_MAX; i++)
+				if (pMNEntry->wire_pool_cap[i] < pMNEntry->wire_pool_cap[i_min])
+					i_min = i;
+			if (sz >= pMNEntry->wire_pool_cap[i_min])
+			{
+				pfree(pMNEntry->wire_pool[i_min]);
+				pMNEntry->wire_pool[i_min] = raw;
+				pMNEntry->wire_pool_cap[i_min] = sz;
+			}
+			else
+				pfree(raw);
+		}
+		batch->wire_data = NULL;
+	}
+
+	/* park the shell with its columns and context intact */
+	batch->wire_owner = NULL;
+	batch->wire_recycle = NULL;
+	VectorBatchReset(batch);
+	if (pMNEntry->shell_pool_count < MOTION_SHELL_POOL_MAX)
+		pMNEntry->shell_pool[pMNEntry->shell_pool_count++] = batch;
+	else
+		VectorBatchDestroy(batch);
+}
+
+/*
+ * Take a payload buffer from the recycling pool (the first one big
+ * enough) or allocate a fresh one; the caller assembles into the data
+ * after the size header.
+ */
+static char *
+TakeWireBuffer(MotionNodeEntry *pMNEntry, int len)
+{
+	Size		need = (Size) len + 1 + WIRE_PAYLOAD_HDR;
+	int			i;
+
+	for (i = 0; i < pMNEntry->wire_pool_count; i++)
+	{
+		if (pMNEntry->wire_pool_cap[i] >= need)
+		{
+			char	   *raw = pMNEntry->wire_pool[i];
+
+			pMNEntry->wire_pool[i] = pMNEntry->wire_pool[--pMNEntry->wire_pool_count];
+			pMNEntry->wire_pool_cap[i] = pMNEntry->wire_pool_cap[pMNEntry->wire_pool_count];
+			*(Size *) raw = need;
+			return raw + WIRE_PAYLOAD_HDR;
+		}
+	}
+	{
+		char	   *raw = (char *) palloc(need);
+
+		*(Size *) raw = need;
+		return raw + WIRE_PAYLOAD_HDR;
+	}
+}
+
+/*
+ * Take a recycled batch shell (columns, selection and varlena context
+ * intact) or create one, and wire it to this entry's recycle hook.
+ */
+static VectorBatch *
+TakeMotionBatch(MotionLayerState *mlStates, MotionNodeEntry *pMNEntry)
+{
+	VectorBatch  *batch;
+
+	if (pMNEntry->shell_pool_count > 0)
+		batch = pMNEntry->shell_pool[--pMNEntry->shell_pool_count];
+	else
+		batch = VectorBatchCreate(mlStates->motion_layer_mctx,
+								  pMNEntry->tuple_desc,
+								  VECTOR_BATCH_DEFAULT_CAPACITY, false);
+	batch->wire_owner = pMNEntry;
+	batch->wire_recycle = VectorMotionRecycleBatch;
+	return batch;
+}
+
+/*
+ * Reassemble a TC_BATCH_* chunk sequence into one columnar batch and
+ * queue it on the motion node entry for a vectorized consumer.
+ */
+static void
+reconstructBatch(MotionLayerState *mlStates, MotionNodeEntry *pMNEntry,
+				 ChunkSorterEntry *pCSEntry)
+{
+	TupleChunkListItem tcItem;
+	StringInfoData buf;
+	VectorBatch  *batch;
+	int			len = 0;
+
+	/*
+	 * One payload buffer per batch, recycled through the entry's pool at
+	 * destroy: the decode hands the buffer over to the batch and its
+	 * by-reference values point into it (zero-copy), so the buffer must
+	 * stay untouched until the batch is destroyed.  The exact presize
+	 * never grows the allocation.
+	 */
+	for (tcItem = pCSEntry->chunk_list.p_first; tcItem != NULL;
+		 tcItem = tcItem->p_next)
+		len += tcItem->chunk_length - TUPLE_CHUNK_HEADER_SIZE;
+
+	buf.data = TakeWireBuffer(pMNEntry, len);
+	buf.maxlen = len + 1;
+	buf.len = 0;
+	buf.cursor = 0;
+
+	for (tcItem = pCSEntry->chunk_list.p_first; tcItem != NULL;
+		 tcItem = tcItem->p_next)
+		appendBinaryStringInfo(&buf,
+							   GetChunkDataPtr(tcItem) + TUPLE_CHUNK_HEADER_SIZE,
+							   tcItem->chunk_length - TUPLE_CHUNK_HEADER_SIZE);
+
+	batch = TakeMotionBatch(mlStates, pMNEntry);
+	VectorBatchDecodeRowsInto(batch, buf.data, buf.len);
+
+	{
+		ReadyBatch *node = (ReadyBatch *) palloc(sizeof(ReadyBatch));
+
+		node->batch = batch;
+		node->next = NULL;
+		if (pMNEntry->ready_batch_tail != NULL)
+			pMNEntry->ready_batch_tail->next = node;
+		else
+			pMNEntry->ready_batch_head = node;
+		pMNEntry->ready_batch_tail = node;
+	}
+
+	clearTCList(&pMNEntry->ser_tup_info.chunkCache, &pCSEntry->chunk_list);
+}
+
+/*
+ * Receive the next decoded vector batch from an unsorted motion, or
+ * NULL at end of stream.  Tuples already received stay in the tuple
+ * FIFO; a stream is homogeneous per sender, so mixed streams do not
+ * occur in practice.
+ */
+VectorBatch *
+RecvBatchFrom(MotionLayerState *mlStates,
+			  ChunkTransportState *transportStates,
+			  int16 motNodeID,
+			  bool *tuples_only)
+{
+	MotionNodeEntry *pMNEntry = getMotionNodeEntry(mlStates, motNodeID);
+
+	Assert(!pMNEntry->preserve_order);
+	if (tuples_only != NULL)
+		*tuples_only = false;
+
+	for (;;)
+	{
+		ReadyBatch *node = pMNEntry->ready_batch_head;
+		VectorBatch *batch;
+
+		if (node != NULL)
+		{
+			pMNEntry->ready_batch_head = node->next;
+			if (pMNEntry->ready_batch_head == NULL)
+				pMNEntry->ready_batch_tail = NULL;
+			batch = node->batch;
+			pfree(node);
+			return batch;
+		}
+
+		/*
+		 * Tuple chunks on the FIFO mean the sender did not batch; leave
+		 * them for the per-row path.
+		 */
+		if (pMNEntry->ready_tuples->p_first != NULL)
+		{
+			if (tuples_only != NULL)
+				*tuples_only = true;
+			return NULL;
+		}
+
+		if (!pMNEntry->moreNetWork)
+			return NULL;
+
+		processIncomingChunks(mlStates, transportStates, pMNEntry,
+							  motNodeID, ANY_ROUTE);
+	}
+}
+
+/*
  * Sends a token to all peer Motion Nodes, indicating that this motion
  * node has no more tuples to send out.
  */
@@ -549,6 +868,71 @@ SendEndOfStream(MotionLayerState *mlStates,
 
 	/* We record EOS as if a tuple were sent. */
 	statSendEOS(mlStates, pMNEntry);
+}
+
+/*
+ * A row-wise consumer drains a vectorized stream through the tuple FIFO:
+ * decompose the next queued batch into minimal tuples.  Batches live in
+ * the motion layer context, the deformed tuples follow the usual FIFO
+ * ownership (the consumer frees them).
+ */
+/*
+ * Take ownership of the queued batch at the head of the batch queue:
+ * the ReadyBatch node is unlinked and freed, the decoded batch moves
+ * to the entry's pending slot for row-by-row vending.
+ */
+static void
+TakePendingBatch(MotionNodeEntry *pMNEntry)
+{
+	ReadyBatch *node = pMNEntry->ready_batch_head;
+
+	if (node == NULL)
+		return;
+	pMNEntry->ready_batch_head = node->next;
+	if (pMNEntry->ready_batch_head == NULL)
+		pMNEntry->ready_batch_tail = NULL;
+	pMNEntry->pending_batch = node->batch;
+	pMNEntry->pending_row = 0;
+	pfree(node);
+}
+
+/*
+ * Form the pending batch's current row as the next tuple for a row-wise
+ * consumer, advancing the vending cursor; destroy the batch when its
+ * rows run out.  Values are read selection-aware and by-reference data
+ * needs no copy: heap_form_minimal_tuple copies it into the tuple body,
+ * and the batch outlives the call.
+ */
+static MinimalTuple
+VendPendingBatchTuple(MotionNodeEntry *pMNEntry)
+{
+	VectorBatch *batch = pMNEntry->pending_batch;
+	TupleDesc	tupdesc = pMNEntry->tuple_desc;
+	int			natts = tupdesc->natts;
+	Datum	   *values = (Datum *) palloc(sizeof(Datum) * Max(natts, 1));
+	bool	   *isnull = (bool *) palloc(sizeof(bool) * Max(natts, 1));
+	MinimalTuple tup;
+	int			col;
+	int			row = VectorBatchSelectedRow(batch, pMNEntry->pending_row);
+
+	for (col = 0; col < natts; col++)
+	{
+		isnull[col] = VectorBatchIsNull(batch, col, row);
+		values[col] = isnull[col] ? 0 :
+			VectorBatchGetDatum(batch, col, row);
+	}
+	tup = heap_form_minimal_tuple(tupdesc, values, isnull);
+	pfree(values);
+	pfree(isnull);
+
+	pMNEntry->pending_row++;
+	if (pMNEntry->pending_row >= batch->nselected)
+	{
+		VectorBatchDestroy(batch);
+		pMNEntry->pending_batch = NULL;
+		pMNEntry->pending_row = 0;
+	}
+	return tup;
 }
 
 /*
@@ -595,10 +979,29 @@ RecvTupleFrom(MotionLayerState *mlStates,
 
 	for (;;)
 	{
+		/*
+		 * A pending batch vends first: batch chunks and tuple chunks
+		 * never mix on one stream, so the two sources cannot both be
+		 * non-empty.
+		 */
+		if (pMNEntry->pending_batch != NULL)
+		{
+			tuple = VendPendingBatchTuple(pMNEntry);
+			if (tuple)
+				break;
+			continue;
+		}
 		/* Get the next tuple from the FIFO, if one is available. */
 		tuple = htfifo_gettuple(ReadyList);
 		if (tuple)
 			break;
+
+		/* row-wise consumers drain vectorized streams via tuples */
+		if (pMNEntry->ready_batch_head != NULL)
+		{
+			TakePendingBatch(pMNEntry);
+			continue;
+		}
 
 		/*
 		 * We need to get more chunks before we have a full tuple to return. Loop
@@ -697,7 +1100,8 @@ processIncomingChunks(MotionLayerState *mlStates,
 		}
 
 		/* Stick the chunk into the sorter. */
-		addChunkToSorter(transportStates,
+		addChunkToSorter(mlStates,
+						 transportStates,
 						 pMNEntry,
 						 tcItem,
 						 motNodeID,
@@ -841,6 +1245,11 @@ EndMotionLayerNode(MotionLayerState *mlStates, int16 motNodeID, bool flushCommLa
 	FreeTupleDesc(pMNEntry->tuple_desc);
 	if (!pMNEntry->preserve_order)
 		htfifo_destroy(pMNEntry->ready_tuples);
+	if (pMNEntry->pending_batch != NULL)
+	{
+		VectorBatchDestroy(pMNEntry->pending_batch);
+		pMNEntry->pending_batch = NULL;
+	}
 
 	pMNEntry->valid = false;
 }
@@ -992,7 +1401,8 @@ materializeChunk(TupleChunkListItem *tcItem)
  * appropriate list of chunks.
  */
 static void
-addChunkToSorter(ChunkTransportState *transportStates,
+addChunkToSorter(MotionLayerState *mlStates,
+				 ChunkTransportState *transportStates,
 				 MotionNodeEntry *pMNEntry,
 				 TupleChunkListItem tcItem,
 				 int16 motNodeID,
@@ -1085,6 +1495,64 @@ addChunkToSorter(ChunkTransportState *transportStates,
 			/* Put this chunk into the list, then turn it into a HeapTuple! */
 			appendChunkToTCList(&chunkSorterEntry->chunk_list, tcItem);
 			reconstructTuple(pMNEntry, chunkSorterEntry, conn->remapper);
+
+			break;
+
+		case TC_BATCH_START:
+
+			if (chunkSorterEntry->chunk_list.num_chunks != 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("received TC_BATCH_START chunk from [src=%d,mn=%d] after partial data",
+								srcRoute, motNodeID)));
+			}
+
+			materializeChunk(&tcItem);
+			appendChunkToTCList(&chunkSorterEntry->chunk_list, tcItem);
+
+			break;
+
+		case TC_BATCH_MID:
+
+			if (chunkSorterEntry->chunk_list.num_chunks <= 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("received TC_BATCH_MID chunk from [src=%d,mn=%d] without leading batch data",
+								srcRoute, motNodeID)));
+			}
+
+			materializeChunk(&tcItem);
+			appendChunkToTCList(&chunkSorterEntry->chunk_list, tcItem);
+
+			break;
+
+		case TC_BATCH_END:
+
+			/*
+			 * A single-chunk batch arrives as a lone END carrying the
+			 * whole payload.
+			 */
+			if (chunkSorterEntry->chunk_list.num_chunks <= 0 &&
+				tcItem->chunk_length > TUPLE_CHUNK_HEADER_SIZE)
+			{
+				materializeChunk(&tcItem);
+				appendChunkToTCList(&chunkSorterEntry->chunk_list, tcItem);
+				reconstructBatch(mlStates, pMNEntry, chunkSorterEntry);
+				break;
+			}
+
+			if (chunkSorterEntry->chunk_list.num_chunks <= 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("received TC_BATCH_END chunk from [src=%d,mn=%d] without leading batch data",
+								srcRoute, motNodeID)));
+			}
+
+			appendChunkToTCList(&chunkSorterEntry->chunk_list, tcItem);
+			reconstructBatch(mlStates, pMNEntry, chunkSorterEntry);
 
 			break;
 

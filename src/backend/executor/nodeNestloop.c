@@ -26,6 +26,7 @@
 #include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeNestloop.h"
+#include "executor/instrument.h"
 #include "optimizer/clauses.h"
 #include "utils/lsyscache.h"
 #include "miscadmin.h"
@@ -764,4 +765,47 @@ extractFuncExprArgs(Expr *clause, List **lclauses, List **rclauses)
 	}
 	else
 		elog(ERROR, "unexpected join qual in JOIN_LASJ_NOTIN join");
+}
+
+bool
+VectorNestLoopPlanIsSupported(NestLoop *node)
+{
+	if (node->shared_outer || node->join.plan.initPlan != NIL ||
+		node->join.plan.extParam != NULL || node->join.plan.allParam != NULL)
+		return false;
+	switch (node->join.jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+		case JOIN_LASJ_NOTIN:
+			return true;
+		default:
+			return false;
+	}
+}
+
+TupleTableSlot *
+VectorNestLoopNext(NestLoopState *node, PlanState *outer_proxy,
+				   PlanState *outer_original)
+{
+	Instrumentation *instr = node->js.ps.instrument;
+	TupleTableSlot *result;
+
+	/* the region drives the nestloop directly, so ExecProcNode's
+	 * instrumentation never runs; approximate it per output row */
+	if (instr)
+		InstrStartNode(instr);
+	result = ExecNestLoop_guts((PlanState *) node);
+	if (instr)
+		InstrStopNode(instr, TupIsNull(result) ? 0 : 1);
+
+	if (TupIsNull(result))
+	{
+		outerPlanState(node) = outer_original;
+		ExecSquelchNode((PlanState *) node);
+		outerPlanState(node) = outer_proxy;
+	}
+	return result;
 }

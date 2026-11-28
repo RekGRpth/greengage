@@ -20,4 +20,9 @@ extern NestLoopState *ExecInitNestLoop(NestLoop *node, EState *estate, int eflag
 extern void ExecEndNestLoop(NestLoopState *node);
 extern void ExecReScanNestLoop(NestLoopState *node);
 
+extern bool VectorNestLoopPlanIsSupported(NestLoop *node);
+extern TupleTableSlot *VectorNestLoopNext(NestLoopState *node,
+										PlanState *outer_proxy,
+										PlanState *outer_original);
+
 #endif							/* NODENESTLOOP_H */

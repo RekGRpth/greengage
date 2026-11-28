@@ -98,6 +98,16 @@ typedef struct NumericAggState
 	int			maxScale;		/* maximum scale seen so far */
 	int64		maxScaleCount;	/* number of values seen with maximum scale */
 	int64		NaNcount;		/* count of NaN values (not included in N!) */
+#ifdef HAVE_INT128
+	/*
+	 * Pending int128 accumulation window fed by do_numeric_accum_fast().
+	 * sumX does not include the window's inputs yet; the window must be
+	 * folded into sumX before sumX is read or modified elsewhere.
+	 */
+	bool		fast_valid;		/* is the window holding pending inputs? */
+	int			fast_scale;		/* exact scale the window's mantissas align to */
+	int128		fast_sum;		/* sum of the window's scale-aligned mantissas */
+#endif
 } NumericAggState;
 
 extern NumericAggState *makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2);
@@ -138,6 +148,63 @@ extern float8 numeric_li_fraction(Numeric x, Numeric x0, Numeric x1,
 								  bool *eq_bounds, bool *eq_abscissas);
 extern Numeric numeric_li_value(float8 f, Numeric y0, Numeric y1);
 extern void do_numeric_accum(NumericAggState *state, Numeric newval);
+extern void do_numeric_accum_datum(NumericAggState *state, Datum newval);
+extern void do_numeric_accum_fast(NumericAggState *state, int64 mantissa,
+								  int scale, int dscale);
+
+#ifdef HAVE_INT128
+/*
+ * The hot int128 accumulation window step: N and maxScale bookkeeping plus
+ * one checked add, all inline so an aggregate over decoded numerics costs
+ * no call per row.  Returns false when the out-of-line
+ * do_numeric_accum_fast() must run: the first window input, a scale
+ * change, an int128 overflow, or (without the guard below matching) never
+ * on this build.  On false the state is untouched apart from the
+ * bookkeeping, which the slow path does not repeat.
+ */
+static inline bool
+numeric_agg_fast_window_add(NumericAggState *state, int64 mantissa,
+							int scale, int dscale)
+{
+	int64		aligned = mantissa;
+	int			pad = (4 - scale % 4) % 4;
+	int128		new_sum;
+
+	state->N++;
+	if (dscale > state->maxScale)
+	{
+		state->maxScale = dscale;
+		state->maxScaleCount = 1;
+	}
+	else if (dscale == state->maxScale)
+		state->maxScaleCount++;
+
+	while (pad > 0)
+	{
+		aligned *= 10;
+		pad--;
+	}
+
+	if (state->fast_valid && state->fast_scale == scale &&
+		!__builtin_add_overflow(state->fast_sum, (int128) aligned,
+								&new_sum))
+	{
+		state->fast_sum = new_sum;
+		return true;
+	}
+	return false;
+}
+#else
+static inline bool
+numeric_agg_fast_window_add(NumericAggState *state, int64 mantissa,
+							int scale, int dscale)
+{
+	return false;
+}
+#endif
+extern bool numeric_decode_fast_datum(Datum value, int64 *mantissa,
+									  int *scale, int *dscale);
+extern int cmp_numeric_datums(Datum num1, Datum num2);
 /*
  * Utility functions in numeric.c
  */
@@ -150,6 +217,13 @@ extern char *numeric_normalize(Numeric num);
 
 extern Numeric numeric_add_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);
+extern bool numeric_decode_fast(Numeric num, int64 *mantissa, int *scale,
+								int *dscale);
+extern bool numeric_scale_fast(int64 *mantissa, int scale, int target);
+extern bool numeric_round_scale_fast(int64 *mantissa, int scale, int target);
+extern bool numeric_mul_fast(int64 left, int64 right, int scale, int dscale,
+							 int64 *mantissa);
+extern Numeric numeric_build_fast(int64 mantissa, int dscale);
 extern Numeric numeric_sub_opt_error(Numeric num1, Numeric num2,
 									 bool *have_error);
 extern Numeric numeric_mul_opt_error(Numeric num1, Numeric num2,
